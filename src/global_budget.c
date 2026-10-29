@@ -191,6 +191,8 @@ static atomic_uint_fast64_t recovery_target_ns, consumed_control_ns;
 static atomic_int_fast64_t available_ns;
 static atomic_uint_fast64_t rejected_spend_count;
 static pthread_mutex_t sample_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* Background writer and diagnostic getter share the existing sample lock. */
+static PeakGlobalBudgetLocalBill last_written_bill;
 static PeakGlobalBudgetSample local_sample;
 static void (*notify)(void);
 static atomic_uint view_sequence;
@@ -332,6 +334,35 @@ static double ledger_cost(const PeakGlobalBudgetSample *s, uint64_t profile)
     return fmax(s->profile_seconds, (double)profile / 1e9) +
         s->control_seconds +
         s->management_seconds + s->transport_seconds;
+}
+static PeakGlobalBudgetLocalBill local_bill_from_frame(const Frame *frame,
+    double management_input, double finalizer_cpu, double finalizer_baseline,
+    bool finalizer_registered)
+{
+    double profile = fmax(frame->sample.profile_seconds, (double)frame->consumed_profile_ns / 1e9);
+    return (PeakGlobalBudgetLocalBill){
+        .written = true, .retiring = frame->sample.retiring, .final = frame->sample.final,
+        .finalizer_registered = finalizer_registered,
+        .sample_sequence = frame->sample.sequence, .message_sequence = frame->message_sequence,
+        .profile_debit_ns = frame->consumed_profile_ns,
+        .profile_sample_seconds = frame->sample.profile_seconds, .profile_billed_seconds = profile,
+        .control_seconds = frame->sample.control_seconds,
+        .management_input_seconds = management_input,
+        .management_sent_seconds = frame->sample.management_seconds,
+        .transport_seconds = frame->sample.transport_seconds,
+        .finalizer_baseline_seconds = finalizer_baseline, .finalizer_cpu_seconds = finalizer_cpu,
+        .finalizer_override_seconds = fmax(0, frame->sample.management_seconds - management_input),
+        .management_increment_seconds = finalizer_registered
+            ? fmax(0, frame->sample.management_seconds - finalizer_baseline) : 0,
+        .total_seconds = ledger_cost(&frame->sample, frame->consumed_profile_ns)};
+}
+PeakGlobalBudgetLocalBill peak_global_budget_local_bill(void)
+{
+    if (getpid() != atomic_load(&owner)) return (PeakGlobalBudgetLocalBill){0};
+    pthread_mutex_lock(&sample_mutex);
+    PeakGlobalBudgetLocalBill bill = last_written_bill;
+    pthread_mutex_unlock(&sample_mutex);
+    return bill;
 }
 /* Control prepayments are releasable escrow, never actual-spent high water.
  * Keep local credit reservation separate for exact grant/admission arithmetic. */
@@ -714,6 +745,14 @@ static void *service(void *data)
     uint64_t transport_round_cpu = 0, broker_round_cpu = 0;
     bool root_all_final = false;
     unsigned seen_ranks = 0;
+    PeakGlobalBudgetLocalBill pending_bill = {0};
+    /* Authoritative accepted-rank snapshot from the final broker decision,
+     * rather than a later client write or an uncharged exit CPU clock. */
+    struct {
+        double ranks, profile, control, management, transport, startup, broker, spent;
+        unsigned final_ranks;
+    } receipt = {0};
+    bool final_proof_sent = false;
     while (atomic_load_explicit(&running, memory_order_acquire)) {
         /* Process parent, not creating pthread: MPI_Init may use a worker. */
         if (broker_only && getppid() != broker_owner_pid)
@@ -817,7 +856,10 @@ static void *service(void *data)
                 broken = true;
                 all = all_final = false;
             }
-            double spent = atomic_load_explicit(&startup_charge, memory_order_relaxed) + broker_cpu, reserved = 0;
+            double startup = atomic_load_explicit(&startup_charge, memory_order_relaxed);
+            double spent = startup + broker_cpu, reserved = 0;
+            double rank_bills = 0, rank_profile = 0, rank_control = 0, rank_management = 0, rank_transport = 0;
+            unsigned final_ranks = 0;
             for (unsigned i = 0; i < world; ++i) {
                 Rank *r = &ranks[i];
                 bool final_closed = r->latest.final && !r->connected;
@@ -827,6 +869,12 @@ static void *service(void *data)
                 unfunded = unfunded || (r->wants_credit && (r->credit_total_ns - r->consumed_ns - r->returned_ns) < (r->requested_ns > 100000 ? r->requested_ns : 100000));
                 done = done && (r->latest.retiring || r->latest.completed_wave >= wave);
                 spent += r->previous_cost; reserved += r->reservation + control_escrow(r);
+                rank_bills += r->previous_cost;
+                rank_profile += fmax(r->latest.profile_seconds, (double)r->profile_ns / 1e9);
+                rank_control += r->latest.control_seconds;
+                rank_management += r->latest.management_seconds;
+                rank_transport += r->latest.transport_seconds;
+                final_ranks += r->seen && r->latest.final;
             }
             all_final = all_final && all && !broken;
             if (all_final && !final_announced) { final_announced = true; record_event('F', rank_id, 0, wave, spent); }
@@ -925,6 +973,11 @@ static void *service(void *data)
                         .wave_span_seconds = span, .granted_total_seconds = ranks[id].granted_total}};
                 p->pending = true;
             }
+            receipt.ranks = rank_bills; receipt.profile = rank_profile;
+            receipt.control = rank_control; receipt.management = rank_management;
+            receipt.transport = rank_transport; receipt.startup = startup;
+            receipt.broker = broker_cpu; receipt.spent = spent;
+            receipt.final_ranks = final_ranks;
             root_all_final = all_final;
             next_round = now_ns + background;
             completed_background_round = true;
@@ -946,8 +999,10 @@ static void *service(void *data)
                     if (peers[i].rank == 0 && peers[i].proof_sent)
                         proof = true;
                 }
-                if (proof)
+                if (proof) {
+                    final_proof_sent = true;
                     break;
+                }
             }
         }
         if (broker_only) {
@@ -997,6 +1052,8 @@ static void *service(void *data)
                 if (retired_wave > next.sample.completed_wave) next.sample.completed_wave = retired_wave;
             }
             next.sample.transport_seconds = transport_cpu;
+            double management_input = next.sample.management_seconds;
+            double finalizer_cpu = 0, frozen_management = 0;
             unsigned clock_state = atomic_load_explicit(&finalizer_state, memory_order_acquire);
             if (clock_state == 2) {
                 uint64_t cpu_now = ns_now(atomic_load(&finalizer_clock)), cpu_start = atomic_load(&finalizer_start);
@@ -1004,7 +1061,9 @@ static void *service(void *data)
                     atomic_store(&finalizer_state, 3); atomic_store(&public_accounting_invalid, true);
                     next.sample.finalizer_invalid = true; broken = true;
                 } else {
-                    double live = atomic_load(&finalizer_baseline) + (double)(cpu_now - cpu_start) / 1e9;
+                    finalizer_cpu = (double)(cpu_now - cpu_start) / 1e9;
+                    frozen_management = atomic_load(&finalizer_baseline);
+                    double live = frozen_management + finalizer_cpu;
                     next.sample.management_seconds = fmax(next.sample.management_seconds, live);
                 }
             } else if (clock_state == 3) next.sample.finalizer_invalid = true;
@@ -1038,9 +1097,17 @@ static void *service(void *data)
                 last_request_target = request_target;
                 next.message_sequence = ++message_sequence;
                 local.outgoing = next; local.pending = true; local.last_send = now_ns;
+                pending_bill = local_bill_from_frame(&next, management_input,
+                    finalizer_cpu, frozen_management, clock_state == 2);
             }
         }
+        bool was_pending = local.pending;
         if (local.fd >= 0 && write_frame(&local)) { close_fd(&local.fd); broken = true; }
+        if (was_pending && !local.pending) {
+            pthread_mutex_lock(&sample_mutex);
+            last_written_bill = pending_bill;
+            pthread_mutex_unlock(&sample_mutex);
+        }
         if (local.fd >= 0 && (ready[1].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))) {
             int result = read_frame(&local);
             if (result < 0) { close_fd(&local.fd); broken = true; }
@@ -1117,6 +1184,11 @@ static void *service(void *data)
         }
 
     }
+    if (broker_only)
+        fprintf(stderr, "[peak] MPI global broker bill: complete=%d final_ranks=%u world_size=%u rank_bill_seconds=%.17g profile_billed_seconds=%.17g control_seconds=%.17g management_seconds=%.17g transport_seconds=%.17g root_startup_seconds=%.17g broker_cpu_charged_seconds=%.17g global_spent_seconds=%.17g\n",
+            final_proof_sent, receipt.final_ranks, world, receipt.ranks,
+            receipt.profile, receipt.control, receipt.management, receipt.transport,
+            receipt.startup, receipt.broker, receipt.spent);
     for (unsigned i = 0; i < peers_count; ++i) close_fd(&peers[i].fd);
     close_fd(&local.fd); client = -1;
     service_storage_free(storage);
@@ -1180,6 +1252,7 @@ int peak_global_budget_start(const char *host, unsigned short port, unsigned ran
     atomic_store(&flush_requested, false); atomic_store(&local_transport_cpu, 0); atomic_store(&startup_charge, 0); atomic_store(&local_completed_wave, 0); atomic_store(&granted_ns, 0); atomic_store(&consumed_ns, 0); atomic_store(&consumed_control_ns, 0); atomic_store(&pressure_notice, false); atomic_store(&requested_ns, 0); atomic_store(&demand_generation, 0);
     heartbeat_cost = (BackgroundCost){0};
     atomic_store(&heartbeat_period, BACKGROUND_NS); atomic_store(&transport_period, BACKGROUND_NS);
+    memset(&last_written_bill, 0, sizeof(last_written_bill));
     memset(&local_sample, 0, sizeof(local_sample)); publish_view((PeakGlobalBudgetView){0});
     atomic_store(&running, true);
     if (pthread_listener_mark_next_created_thread_helper) pthread_listener_mark_next_created_thread_helper();

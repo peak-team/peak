@@ -9378,6 +9378,20 @@ peak_general_listener_write_global_budget_diagnostics(gboolean settled)
             global.broker_cpu_seconds, global.broker_final_written, global.startup_sealed,
             (unsigned long long)global.background_period_ns,
             (unsigned long long)global.freshness_ns, global.transport_seconds);
+        if (settled) {
+            PeakGlobalBudgetLocalBill bill = peak_global_budget_local_bill();
+            peak_log_report("[peak] MPI global local bill: written=%d retiring=%d final=%d sample_sequence=%llu message_sequence=%llu acknowledged_sample_sequence=%llu profile_sample_seconds=%.17g profile_debit_ns=%llu profile_billed_seconds=%.17g control_seconds=%.17g management_input_seconds=%.17g management_sent_seconds=%.17g transport_seconds=%.17g finalizer_registered=%d finalizer_baseline_seconds=%.17g finalizer_cpu_seconds=%.17g finalizer_override_seconds=%.17g management_increment_seconds=%.17g total_seconds=%.17g\n",
+                bill.written, bill.retiring, bill.final,
+                (unsigned long long)bill.sample_sequence,
+                (unsigned long long)bill.message_sequence,
+                (unsigned long long)global.acknowledged_sequence,
+                bill.profile_sample_seconds, (unsigned long long)bill.profile_debit_ns,
+                bill.profile_billed_seconds, bill.control_seconds,
+                bill.management_input_seconds, bill.management_sent_seconds, bill.transport_seconds,
+                bill.finalizer_registered, bill.finalizer_baseline_seconds,
+                bill.finalizer_cpu_seconds, bill.finalizer_override_seconds,
+                bill.management_increment_seconds, bill.total_seconds);
+        }
         peak_log_report("[peak] MPI closing forecast: per_window_seconds=%.9g targets=%llu windows=%llu total_seconds=%.9g\n",
             peak_global_closing_window_seconds,
             (unsigned long long)peak_global_closing_target_count,

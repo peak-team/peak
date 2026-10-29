@@ -222,6 +222,12 @@ static void check_background_rounds(void)
     assert(refilled.granted_total_ns > funded.granted_total_ns);
     assert(atomic_load(&credit_wakes) == prior_wakes);
     peak_global_budget_stop();
+    PeakGlobalBudgetLocalBill bill = peak_global_budget_local_bill();
+    assert(bill.written && bill.sample_sequence == 2 && bill.message_sequence > 0);
+    assert(bill.profile_sample_seconds == 0 && bill.profile_debit_ns == 1000);
+    assert(bill.profile_billed_seconds == .000001);
+    assert(bill.total_seconds == bill.profile_billed_seconds + bill.control_seconds +
+        bill.management_sent_seconds + bill.transport_seconds);
 }
 
 int main(void)
