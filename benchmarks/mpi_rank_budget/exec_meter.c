@@ -15,8 +15,8 @@ int main(int argc, char **argv) {
         strcmp(argv[3], "--helper") || strcmp(argv[5], "--global") ||
         strcmp(argv[7], "--policy") || strcmp(argv[9], "--") ||
         (strcmp(argv[6], "0") && strcmp(argv[6], "1")) ||
-        (strcmp(argv[8], "immediate") && strcmp(argv[8], "post-init"))) {
-        fprintf(stderr, "usage: exec_meter --preload path|none --helper path|none --global 0|1 --policy immediate|post-init -- program [args]\n");
+        (strcmp(argv[8], "immediate") && strcmp(argv[8], "post-init") && strcmp(argv[8], "default"))) {
+        fprintf(stderr, "usage: exec_meter --preload path|none --helper path|none --global 0|1 --policy immediate|post-init|default -- program [args]\n");
         return 2;
     }
     const char *preload = getenv("LD_PRELOAD"), *audit = getenv("LD_AUDIT");
@@ -31,8 +31,10 @@ int main(int argc, char **argv) {
     char value[32];
     snprintf(value, sizeof(value), "%" PRIu64, begin);
     if (setenv("PEAK_BENCH_EXEC_BEGIN_NS", value, 1) ||
-        setenv("PEAK_MPI_GLOBAL_BUDGET", argv[6], 1) ||
-        setenv("PEAK_MPI_ACTIVATION_POLICY", argv[8], 1)) return 2;
+        setenv("PEAK_MPI_GLOBAL_BUDGET", argv[6], 1)) return 2;
+    if (!strcmp(argv[8], "default")) {
+        if (unsetenv("PEAK_MPI_ACTIVATION_POLICY")) return 2;
+    } else if (setenv("PEAK_MPI_ACTIVATION_POLICY", argv[8], 1)) return 2;
     if (strcmp(argv[2], "none")) {
         if (setenv("LD_PRELOAD", argv[2], 1)) return 2;
     } else if (unsetenv("LD_PRELOAD")) return 2;

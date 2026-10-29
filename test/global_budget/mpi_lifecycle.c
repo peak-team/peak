@@ -48,10 +48,27 @@ int main(int argc,char **argv)
         int (*guard)(void)=dlsym(RTLD_DEFAULT,"mpi_interceptor_test_bootstrap_clock_guard");
         int (*grace)(void)=dlsym(RTLD_DEFAULT,"peak_general_listener_test_global_grace_faa");
         int (*admission)(void)=dlsym(RTLD_DEFAULT,"peak_general_listener_test_global_admission_ns");
-        return guard&&grace&&admission ? (guard() || grace() || admission()) : 2;
+        int (*idle)(void)=dlsym(RTLD_DEFAULT,"peak_general_listener_test_global_idle_guard");
+        return guard&&grace&&admission&&idle ? (guard() || grace() || admission() || idle()) : 2;
     }
     unsigned char original_target[16];
     memcpy(original_target, (const void*)&pressure_000, sizeof(original_target));
+    const char* activation = getenv("PEAK_MPI_ACTIVATION_POLICY");
+    if (activation == NULL || !strcmp(activation, "prepare") || !strcmp(activation, "post-init")) {
+        uint32_t (*physical)(void) = dlsym(RTLD_DEFAULT,"peak_general_listener_test_physical_targets");
+        uint64_t (*calls)(void) = dlsym(RTLD_DEFAULT,"peak_general_listener_test_all_target_calls");
+        int (*active)(void) = dlsym(RTLD_DEFAULT,"peak_runtime_is_active_for_checkpoint");
+        double (*prepared)(void) = dlsym(RTLD_DEFAULT,"peak_mpi_runtime_preparation_seconds");
+        int expect_deferred = activation && !strcmp(activation, "post-init");
+        if (!physical || !calls || !active || !prepared || physical() != 0 || calls() != 0 ||
+            (!!active() == expect_deferred) || (!expect_deferred && prepared() <= 0.0)) return 91;
+        uint64_t x = 123;
+        double until = now() + .05;
+        do { x = pressure_000(x, 1); } while (now() < until);
+        if (physical() != 0 || calls() != 0 ||
+            memcmp(original_target, (const void*)&pressure_000, sizeof(original_target))) return 92;
+        fprintf(stderr,"pre_mpi_native=1 pre_mpi_target_calls=0 oracle=%llu\n",(unsigned long long)x);
+    }
     int provided,rank,size;MPI_Init_thread(&argc,&argv,MPI_THREAD_FUNNELED,&provided);
     MPI_Comm_rank(MPI_COMM_WORLD,&rank);MPI_Comm_size(MPI_COMM_WORLD,&size);
     PeakGlobalBudgetView (*view)(void)=dlsym(RTLD_DEFAULT,"peak_general_listener_test_global_view");

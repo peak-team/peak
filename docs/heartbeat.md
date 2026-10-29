@@ -757,13 +757,21 @@ on the application's initialization thread. Partial-rank opt-in is unsupported
 and can block in that collective; it is not a timeout-safe discovery protocol.
 The wrapper preserves the application's requested/provided MPI thread levels.
 After bootstrap, background coordination uses TCP only, including under FUNNELED
-or SINGLE; heartbeat/controller threads do not invoke MPI.
+or SINGLE; heartbeat/controller threads do not invoke MPI. A separate native
+`peak_detach_helper --global-budget-broker` process owns the coordinator; every
+rank, including rank 0, is a client. It is distinct from the ptrace detach helper.
+Rank 0's safe thread stop therefore cannot pause the coordinator. The broker
+starts without PEAK preload/audit libraries, charges its own CPU once to the
+shared ledger, and is terminated and reaped when its owner stops. It needs no
+thread exemption from the safe mutation backend.
 
-On supported MPI launches, enabling global mode also defaults activation to
-post-MPI-init when `PEAK_MPI_ACTIVATION_POLICY` is unset. Explicit `immediate`,
-non-MPI processes, and default-off operation retain their existing activation
-policy. With heartbeat admission available, post-init activation resolves targets
-without patching their entry points. The existing safe controller first installs
+On supported MPI launches with heartbeat admission, global mode defaults to
+`prepare` when `PEAK_MPI_ACTIVATION_POLICY` is unset. PEAK prepares its runtime
+before MPI initialization and resolves user targets without patching their entry
+points. The hold also covers dynamically discovered targets and remains in place
+while bootstrap is pending. Explicit `post-init` retains fully deferred runtime
+initialization; explicit `immediate`, non-MPI processes and default-off operation
+retain their existing activation behavior. The existing safe controller first installs
 a target only after a complete mutation-plus-observation lease is funded; root
 also reserves its future closing cost. This avoids making a never-funded rank pay
 a physical closing cost merely because its hotspot appears later. First paid
@@ -894,11 +902,20 @@ release and support cleanup; waiting wall time for peer application work and the
 original MPI_Finalize call are excluded. A failed CPU clock is diagnosed rather
 than represented as a successful measurement.
 
-When post-init activation is selected, root's measured PEAK activation duration
-is also charged once with bootstrap startup cost. Only the original MPI_Init
-call earns the initial runtime offset; PEAK activation and bootstrap do not.
-The optional init timing line keeps original, activation and bootstrap durations
-separate for attribution.
+Root's measured early preparation, post-init activation and bootstrap durations
+are charged once as startup cost. Only the original MPI_Init call earns the
+initial runtime offset; PEAK preparation, activation and bootstrap do not.
+`MPI preparation:` keeps these components separate. The exec-inclusive benchmark
+also includes loader/constructor time, so moving work before main cannot appear
+as free initialization.
+
+Bootstrap readiness does not authorize spending. The native broker may report a
+live all-rank connection while holding all grants and new STOP waves. Root first
+publishes its final startup charge, then seals startup in the same authenticated
+snapshot. Only after the broker receives that seal can it lend earned headroom.
+The snapshot reads the seal before the fee so a concurrent publication cannot
+pair an old zero fee with a new authorization. A failed startup clock leaves
+funding closed; sealing cannot move backward.
 
 Retired finalizer-thread CPU is sampled live through its POSIX thread CPU clock,
 starting at PEAK finalization entry. The helper uses the maximum of the published
@@ -907,7 +924,10 @@ last counter update and live watch therefore settle the same cost once. FINAL
 is distinct from retirement: only after the existing all-rank proof does each
 rank publish a new FINAL revision. Closing waits for every FINAL revision and
 its cohort acknowledgment, preventing root from dropping late peers' final cost
-frames. The original MPI finalizer runs after this helper has stopped and is
+frames. In native-broker mode, root additionally waits for an authenticated
+confirmation that all cohort FINAL replies were fully written before stopping
+and reaping the broker. Root's own FINAL acknowledgment alone is insufficient.
+The original MPI finalizer runs after this helper has stopped and is
 outside this PEAK-management CPU watch.
 
 Concurrent callback charges use the primary atomic available-credit counter;
@@ -925,6 +945,14 @@ the pool across every detached rank. Active refills can still use partial
 credit. A recovery request's complete target stays fixed until acknowledgment
 and admission; waiting to earn that recovery budget is excluded from active
 network-refill latency prediction.
+
+Actual physical membership carries an activity revision as well as its count.
+A fresh positive revision starts the existing 100 ms idle interval, so time spent
+waiting detached cannot immediately reclaim a restored observation lease. Surplus
+returns use a nonblocking attempt on the controller's existing listener lock and
+refuse pending or running mutations. The physical revision check and wallet
+return commit share that lock; prepaid partial installations therefore retain
+their operating credit. Callback spending still uses bounded atomics only.
 
 Bootstrap readiness has an independent iteration cap and rejects failing or
 backward monotonic readings. A local clock failure still participates in the
@@ -951,12 +979,9 @@ become permanent spent cost. This also keeps prepaid future control work in
 escrow when an earlier, uncredited STOP already contributed cumulative cost.
 
 
-Global mode on Linux 64-bit now defaults an already identified MPI process to
-post-`MPI_Init` activation when `PEAK_MPI_ACTIVATION_POLICY` is unset. Explicit
-`immediate`, global mode off, non-MPI processes, and unsupported global backends
-retain the existing activation choice. With post-init activation and a working
-heartbeat admission loop, targets are first registered without patching their
-code. An earned full mutation plus observation lease admits their first safe
+With early preparation or explicit post-init activation and a working heartbeat
+admission loop, targets are first registered without patching their code.
+An earned full mutation plus observation lease admits their first safe
 batch installation; future closing reserve remains separate. The initial
 observation lease is at least the estimated 3 ms mutation cost, shared across
 hooks in the batch. A cold, never-funded target therefore incurs no physical

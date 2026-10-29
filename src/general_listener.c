@@ -310,6 +310,39 @@ static uint64_t peak_mpi_burst_waves;
 static uint64_t peak_mpi_burst_unsampled_targets;
 static gboolean peak_detach_count_overridden = FALSE;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Service-only idle-return guard. A paid queued mutation already owns its
+ * observation lease, even before the backend has published physical targets.
+ * trylock is essential: the controller may hold this mutex while service
+ * threads are physically suspended by the existing mutation protocol. */
+static gboolean
+peak_general_listener_idle_has_pending_unlocked(void)
+{
+    for (size_t i = 0; peak_hook_states != NULL && i < peak_hook_address_count; i++) {
+        PeakHookState state = peak_hook_states[i];
+        if (state == PEAK_HOOK_DETACH_REQUESTED || state == PEAK_HOOK_DETACHING ||
+            state == PEAK_HOOK_REATTACH_REQUESTED || state == PEAK_HOOK_REATTACHING)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+PEAK_API bool
+peak_global_budget_listener_idle_try_guard(void)
+{
+    if (pthread_mutex_trylock(&lock) != 0) return false;
+    if (peak_general_listener_idle_has_pending_unlocked()) {
+        pthread_mutex_unlock(&lock);
+        return false;
+    }
+    return true;
+}
+
+PEAK_API void
+peak_global_budget_listener_idle_unguard(void)
+{
+    pthread_mutex_unlock(&lock);
+}
 _Atomic gboolean heartbeat_running = true;
 static pthread_t general_controller_thread;
 static pthread_mutex_t general_controller_wake_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -8451,6 +8484,37 @@ PEAK_API int peak_general_listener_test_global_grace_faa(void)
     atomic_store(&peak_global_grace_claimed_ns, 0);
     return failed;
 }
+PEAK_API int peak_general_listener_test_global_idle_guard(void)
+{
+    static const PeakHookState pending[] = {
+        PEAK_HOOK_DETACH_REQUESTED, PEAK_HOOK_DETACHING,
+        PEAK_HOOK_REATTACH_REQUESTED, PEAK_HOOK_REATTACHING
+    };
+    int failed = 0;
+    pthread_mutex_lock(&lock);
+    /* No recursive/blocking acquisition when a controller owns the mutex. */
+    if (peak_global_budget_listener_idle_try_guard()) failed = 1;
+    if (peak_hook_states != NULL && peak_hook_address_count != 0) {
+        PeakHookState saved = peak_hook_states[0];
+        for (size_t i = 0; i < G_N_ELEMENTS(pending); i++) {
+            peak_hook_states[0] = pending[i];
+            if (!peak_general_listener_idle_has_pending_unlocked()) failed = 1;
+        }
+        peak_hook_states[0] = saved;
+    }
+    pthread_mutex_unlock(&lock);
+    return failed;
+}
+PEAK_API uint64_t peak_general_listener_test_all_target_calls(void)
+{
+    uint64_t calls = 0;
+    pthread_mutex_lock(&lock);
+    for (size_t i = 0; i < peak_hook_address_count; i++)
+        if (array_listener != NULL && array_listener[i] != NULL)
+            calls += peak_general_listener_total_calls((PeakGeneralListener*)array_listener[i]);
+    pthread_mutex_unlock(&lock);
+    return calls;
+}
 PEAK_API uint32_t peak_general_listener_test_physical_targets(void)
 {
     pthread_mutex_lock(&lock);
@@ -9456,13 +9520,17 @@ peak_general_listener_write_global_budget_diagnostics(gboolean settled)
             (unsigned long long)atomic_load(&peak_global_degraded_samples),
             (unsigned long long)atomic_load(&peak_global_invalid_accounting),
             (double)MIN(atomic_load(&peak_global_grace_claimed_ns), PEAK_GLOBAL_GRACE_NS) / 1e9);
+        peak_log_report("[peak] MPI global service: settlement=%d parent_process_id=%llu broker_process_id=%llu broker_cpu_seconds=%.9g broker_final_written=%d startup_sealed=%d\n",
+            settled, (unsigned long long)getpid(),
+            (unsigned long long)global.broker_process_id,
+            global.broker_cpu_seconds, global.broker_final_written, global.startup_sealed);
         peak_log_report("[peak] MPI closing forecast: per_window_seconds=%.9g targets=%llu windows=%llu total_seconds=%.9g\n",
             peak_global_closing_window_seconds,
             (unsigned long long)peak_global_closing_target_count,
             (unsigned long long)peak_global_admission_closing_windows(peak_global_closing_target_count),
             peak_global_closing_seconds);
         peak_log_report("[peak] MPI initial admission: policy=%s bootstrap_finished=%d first_paid_attach_count=%llu first_local_attach_count=%llu initial_unexposed=%d\n",
-            peak_global_funded_initial_attach ? "fund-before-attach-post-init" : "existing-physical-attach",
+            peak_global_funded_initial_attach ? "fund-before-attach" : "existing-physical-attach",
             atomic_load(&peak_global_bootstrap_finished),
             (unsigned long long)peak_global_first_paid_attach_count,
             (unsigned long long)peak_global_first_local_attach_count,

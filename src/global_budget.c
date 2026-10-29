@@ -1,5 +1,8 @@
 #define _GNU_SOURCE
 #include "internal/global_budget.h"
+#ifdef PEAK_GLOBAL_BUDGET_NATIVE
+#include "internal/global_budget_spawn.h"
+#endif
 #if !defined(__linux__) || UINTPTR_MAX != UINT64_MAX
 int peak_global_budget_listen(unsigned short *p) { (void)p; return -1; }
 uint64_t peak_global_budget_nonce(void) { return 0; }
@@ -23,6 +26,7 @@ bool peak_global_budget_final_flush(unsigned n) { (void)n;return false; }
 void peak_global_budget_request_credit(uint64_t n) { (void)n; }
 bool peak_global_budget_flush(unsigned n) { (void)n;return false; }
 void peak_global_budget_stop(void) {}
+int peak_global_budget_broker_main(int argc,char **argv) { (void)argc;(void)argv;return 2; }
 #else
 #include <arpa/inet.h>
 #include <errno.h>
@@ -42,7 +46,7 @@ void peak_global_budget_stop(void) {}
 #include <time.h>
 #include <unistd.h>
 
-/* Version two is a homogeneous-host protocol, confined to an MPI job. */
+/* Version four is a homogeneous-host protocol, confined to an MPI job. */
 _Static_assert(ATOMIC_LLONG_LOCK_FREE == 2, "budget credits require lock-free 64-bit atomics");
 _Static_assert(__atomic_always_lock_free(sizeof(double), 0), "budget views require lock-free doubles");
 #define LIMIT 64
@@ -52,7 +56,7 @@ _Static_assert(__atomic_always_lock_free(sizeof(double), 0), "budget views requi
 #define MAX_TOTAL_NS UINT64_C(999999999000000000)
 _Static_assert(MAX_SPEND_NS <= INT64_MAX / INT32_MAX, "temporary debit marker must not overflow");
 #define MAGIC UINT32_C(0x50474231)
-#define PROTOCOL_VERSION 2
+#define PROTOCOL_VERSION 4
 #define GRACE_NS UINT64_C(500000)
 #define FRESH_NS UINT64_C(1000000000)
 #ifndef PEAK_GLOBAL_BUDGET_IO_CHUNK
@@ -62,7 +66,8 @@ _Static_assert(MAX_SPEND_NS <= INT64_MAX / INT32_MAX, "temporary debit marker mu
 typedef struct {
     uint32_t magic, version, rank, size;
     uint64_t reply_sequence, consumed_profile_ns, consumed_control_ns, nonce, requested_ns, demand_generation, message_sequence, returned_ns;
-    bool request_credit;
+    bool request_credit, root_startup_sealed;
+    double root_origin_seconds, root_startup_seconds;
     PeakGlobalBudgetSample sample;
     PeakGlobalBudgetView view;
 } Frame;
@@ -70,7 +75,7 @@ typedef struct {
     int fd, rank;
     Frame incoming, outgoing;
     size_t received, sent;
-    bool pending, final_sent;
+    bool pending, final_sent, proof_sent;
     uint64_t last_activity, last_send;
 } Peer;
 typedef struct {
@@ -86,6 +91,11 @@ static uint64_t job_nonce;
 uint64_t peak_global_budget_nonce(void) { return job_nonce; }
 void peak_global_budget_set_nonce(uint64_t n) { job_nonce = n; }
 static double ratio;
+static bool broker_only, native_client;
+static pid_t broker_owner_pid;
+#ifdef PEAK_GLOBAL_BUDGET_NATIVE
+static pid_t broker_pid = -1;
+#endif
 typedef struct { uint64_t time, generation, wave; unsigned rank; char kind; double amount; } BudgetEvent;
 static BudgetEvent events[256];
 static unsigned event_count;
@@ -99,15 +109,40 @@ static void record_event(char kind, unsigned rank, uint64_t generation, uint64_t
 }
 static _Atomic pid_t owner;
 static pthread_t worker;
+static atomic_uint_fast64_t public_broker_pid;
+static atomic_bool public_broker_final, public_startup_sealed;
+static atomic_bool startup_sealed;
+static _Atomic double public_broker_cpu;
 static atomic_bool running, pressure_notice, flush_requested, local_retiring, request_recovery;
 static atomic_uint local_attached;
-/* High bit marks controller evidence; HB counts are fallback only. */
-static atomic_uint_fast64_t physical_targets;
+/* High 32 bits are a nonzero physical activity revision; low bits are count. */
+static atomic_uint_fast64_t physical_targets, physical_revision;
 static uint32_t effective_targets(uint32_t fallback)
 {
     if (atomic_load(&local_retiring)) return 0;
     uint64_t word = atomic_load_explicit(&physical_targets, memory_order_acquire);
     return word >> 32 ? (uint32_t)word : fallback;
+}
+typedef struct {
+    uint64_t word;
+    bool attached;
+} PhysicalIdleSnapshot;
+static PhysicalIdleSnapshot physical_idle_snapshot(uint64_t word, uint32_t fallback, uint64_t now,
+    uint64_t *seen, uint64_t *last_activity, bool *returned)
+{
+    if (!now || now < *last_activity)
+        return (PhysicalIdleSnapshot){word, false};
+    uint32_t count = word >> 32 ? (uint32_t)word : fallback;
+    if (atomic_load(&local_retiring))
+        count = 0;
+    if (word != *seen) {
+        if (count) {
+            *last_activity = now;
+            *returned = false;
+        }
+        *seen = word;
+    }
+    return (PhysicalIdleSnapshot){word, count != 0};
 }
 static atomic_uint_fast64_t recovery_target_ns, consumed_control_ns;
 static atomic_int_fast64_t available_ns;
@@ -126,6 +161,8 @@ static atomic_uint_fast64_t local_completed_wave, public_wave, public_decision, 
 static _Atomic double public_spent, public_remaining, public_allowance, public_span, public_granted, public_budget, public_reserved, public_control_reserve, startup_charge, local_transport_cpu, earned_origin, refill_rtt, consumption_rate;
 extern void pthread_listener_exclude_current_thread(void) __attribute__((weak));
 extern void pthread_listener_mark_next_created_thread_helper(void) __attribute__((weak));
+extern bool peak_global_budget_listener_idle_try_guard(void) __attribute__((weak));
+extern void peak_global_budget_listener_idle_unguard(void) __attribute__((weak));
 static uint64_t ns_now(clockid_t clock)
 {
     struct timespec t;
@@ -140,6 +177,47 @@ static void poke(void)
     (void)write(wake_fd, &value, sizeof(value)); /* EFD_NONBLOCK: EAGAIN is harmless. */
 }
 static void close_fd(int *fd) { if (*fd >= 0) close(*fd); *fd = -1; }
+static bool idle_return_due(PhysicalIdleSnapshot physical, uint64_t now,
+    uint64_t last_activity, bool returned, int64_t balance, uint64_t keep)
+{
+    return physical.attached && !returned && now >= last_activity &&
+        now - last_activity >= UINT64_C(100000000) &&
+        !atomic_load(&pressure_notice) && !atomic_load(&request_started_ns) &&
+        balance > 0 && (uint64_t)balance > keep;
+}
+/* The production listener guard shares the controller's existing lock and
+ * refuses queued/in-progress mutations. Never wait for a stopped service or
+ * introduce a new lock that the STW controller would need to acquire. */
+static uint64_t idle_return_commit(PhysicalIdleSnapshot physical, int64_t balance, uint64_t keep)
+{
+    if (balance <= 0 || (uint64_t)balance <= keep)
+        return 0;
+    bool has_guard = peak_global_budget_listener_idle_try_guard &&
+        peak_global_budget_listener_idle_unguard;
+#ifdef PEAK_GLOBAL_BUDGET_NATIVE
+    if (!has_guard)
+        return 0;
+#endif
+    if (has_guard && !peak_global_budget_listener_idle_try_guard())
+        return 0;
+    uint64_t returned = 0;
+    if (atomic_load_explicit(&physical_targets, memory_order_acquire) == physical.word &&
+        !atomic_load(&local_retiring) && !atomic_load(&pressure_notice) &&
+        !atomic_load(&request_started_ns)) {
+#ifdef PEAK_GLOBAL_BUDGET_TEST_IDLE_COMMIT_HOOK
+        PEAK_GLOBAL_BUDGET_TEST_IDLE_COMMIT_HOOK();
+#endif
+        int64_t target = (int64_t)keep;
+        if (atomic_compare_exchange_strong(&available_ns, &balance, target)) {
+            returned = (uint64_t)balance - keep;
+            atomic_fetch_add(&debit_ns, returned);
+            atomic_fetch_add(&returned_ns, returned);
+        }
+    }
+    if (has_guard)
+        peak_global_budget_listener_idle_unguard();
+    return returned;
+}
 static bool number(double n) { return isfinite(n) && n >= 0; }
 static double cost(const PeakGlobalBudgetSample *s)
 {
@@ -156,6 +234,30 @@ static double ledger_cost(const PeakGlobalBudgetSample *s, uint64_t profile)
 static double control_escrow(const Rank *r)
 {
     return (double)(r->control_ns - r->latest.settled_control_credit_ns) / 1e9;
+}
+static bool broker_cpu_snapshot(uint64_t *last, double *seconds)
+{
+    uint64_t cpu = ns_now(CLOCK_PROCESS_CPUTIME_ID);
+    if (!cpu || cpu < *last)
+        return false;
+    *last = cpu;
+    *seconds = (double)cpu / 1e9;
+    return true;
+}
+static bool root_metadata_valid(const Frame *frame)
+{
+    if (!number(frame->root_origin_seconds) || !number(frame->root_startup_seconds) ||
+        frame->root_origin_seconds > 3600)
+        return false;
+    if (frame->rank)
+        return !frame->root_origin_seconds && !frame->root_startup_seconds &&
+            !frame->root_startup_sealed;
+    /* Embedded atomics can legitimately be newer than an in-flight frame. */
+    if (!broker_only)
+        return true;
+    return frame->root_origin_seconds >= atomic_load(&earned_origin) &&
+        frame->root_startup_seconds >= atomic_load(&startup_charge) &&
+        (!atomic_load(&startup_sealed) || frame->root_startup_sealed);
 }
 static bool valid_sample(const PeakGlobalBudgetSample *s, const Rank *r)
 {
@@ -185,6 +287,10 @@ static void publish_view(PeakGlobalBudgetView v)
     atomic_store_explicit(&public_active, v.active, memory_order_relaxed);
     atomic_store(&public_participant, v.wave_participant);
     atomic_store(&public_finalized, v.cohort_finalized);
+    atomic_store(&public_broker_pid, v.broker_process_id);
+    atomic_store(&public_broker_final, v.broker_final_written);
+    atomic_store(&public_startup_sealed, v.startup_sealed);
+    atomic_store(&public_broker_cpu, v.broker_cpu_seconds);
     if (v.accounting_invalid) atomic_store(&public_accounting_invalid, true);
     atomic_store(&public_demand_ack, v.acknowledged_demand_generation);
     atomic_store_explicit(&public_wave, v.wave, memory_order_relaxed);
@@ -226,6 +332,10 @@ PeakGlobalBudgetView peak_global_budget_view(void)
         if (before & 1) continue;
         v.active = atomic_load_explicit(&public_active, memory_order_relaxed);
         v.wave_participant = atomic_load(&public_participant);
+        v.broker_process_id = atomic_load(&public_broker_pid);
+        v.broker_final_written = atomic_load(&public_broker_final);
+        v.startup_sealed = atomic_load(&public_startup_sealed);
+        v.broker_cpu_seconds = atomic_load(&public_broker_cpu);
         v.cohort_finalized = atomic_load(&public_finalized);
         v.accounting_invalid = atomic_load(&public_accounting_invalid);
         v.acknowledged_demand_generation = atomic_load(&public_demand_ack);
@@ -325,6 +435,7 @@ static int write_frame(Peer *p)
     else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) return -1;
     if (p->sent == sizeof(Frame)) {
         if (p->outgoing.view.cohort_finalized) p->final_sent = true;
+        if (p->outgoing.view.broker_final_written) p->proof_sent = true;
         p->sent = 0; p->pending = false;
     }
     return 0;
@@ -344,6 +455,7 @@ static bool disconnect(Peer *p, Rank *ranks)
 static int service_poll_timeout(const Peer *local, uint64_t last_target, bool recheck, bool broken)
 {
     bool urgent = atomic_load(&flush_requested) ||
+        (!rank_id && (atomic_load(&earned_origin)!=local->outgoing.root_origin_seconds || atomic_load(&startup_charge)!=local->outgoing.root_startup_seconds || atomic_load(&startup_sealed)!=local->outgoing.root_startup_sealed)) ||
         atomic_load(&demand_generation) != local->outgoing.demand_generation ||
         atomic_load(&requested_ns) != last_target ||
         atomic_load(&returned_ns) != local->outgoing.returned_ns ||
@@ -357,7 +469,7 @@ static int service_poll_timeout(const Peer *local, uint64_t last_target, bool re
 static bool reply_urgent(const Peer *p, const Rank *r, bool all, bool final, uint64_t wave, uint64_t completed)
 {
     const PeakGlobalBudgetView *v = &p->outgoing.view;
-    return v->active != all || v->wave != wave || v->cohort_finalized != final ||
+    return v->startup_sealed != atomic_load(&startup_sealed) || v->broker_final_written != atomic_load(&root_final_sent) || v->active != all || v->wave != wave || v->cohort_finalized != final ||
         v->acknowledged_demand_generation != r->fulfilled_generation ||
         v->root_completed_wave != completed || v->granted_total_ns != r->credit_total_ns ||
         v->acknowledged_sequence != r->latest.sequence;
@@ -378,6 +490,16 @@ static Frame request_snapshot(void)
         .returned_ns = atomic_load_explicit(&returned_ns, memory_order_acquire)};
     pthread_mutex_unlock(&sample_mutex);
     next.sample.attached_targets = effective_targets(next.sample.attached_targets);
+    if (!rank_id) {
+        /* Acquire the commitment BEFORE reading its cost. False + new cost is
+         * conservative; true + an older cost must never be constructed. */
+        next.root_startup_sealed = atomic_load_explicit(&startup_sealed, memory_order_acquire);
+#ifdef PEAK_GLOBAL_BUDGET_TEST_SEAL_SNAPSHOT_HOOK
+        PEAK_GLOBAL_BUDGET_TEST_SEAL_SNAPSHOT_HOOK();
+#endif
+        next.root_origin_seconds = atomic_load(&earned_origin);
+        next.root_startup_seconds = atomic_load(&startup_charge);
+    }
     return next;
 }
 static void acknowledge_request(uint64_t acknowledged, uint64_t now)
@@ -452,20 +574,25 @@ static void *service(void *unused)
     uint64_t rate_time = ns_now(CLOCK_MONOTONIC), rate_consumed = 0, last_consumption = rate_time, last_request_target = 0, last_profile_activity = rate_time, learning_generation = 0;
     bool hot_origin = false;
     bool broken = false; double broken_deadline = 0;
+    uint64_t broker_cpu_last=0;bool broker_clock_invalid=false;
+    uint64_t last_physical_activity = 0;
     while (atomic_load_explicit(&running, memory_order_acquire)) {
+        /* Process parent, not creating pthread: MPI_Init may use a worker. */
+        if (broker_only && getppid() != broker_owner_pid)
+            break;
         uint64_t now_ns = ns_now(CLOCK_MONOTONIC);
         struct pollfd ready[LIMIT + 3];
-        ready[0] = (struct pollfd){rank_id == 0 ? listener : -1, POLLIN, 0};
+        ready[0] = (struct pollfd){(rank_id == 0 && !native_client) ? listener : -1, POLLIN, 0};
         ready[1] = (struct pollfd){local.fd, POLLIN | (local.pending ? POLLOUT : 0), 0};
         ready[2] = (struct pollfd){wake_fd, POLLIN, 0};
         for (unsigned i = 0; i < world; ++i)
-            ready[i + 3] = (struct pollfd){rank_id == 0 ? peers[i].fd : -1, POLLIN | (peers[i].pending ? POLLOUT : 0), 0};
-        int timeout = service_poll_timeout(&local, last_request_target, recheck_root, broken);
+            ready[i + 3] = (struct pollfd){(rank_id == 0 && !native_client) ? peers[i].fd : -1, POLLIN | (peers[i].pending ? POLLOUT : 0), 0};
+        int timeout = broker_only ? (recheck_root ? 0 : (broken ? 10 : 100)) : service_poll_timeout(&local, last_request_target, recheck_root, broken);
         recheck_root = false;
         (void)poll(ready, world + 3, timeout);
         now_ns = ns_now(CLOCK_MONOTONIC);
         if (ready[2].revents & POLLIN) { uint64_t events; (void)read(wake_fd, &events, sizeof(events)); }
-        if (rank_id == 0) {
+        if (rank_id == 0 && !native_client) {
             int s = ready[0].revents & POLLIN
                 ? accept4(listener, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC) : -1;
             if (s >= 0) {
@@ -495,6 +622,16 @@ static void *service(void *unused)
                 if (!f.message_sequence || (r->seen && f.sample.sequence < r->latest.sequence)) {
                     (void)disconnect(p, ranks); broken = true; continue;
                 }
+                if (!root_metadata_valid(&f)) {
+                    (void)disconnect(p, ranks);
+                    broken = true;
+                    continue;
+                }
+                if (!f.rank && broker_only) {
+                    atomic_store(&earned_origin, f.root_origin_seconds);
+                    atomic_store(&startup_charge, f.root_startup_seconds);
+                    atomic_store(&startup_sealed, f.root_startup_sealed);
+                }
                 r->message_sequence = f.message_sequence;
                 if (f.demand_generation < r->demand_generation) { (void)disconnect(p, ranks); broken = true; continue; }
                 r->wants_credit = f.request_credit && !f.sample.retiring; r->requested_ns = f.requested_ns;
@@ -518,7 +655,13 @@ static void *service(void *unused)
                 r->latest = f.sample; r->seen = r->connected = true; r->last_update = now_ns;
             }
             bool all = !broken, all_final = !broken, unfunded = false, done = wave != 0;
-            double spent = atomic_load_explicit(&startup_charge, memory_order_relaxed), reserved = 0;
+            double broker_cpu=(double)broker_cpu_last/1e9;
+            if (broker_only && !broker_cpu_snapshot(&broker_cpu_last, &broker_cpu)) {
+                broker_clock_invalid = true;
+                broken = true;
+                all = all_final = false;
+            }
+            double spent = atomic_load_explicit(&startup_charge, memory_order_relaxed) + broker_cpu, reserved = 0;
             for (unsigned i = 0; i < world; ++i) {
                 Rank *r = &ranks[i];
                 bool final_closed = r->latest.final && !r->connected;
@@ -553,7 +696,7 @@ static void *service(void *unused)
                         ranks[i].latest.sequence > ranks[i].member_sample_sequence &&
                         ranks[i].registration_generation <= ranks[i].member_generation) ranks[i].registered = false;
             }
-            if (all && !wave_pending) {
+            if (all && !wave_pending && atomic_load(&startup_sealed)) {
                 /* Spend only already earned global headroom, prioritizing
                  * demand; no timeout ever reclaims an unacknowledged grant. */
                 for (unsigned k = 0; k < world && remaining > 0; ++k) {
@@ -611,7 +754,7 @@ static void *service(void *unused)
                 uint64_t decision = ++reply_sequence;
                 p->outgoing = (Frame){.magic = MAGIC, .version = PROTOCOL_VERSION, .nonce = job_nonce, .rank = id,
                     .size = world, .reply_sequence = decision,
-                    .view = {.granted_total_ns = ranks[id].credit_total_ns, .active = all, .cohort_finalized = all_final, .returned_total_ns = ranks[id].returned_ns, .wave_participant = ranks[id].participant, .acknowledged_demand_generation = ranks[id].fulfilled_generation, .wave = wave, .decision_sequence = decision, .view_epoch = decision, .root_completed_wave = completed_wave,
+                    .view = {.startup_sealed = atomic_load(&startup_sealed), .broker_process_id = broker_only ? (uint64_t)getpid() : 0, .accounting_invalid = broker_clock_invalid, .broker_final_written = atomic_load(&root_final_sent), .broker_cpu_seconds = broker_cpu, .granted_total_ns = ranks[id].credit_total_ns, .active = all, .cohort_finalized = all_final, .returned_total_ns = ranks[id].returned_ns, .wave_participant = ranks[id].participant, .acknowledged_demand_generation = ranks[id].fulfilled_generation, .wave = wave, .decision_sequence = decision, .view_epoch = decision, .root_completed_wave = completed_wave,
                         .acknowledged_sequence = ranks[id].latest.sequence,
                         .budget_seconds = budget, .reserved_seconds = reserved, .control_reserve_seconds = grace_reserve + closing_reserve, .global_spent_seconds = spent,
                         .remaining_seconds = remaining,
@@ -631,7 +774,27 @@ static void *service(void *unused)
             bool sent_all = all_final;
             for (unsigned i = 0; i < world; ++i) sent_all = sent_all && peers[i].rank >= 0 && peers[i].final_sent;
             if (sent_all && !atomic_load(&root_final_sent)) record_event('A', rank_id, 0, wave, 0);
-            atomic_store_explicit(&root_final_sent, sent_all, memory_order_release);
+            bool was_sent = atomic_exchange_explicit(&root_final_sent, sent_all, memory_order_acq_rel);
+            if (sent_all && !was_sent)
+                recheck_root = true;
+            if (broker_only && sent_all) {
+                bool proof = false;
+                for (unsigned i = 0; i < world; ++i) {
+                    if (peers[i].rank == 0 && peers[i].proof_sent)
+                        proof = true;
+                }
+                if (proof)
+                    break;
+            }
+        }
+        if (broker_only) {
+            if (broken) {
+                if (!broken_deadline)
+                    broken_deadline = seconds_now() + .05;
+                if (seconds_now() >= broken_deadline)
+                    break;
+            }
+            continue;
         }
         uint64_t current_consumed = atomic_load(&consumed_ns);
         uint64_t learning_request = atomic_load_explicit(&demand_generation, memory_order_acquire);
@@ -689,6 +852,8 @@ static void *service(void *unused)
             bool urgent = atomic_exchange(&flush_requested, false) || next.returned_ns != prior->returned_ns || request_target != last_request_target ||
                 next.demand_generation != prior->demand_generation || next.request_credit != prior->request_credit ||
                 next.sample.completed_wave != prior->sample.completed_wave || next.sample.retiring != prior->sample.retiring || next.sample.final != prior->sample.final ||
+                next.root_origin_seconds != prior->root_origin_seconds || next.root_startup_seconds != prior->root_startup_seconds ||
+                next.root_startup_sealed != prior->root_startup_sealed ||
                 next.sample.finalizer_invalid != prior->sample.finalizer_invalid ||
                 next.sample.attached_targets != prior->sample.attached_targets;
             if (next.sample.sequence && (urgent || now_ns - local.last_send >= UINT64_C(100000000))) {
@@ -713,7 +878,7 @@ static void *service(void *unused)
             if (result == 1) {
                 Frame f = local.incoming; local.received = 0;
                 if (!header(&f) || f.rank != rank_id || !f.reply_sequence ||
-                    !number(f.view.global_spent_seconds) || !number(f.view.remaining_seconds) ||
+                    (native_client && !f.view.broker_process_id) || !number(f.view.broker_cpu_seconds) || !number(f.view.global_spent_seconds) || !number(f.view.remaining_seconds) ||
                     !number(f.view.allowance_seconds) || !number(f.view.wave_span_seconds) || !number(f.view.granted_total_seconds) || f.view.granted_total_ns > MAX_TOTAL_NS || f.view.granted_total_ns < atomic_load(&granted_ns) ||
                     f.view.granted_total_seconds != (double)f.view.granted_total_ns / 1e9 || !number(f.view.budget_seconds) || !number(f.view.reserved_seconds) || !number(f.view.control_reserve_seconds)) {
                     close_fd(&local.fd); broken = true;
@@ -745,17 +910,22 @@ static void *service(void *unused)
         int64_t balance = atomic_load_explicit(&available_ns, memory_order_acquire);
         uint64_t keep = atomic_load(&low_water_ns);
         pthread_mutex_lock(&sample_mutex);
-        bool attached = effective_targets(local_sample.attached_targets) > 0;
+        uint32_t fallback_attached = local_sample.attached_targets;
         pthread_mutex_unlock(&sample_mutex);
-        if (attached && !idle_returned && now_ns - last_consumption >= UINT64_C(100000000) &&
-            !atomic_load(&pressure_notice) && !atomic_load(&request_started_ns) &&
-            balance > 0 && (uint64_t)balance > keep) {
-            int64_t target = (int64_t)keep;
-            if (atomic_compare_exchange_strong(&available_ns, &balance, target)) {
-                uint64_t returned = (uint64_t)(balance - target);
-                atomic_fetch_add(&debit_ns, returned); atomic_fetch_add(&returned_ns, returned);
-                record_event('I', rank_id, atomic_load(&demand_generation), last_wave, (double)returned / 1e9);
-                idle_returned = true; poke();
+        /* Load the event before its fresh activity clock. A thread stop can
+         * have held this service since the loop's earlier timestamp. */
+        uint64_t physical_word = atomic_load_explicit(&physical_targets, memory_order_acquire);
+        uint64_t idle_now = ns_now(CLOCK_MONOTONIC);
+        PhysicalIdleSnapshot physical = physical_idle_snapshot(physical_word, fallback_attached,
+            idle_now, &last_physical_activity, &last_consumption, &idle_returned);
+        if (idle_now >= now_ns &&
+            idle_return_due(physical, idle_now, last_consumption, idle_returned, balance, keep)) {
+            uint64_t returned = idle_return_commit(physical, balance, keep);
+            if (returned) {
+                idle_returned = true;
+                record_event('I', rank_id, atomic_load(&demand_generation), last_wave,
+                    (double)returned / 1e9);
+                poke();
             }
         }
         uint64_t cpu_end = ns_now(CLOCK_THREAD_CPUTIME_ID);
@@ -773,15 +943,42 @@ int peak_global_budget_start(const char *host, unsigned short port, unsigned ran
 {
     if (!job_nonce || !host || !port || !size || size > LIMIT || rank >= size || !number(target) ||
         atomic_load(&running) || (rank == 0 && listener < 0)) return -1;
+    const char *trace = getenv("PEAK_MPI_GLOBAL_TRACE");
+    const char *legacy = getenv("PEAK_GLOBAL_BUDGET_TRACE");
+    bool tracing = (trace && !strcmp(trace, "1")) || (legacy && !strcmp(legacy, "1"));
+#ifdef PEAK_GLOBAL_BUDGET_NATIVE
+    if (!rank) {
+        broker_pid = peak_global_budget_spawn(listener, size, target, job_nonce, tracing);
+        if (broker_pid < 0)
+            return -1;
+        close_fd(&listener);
+    }
+    native_client = true;
+#else
+    (void)tracing;
+#endif
     int fd = connect_host(host, port);
-    if (fd < 0) return -1;
+    if (fd < 0) {
+#ifdef PEAK_GLOBAL_BUDGET_NATIVE
+        peak_global_budget_reap(broker_pid);
+        broker_pid = -1;
+#endif
+        return -1;
+    }
     wake_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-    if (wake_fd < 0) { close(fd); return -1; }
-    event_count = 0; const char *trace = getenv("PEAK_MPI_GLOBAL_TRACE");
+    if (wake_fd < 0) { close(fd);
+#ifdef PEAK_GLOBAL_BUDGET_NATIVE
+        peak_global_budget_reap(broker_pid);
+        broker_pid = -1;
+#endif
+        return -1; }
+    event_count = 0; trace = getenv("PEAK_MPI_GLOBAL_TRACE");
     const char *legacy_trace = getenv("PEAK_GLOBAL_BUDGET_TRACE");
     trace_enabled = (trace && !strcmp(trace, "1")) || (legacy_trace && !strcmp(legacy_trace, "1"));
     client = fd; rank_id = rank; world = size; ratio = target; notify = wake;
     atomic_store(&owner, getpid());
+    atomic_store(&startup_sealed, !native_client);
+    atomic_store(&physical_revision, 0);
     atomic_store(&physical_targets, 0); atomic_store(&earned_origin, 0); atomic_store(&local_retiring, false);
     atomic_store(&rejected_spend_count, 0); atomic_store(&available_ns, 0); atomic_store(&local_attached, 0); atomic_store(&recovery_target_ns, 0); atomic_store(&request_recovery, false);
     atomic_store(&finalizer_state, 0); atomic_store(&public_finalized, false);
@@ -792,7 +989,12 @@ int peak_global_budget_start(const char *host, unsigned short port, unsigned ran
     atomic_store(&running, true);
     if (pthread_listener_mark_next_created_thread_helper) pthread_listener_mark_next_created_thread_helper();
     if (pthread_create(&worker, NULL, service, NULL)) {
-        atomic_store(&running, false); close_fd(&client); close_fd(&wake_fd); return -1;
+        atomic_store(&running, false); close_fd(&client); close_fd(&wake_fd);
+#ifdef PEAK_GLOBAL_BUDGET_NATIVE
+        peak_global_budget_reap(broker_pid);
+        broker_pid = -1;
+#endif
+        return -1;
     }
     return 0;
 }
@@ -814,8 +1016,15 @@ void peak_global_budget_publish(const PeakGlobalBudgetSample *s)
 void peak_global_budget_physical_targets(uint32_t count)
 {
     if (getpid() != atomic_load(&owner) || !atomic_load(&running)) return;
-    uint64_t word = (UINT64_C(1) << 32) | count;
-    if (atomic_exchange_explicit(&physical_targets, word, memory_order_acq_rel) != word) poke();
+    /* Every backend publication is an activity event, including a complete
+     * zero -> same-positive cycle that the service never observed in between.
+     * Publish revision and count together before waking the service. */
+    uint64_t revision = (uint32_t)(atomic_fetch_add(&physical_revision, 1) + 1);
+    if (!revision)
+        revision = (uint32_t)(atomic_fetch_add(&physical_revision, 1) + 1);
+    uint64_t word = (revision << 32) | count;
+    atomic_store_explicit(&physical_targets, word, memory_order_release);
+    poke();
     if (count) { atomic_store(&recovery_target_ns, 0); atomic_store(&request_recovery, false); }
 }
 void peak_global_budget_startup(double seconds)
@@ -823,8 +1032,11 @@ void peak_global_budget_startup(double seconds)
     if (getpid() != atomic_load(&owner) || rank_id != 0 || !number(seconds)) return;
     double old = atomic_load_explicit(&startup_charge, memory_order_relaxed);
     for (unsigned attempt = 0; attempt < 2 && old < seconds; ++attempt)
-        if (atomic_compare_exchange_weak_explicit(&startup_charge, &old, seconds,
+        if (atomic_compare_exchange_strong_explicit(&startup_charge, &old, seconds,
                 memory_order_release, memory_order_relaxed)) break;
+    /* A failed bounded maximum update must never seal an older fee. */
+    if (atomic_load_explicit(&startup_charge, memory_order_acquire) >= seconds)
+        atomic_store_explicit(&startup_sealed, true, memory_order_release);
     poke();
 }
 void peak_global_budget_origin(double seconds)
@@ -995,8 +1207,10 @@ bool peak_global_budget_final_flush(unsigned timeout_ms)
         previous = now;
         PeakGlobalBudgetView v = peak_global_budget_view();
         if (v.accounting_invalid) return false;
-        if (v.acknowledged_sequence >= sequence && v.cohort_finalized &&
-            (rank_id || atomic_load_explicit(&root_final_sent, memory_order_acquire))) return true;
+        bool root_written = rank_id || (native_client ? v.broker_final_written :
+            atomic_load_explicit(&root_final_sent, memory_order_acquire));
+        if (v.acknowledged_sequence >= sequence && v.cohort_finalized && root_written)
+            return true;
         if (now - started >= (uint64_t)timeout_ms * 1000000 || waits == timeout_ms) break;
         struct timespec delay = {0, 1000000}; nanosleep(&delay, NULL);
     }
@@ -1025,6 +1239,63 @@ void peak_global_budget_stop(void)
         }
     }
     close_fd(&client); close_fd(&listener); close_fd(&wake_fd);
+#ifdef PEAK_GLOBAL_BUDGET_NATIVE
+    if (broker_pid > 0) {
+        PeakGlobalBudgetView final = peak_global_budget_view();
+        pid_t old = broker_pid;
+        bool reaped = peak_global_budget_reap(old);
+        broker_pid = -1;
+        fprintf(stderr, "[peak] native global broker: pid=%ld cpu_seconds=%.9g "
+                        "all_final_replies_written=%d reap_confirmed=%d\n",
+                (long)old, final.broker_cpu_seconds, final.broker_final_written, reaped);
+    }
+#endif
+}
+int peak_global_budget_broker_main(int argc, char **argv)
+{
+    if (argc != 9)
+        return 2;
+    char *end = NULL;
+    unsigned long long values[5];
+    const unsigned indexes[5] = {2, 3, 4, 6, 7};
+    for (unsigned i = 0; i < 5; i++) {
+        errno = 0;
+        values[i] = strtoull(argv[indexes[i]], &end, 10);
+        if (errno || !end || *end)
+            return 2;
+    }
+    errno = 0;
+    uint64_t bits = strtoull(argv[5], &end, 10);
+    double target;
+    memcpy(&target, &bits, sizeof target);
+    if (errno || !end || *end || !number(target) || !values[2] || values[2] > LIMIT || !values[3] ||
+        values[0] != 3 || values[1] != 4 || values[4] != (unsigned long long)getppid())
+        return 2;
+    broker_owner_pid = (pid_t)values[4];
+    listener = 3;
+    world = (unsigned)values[2];
+    job_nonce = values[3];
+    ratio = target;
+    rank_id = 0;
+    broker_only = true;
+    atomic_store(&owner, getpid());
+    atomic_store(&running, true);
+    trace_enabled = !strcmp(argv[8], "1");
+    unsigned char ready = 0xa7;
+    if (write(4, &ready, 1) != 1)
+        return 2;
+    close(4);
+    service(NULL);
+    atomic_store(&running, false);
+    close_fd(&listener);
+    for (unsigned i = event_count > 256 ? event_count - 256 : 0; i < event_count; i++) {
+        BudgetEvent *e = &events[i % 256];
+        fprintf(stderr,
+                "[peak] global event: ns=%llu kind=%c rank=%u demand=%llu wave=%llu amount=%.17g\n",
+                (unsigned long long)e->time, e->kind, e->rank, (unsigned long long)e->generation,
+                (unsigned long long)e->wave, e->amount);
+    }
+    return 0;
 }
 
 #endif

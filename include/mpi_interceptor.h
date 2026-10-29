@@ -7,7 +7,9 @@
  *
  * MPI_Init/PMPI_Init and their thread-level variants are interposed with
  * ordinary dynamic symbols rather than Gum patches. By default PEAK is already
- * active when they run. With PEAK_MPI_ACTIVATION_POLICY=post-init, PEAK remains
+ * active when they run. Global prepare mode initializes support eagerly but
+ * keeps user targets native until a paid global lease. With
+ * PEAK_MPI_ACTIVATION_POLICY=post-init, PEAK remains
  * configured but inactive while the real initializer loads transport
  * providers, then activates Gum hooks from the outermost return path.
  */
@@ -37,6 +39,7 @@ PEAK_MPI_INTERCEPTOR_API int peak_mpi_internal_context_active(void);
  * @param result Return code from the real MPI or PMPI initializer.
  */
 PEAK_MPI_INTERCEPTOR_API void peak_mpi_init_completed(int result);
+PEAK_MPI_INTERCEPTOR_API double peak_mpi_runtime_preparation_seconds(void);
 
 /**
  * @brief Attach MPI function interception

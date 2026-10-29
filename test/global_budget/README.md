@@ -1,9 +1,11 @@
 # Experimental global-budget transport checks
 
-This module uses one job-scoped, random-nonce TCP broker and one helper thread
-per process. It never calls MPI. The MPI init integration bootstraps the address,
+This module uses one job-scoped, random-nonce TCP broker and one client helper
+thread per rank. Production starts a separate native `peak_detach_helper
+--global-budget-broker` process; rank zero is also a client. The ptrace helper
+is a different process. Standalone protocol tests retain an embedded broker. It never calls MPI. The MPI init integration bootstraps the address,
 port and nonce on the application's initialization thread; all participating
-ranks must opt in. Protocol version 2 is Linux/64-bit, homogeneous-ABI only,
+ranks must opt in. Protocol version 4 is Linux/64-bit, homogeneous-ABI only,
 with at most 64 ranks. Other platforms build inert API stubs.
 
 Runtime cost snapshots are cumulative, finite and monotonic. The root uses its
@@ -124,7 +126,8 @@ acknowledges the request generation, allowing the next low-water crossing to
 produce a new immediate request. The root reserves every positive grant before
 sending it. Credit return uses the same atomic debit counter as consumption and
 a cumulative returned counter; replay cannot return funds twice. After 100ms
-without consumption, the owner helper may explicitly return unused credit above
+without consumption or a physical installation event, the owner helper may
+explicitly return unused credit above
 one predictive block, once per idle interval, provided no refill is pending.
 The root never reclaims credits merely because they are old. Registration is
 released only after confirmed DONE with detached targets, not on idle return.
@@ -332,3 +335,51 @@ fixed-work hardware timings are still required to assess slowdown.
 `test_control_escrow.c` covers completion between the HB watermark and actual
 cost reads, permanent high-water double charging, cancelled paid operations,
 legacy unpaid control alongside new prepayment, and rejection of old marks.
+
+The native broker has no PEAK preload/audit environment or inherited application
+FDs beyond standard streams and its explicit listener/readiness channels. Its
+actual process CPU is charged once, separately from every client thread's CPU.
+Root origin/startup accounting travels in authenticated rank-zero messages.
+FINAL success for rank zero additionally requires the broker's proof that all
+cohort-finalized replies were fully written. After writing that proof the broker
+may exit naturally; teardown performs bounded termination/reaping if necessary
+and prints PID, CPU, all-written proof and actual reap confirmation.
+
+The broker checks its process-parent PID at each bounded poll iteration. This
+supports MPI initialization from a nonleader pthread whose lifetime is shorter
+than the rank's, while still terminating after actual parent-process exit.
+`test_native_broker.c` exercises SIGSTOP of the root client while another rank
+receives a grant, environment/maps isolation, early FINAL, exec failure, broker
+failure, parent exit, and creator-pthread exit. `test_broker_clock.c` verifies
+failed or backward broker CPU clocks cannot become zero-cost accounting.
+
+Native startup readiness is separate from permission to issue credit. The broker
+may report active while startup is unsealed, allowing the MPI bootstrap to
+finish measuring its own cost. Rank zero first publishes the final startup fee,
+then commits a monotonic seal. A request snapshot acquires that seal before
+reading the fee, and the broker charges the authenticated frame before enabling
+grants or STOP funding decisions. Peers cannot seal startup. The returned
+`startup_sealed` diagnostic is the broker's acknowledgment, rather than a local
+assumption. `test_startup_seal.c` checks ample gross budget cannot fund requests
+before this commitment, a fee that exhausts the budget still prevents grants,
+and an affordable sealed fee permits grants. It also forces the snapshot race
+and rejects seal/cost regressions. Embedded legacy fixtures begin sealed.
+
+Physical membership publications carry count and an activity revision in one
+atomic word. A new positive revision starts a fresh idle interval, including a
+close/restore cycle whose zero count the client service did not observe. The
+service reads that word before taking a fresh monotonic timestamp, so time spent
+waiting detached or stopped in a control window cannot become attached idle.
+It revalidates the physical word before returning surplus while holding the
+listener's existing controller lock through a nonblocking guard. The guard also
+refuses any queued or in-progress mutation, protecting prepaid partial installs.
+It is released after wallet/counter commit and before trace or wake operations.
+Native mode without both listener guard callbacks conservatively skips automatic
+idle returns; embedded protocol fixtures retain their direct-CAS fallback. The original 100ms
+idle interval and funded predictive tail remain unchanged.
+`test_physical_idle_epoch.c` verifies exact time boundaries, missed same-count
+cycles, invalid clocks, stale-snapshot rejection and integer conservation.
+
+`test_idle_guard.c` forces a publication attempt after the word recheck, checks
+that the shared controller lock excludes it, preserves prepaid pending leases,
+and permits quiescent surplus returns without changing the idle threshold.

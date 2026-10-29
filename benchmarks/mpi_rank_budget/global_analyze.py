@@ -4,6 +4,7 @@ import argparse,json,re,sys,statistics,math
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parent))
 from sync_summary import workload,peak
+from recovery_analyze import parse as recovery_workload
 CASES=('allreduce-rotating','allreduce-slack','bcast-slack','iallreduce-critical','funded-allreduce-rotating')
 LABELS=('N0','L0','G0','G1','L1','N1')
 def global_report(text):
@@ -59,6 +60,36 @@ def global_report(text):
             n=float(value)
             if not math.isfinite(n) or n<0:raise ValueError('invalid extra global cost '+key)
             fields[key]=n
+    activation_rows=re.findall(r'MPI activation: ([^\n]+)',text)
+    if activation_rows:fields['activation']=dict(re.findall(r'(\w+)=([^\s]+)',activation_rows[-1]))
+    preparation_rows=re.findall(r'MPI preparation: ([^\n]+)',text)
+    if preparation_rows:
+        preparation=dict(re.findall(r'(\w+)=([^\s]+)',preparation_rows[-1]))
+        for key in ('preparation_seconds','activation_seconds','bootstrap_seconds','charged_startup_seconds'):
+            preparation[key]=float(preparation[key])
+            if not math.isfinite(preparation[key]) or preparation[key]<0:raise ValueError('invalid preparation cost')
+        fields['preparation']=preparation
+    service_rows=re.findall(r'MPI global service: ([^\n]+)',text)
+    if service_rows:
+        service=dict(re.findall(r'(\w+)=([^\s]+)',service_rows[-1]))
+        for key in ('settlement','parent_process_id','broker_process_id','broker_final_written'):
+            service[key]=int(service[key])
+            if service[key]<0:raise ValueError('invalid native service field')
+        if 'startup_sealed' in service:
+            service['startup_sealed']=int(service['startup_sealed'])
+            if service['startup_sealed'] not in (0,1):raise ValueError('invalid startup seal')
+        service['broker_cpu_seconds']=float(service['broker_cpu_seconds'])
+        if not math.isfinite(service['broker_cpu_seconds']) or service['broker_cpu_seconds']<0:raise ValueError('invalid service CPU')
+        fields['service']=service
+    broker_rows=re.findall(r'native global broker: ([^\n]+)',text)
+    if broker_rows:
+        broker=dict(re.findall(r'(\w+)=([^\s]+)',broker_rows[-1]))
+        for key in ('pid','all_final_replies_written','reap_confirmed'):
+            broker[key]=int(broker[key])
+            if broker[key]<0:raise ValueError('invalid native broker proof')
+        broker['cpu_seconds']=float(broker['cpu_seconds'])
+        if not math.isfinite(broker['cpu_seconds']) or broker['cpu_seconds']<0:raise ValueError('invalid broker CPU')
+        fields['native_broker']=broker
     fields['settlement_confirmed']=bool(fields['shutdown_confirmed'])
     fields['last_wave_globally_completed']=fields['root_completed_wave']>=fields['wave']
     fields['observed_emergency_fallback']=fields.get('emergency_fallback_count',0)>0
@@ -123,24 +154,53 @@ def validate_meter(root,label,work,policy,global_mode):
         expected=f'bench_exec_meter entry_ld_preload=empty entry_ld_audit=empty policy={policy} global={int(global_mode)}'
         if err.count(expected)!=1 or re.search(r'^PEAK done with: .*exec_meter',err,re.M):raise ValueError('missing native meter entry/policy proof')
 
+def validate_final_runtime(glob,rank):
+    activation=glob.get('activation',{})
+    if activation.get('policy')!='prepare' or activation.get('targets')!='native-until-paid':raise ValueError('missing prepare/native-until-paid product path')
+    admission=glob.get('initial_admission',{})
+    if admission.get('bootstrap_finished')!=1 or admission.get('first_local_attach_count')!=0 or admission.get('first_paid_attach_count',-1)<0:raise ValueError('unproven paid initial target admission')
+    prep=glob.get('preparation',{})
+    if not prep or not math.isclose(prep['charged_startup_seconds'],sum(prep[k] for k in ('preparation_seconds','activation_seconds','bootstrap_seconds')),rel_tol=1e-7,abs_tol=1e-8):raise ValueError('startup charge does not match preparation+activation+bootstrap')
+    service=glob.get('service',{})
+    if service.get('startup_sealed')!=1:raise ValueError('missing broker-authenticated startup seal')
+    if service.get('settlement')!=1 or service.get('broker_process_id',0)<=0 or service.get('parent_process_id',0)<=0 or service.get('broker_final_written') not in (0,1):raise ValueError('missing confirmed native broker service view')
+    if glob.get('member',{}).get('cohort_finalized')!=1 or glob.get('shutdown_confirmed')!=1:raise ValueError('missing final cohort acknowledgement')
+    if rank==0:
+        broker=glob.get('native_broker',{})
+        if service.get('broker_final_written')!=1 or broker.get('pid',0)!=service['broker_process_id'] or broker.get('all_final_replies_written')!=1 or broker.get('reap_confirmed')!=1 or service['broker_process_id']==service['parent_process_id']:raise ValueError('root broker is not independently confirmed/reaped')
+
+def potential_calls(work):
+    if 'potential_profiled_calls_by_rank' in work:return work['potential_profiled_calls_by_rank']
+    return {int(row['rank']):int(row['potential_profiled_calls']) for row in work['phases']['phase']['ranks']}
+
+def elapsed_sample(work,metric):
+    if metric=='main_to_finalize':return work['process_seconds']
+    if metric=='exec_to_finalize':return work['exec_seconds']
+    if metric=='burst_total':return sum(work['phases'][name]['root_wall'] for name in ('burst_before','burst_after'))
+    if metric=='native_total':return sum(work['phases'][name]['root_wall'] for name in ('native_before','native_between'))
+    if metric=='measured_stages_total':return sum(phase['root_wall'] for phase in work['phases'].values())
+    return work['phases']['phase']['root_wall']+(work['phases']['warmup']['root_wall'] if metric=='warmup_main' else 0)
+
 def main():
-    p=argparse.ArgumentParser();p.add_argument('results',type=Path);p.add_argument('--require-final-members',action='store_true');p.add_argument('--require-diagnostics',action='store_true');p.add_argument('--set',choices=('small','matrix','funded','targeted','matrix22','final32','escrow_targeted','activation_probe','all'),default='small');a=p.parse_args();cases={};errors={}
+    p=argparse.ArgumentParser();p.add_argument('results',type=Path);p.add_argument('--require-final-members',action='store_true');p.add_argument('--require-native-broker',action='store_true');p.add_argument('--require-diagnostics',action='store_true');p.add_argument('--set',choices=('small','matrix','funded','targeted','matrix22','final32','escrow_targeted','activation_probe','funded_recovery','final_candidate','final_matrix','all'),default='small');a=p.parse_args();cases={};errors={}
     matrix=tuple(sy+'-'+la for sy in ('allreduce','barrier','bcast','ring','iallreduce') for la in ('rotating','slack','critical','aligned'))
     funded=tuple('funded-'+sy+'-rotating' for sy in ('allreduce','barrier','bcast','ring','iallreduce'))
     funded+=tuple('funded-concurrent-'+sy+'-rotating' for sy in ('allreduce','barrier','bcast','ring','iallreduce'))
     matrix22=matrix+('bcast-rotating-repeat1','bcast-rotating-repeat2')
     activation_cases=tuple(policy+'-'+name for policy in ('immediate','post-init') for name in ('bcast-rotating','barrier-critical','barrier-aligned','funded-concurrent-allreduce-rotating','iallreduce-critical'))
-    selected={'activation_probe':activation_cases,'escrow_targeted':('bcast-rotating','barrier-critical','barrier-aligned','funded-concurrent-allreduce-rotating','iallreduce-critical'),'matrix22':matrix22,'final32':matrix22+funded,'targeted':('bcast-rotating','barrier-critical','barrier-aligned','funded-concurrent-allreduce-rotating'),'small':CASES,'matrix':matrix,'funded':funded,'all':matrix+funded}[a.set]
+    funded_recovery=tuple('funded-concurrent-'+sy+'-rotating' for sy in ('allreduce','barrier','bcast','ring','iallreduce'))+('earned-recovery-long',)
+    selected={'final_matrix':matrix22,'funded_recovery':funded_recovery,'final_candidate':matrix22+funded_recovery,'activation_probe':activation_cases,'escrow_targeted':('bcast-rotating','barrier-critical','barrier-aligned','funded-concurrent-allreduce-rotating','iallreduce-critical'),'matrix22':matrix22,'final32':matrix22+funded,'targeted':('bcast-rotating','barrier-critical','barrier-aligned','funded-concurrent-allreduce-rotating'),'small':CASES,'matrix':matrix,'funded':funded,'all':matrix+funded}[a.set]
     for name in selected:
       try:
-        root=a.results/name;runs={l:workload(root,l) for l in LABELS};ref=runs['N0'];reports={}
+        root=a.results/name;long_case=name=='earned-recovery-long';loader=recovery_workload if long_case else workload;runs={l:loader(root,l) for l in LABELS};ref=runs['N0'];reports={}
         for l,r in runs.items():
             if int(r['config']['ranks'])!=32 or int(r['config']['threads'])!=6 or not r['affinity_unique'] or len(set(b['host'] for b in r['bindings'].values()))!=2:raise ValueError('invalid topology')
-            if r['config']!=ref['config'] or r['scenario']!=ref['scenario'] or r['bindings']!=ref['bindings'] or any(r['phases'][s]['checksum']!=ref['phases'][s]['checksum'] for s in ('warmup','phase')):raise ValueError('mismatched workload')
+            if r['config']!=ref['config'] or r['scenario']!=ref['scenario'] or r['bindings']!=ref['bindings'] or any(r['phases'][s]['checksum']!=ref['phases'][s]['checksum'] for s in ref['phases']):raise ValueError('mismatched workload')
             if a.set=='activation_probe':validate_meter(root,l,r,'post-init' if name.startswith('post-init-') else 'immediate',l[0]=='G')
+            elif a.set in ('funded_recovery','final_candidate','final_matrix'):validate_meter(root,l,r,'default',l[0]=='G')
             if l[0] not in 'LG':continue
             perrank=[]
-            expected={int(row['rank']):int(row['potential_profiled_calls']) for row in r['phases']['phase']['ranks']}
+            expected=potential_calls(r)
             for rank in range(32):
                 text=(root/l/f'rank-{rank}.err').read_text();local=peak(text);glob=global_report(text) if l[0]=='G' or 'MPI global budget:' in text else {'configured':0,'ever_active':0}
                 policies=re.findall(r'MPI budget risk policy: ([^\n]+)',text)
@@ -162,26 +222,36 @@ def main():
                     bootstrap=dict(re.findall(r'(\w+)=([^\s]+)',boot[-1]))
                     if bootstrap.get('backend')!='tcp' or int(bootstrap.get('required_thread_level',-1))!=1 or int(bootstrap.get('provided_thread_level',-1))<1:raise ValueError('invalid FUNNELED bootstrap')
                     glob['bootstrap']=bootstrap
+                    if a.set in ('funded_recovery','final_candidate','final_matrix'):validate_final_runtime(glob,rank)
+                    if a.require_native_broker and rank==0:
+                        broker=glob.get('native_broker',{})
+                        if broker.get('pid',0)<=0 or broker.get('all_final_replies_written')!=1 or broker.get('reap_confirmed')!=1:raise ValueError('missing confirmed independent native broker')
+                        entries=list((root/l).glob('entry-*.txt'))
+                        parent=[int(re.search(r'pid=(\d+)',entry.read_text())[1]) for entry in entries if 'PMI_RANK=0 ' in entry.read_text()]
+                        if len(parent)!=1 or broker['pid']==parent[0]:raise ValueError('broker is not an independent root process')
+
                 parsed=timing_and_events(text)
                 perrank.append({'local':local,'global':glob,'timing_events':parsed,'post_wave_restoration_proofs':restoration_proof(text,parsed)})
+            if l[0]=='G' and a.set in ('funded_recovery','final_candidate','final_matrix') and len({r['global']['service']['broker_process_id'] for r in perrank})!=1:raise ValueError('ranks disagree on native broker PID')
             reports[l]=perrank
         groups={}
         for g,labels in {'native':('N0','N1'),'local':('L0','L1'),'global':('G0','G1')}.items():
             groups[g]={}
-            for metric in (('main','warmup_main','main_to_finalize','exec_to_finalize') if a.set=='activation_probe' else ('main','warmup_main','main_to_finalize')):
-                samples=[runs[l]['exec_seconds'] if metric=='exec_to_finalize' else runs[l]['process_seconds'] if metric=='main_to_finalize' else runs[l]['phases']['phase']['root_wall']+(runs[l]['phases']['warmup']['root_wall'] if metric=='warmup_main' else 0) for l in labels]
+            for metric in (('burst_total','native_total','measured_stages_total','main_to_finalize','exec_to_finalize') if long_case else ('main','warmup_main','main_to_finalize','exec_to_finalize') if a.set in ('activation_probe','funded_recovery','final_candidate','final_matrix') else ('main','warmup_main','main_to_finalize')):
+                samples=[elapsed_sample(runs[l],metric) for l in labels]
                 groups[g][metric]={'samples':samples,'mean':statistics.mean(samples)}
         for g in groups.values():
             for metric,v in g.items():v['ratio_to_native']=v['mean']/groups['native'][metric]['mean']
-        coord={l:{'rank0_last_view':reports[l][0]['global'],'view_epochs':[r['global'].get('view_epoch') for r in reports[l]],'ever_active_ranks':sum(bool(r['global'].get('ever_active')) for r in reports[l]),'profiled_targets_by_rank':[r['local']['profiled_targets'] for r in reports[l]],'local_allowance_by_rank':[r['global'].get('allowance_seconds',0) for r in reports[l]],'emergency_ranks':sum(bool(r['global'].get('observed_emergency_fallback')) for r in reports[l]),'runtime_degraded_ranks':sum(r['global'].get('runtime_degraded_samples',0)>0 for r in reports[l]),'invalid_accounting_ranks':sum(r['global'].get('invalid_accounting_samples',0)>0 for r in reports[l]),'settlement_confirmed_ranks':sum(bool(r['global'].get('settlement_confirmed')) for r in reports[l]),'positive_grant_ranks':sum(r['global'].get('granted_total_seconds',0)>0 for r in reports[l]),'reattached_targets':sum(r['local']['reattached'] for r in reports[l]),'recorded_calls':sum(r['local']['calls'] for r in reports[l]),'local_windows':sum(r['local']['windows'] for r in reports[l]),'potential_selected_calls':sum(int(row['potential_profiled_calls']) for row in runs[l]['phases']['phase']['ranks']),'selected_call_fraction':sum(r['local']['calls'] for r in reports[l])/sum(int(row['potential_profiled_calls']) for row in runs[l]['phases']['phase']['ranks']),'observed_demand_ranks':sum(int(row['potential_profiled_calls'])>0 for row in runs[l]['phases']['phase']['ranks']),'ordinary_emergency_free':all(r['global'].get('emergency_fallback_count',0)==0 for r in reports[l]),'restoration_observed':any(r['local']['reattached']>0 and r['local']['revisited']>0 for r in reports[l])} for l in ('G0','G1')}
+        coord={l:{'rank0_last_view':reports[l][0]['global'],'view_epochs':[r['global'].get('view_epoch') for r in reports[l]],'ever_active_ranks':sum(bool(r['global'].get('ever_active')) for r in reports[l]),'profiled_targets_by_rank':[r['local']['profiled_targets'] for r in reports[l]],'local_allowance_by_rank':[r['global'].get('allowance_seconds',0) for r in reports[l]],'emergency_ranks':sum(bool(r['global'].get('observed_emergency_fallback')) for r in reports[l]),'runtime_degraded_ranks':sum(r['global'].get('runtime_degraded_samples',0)>0 for r in reports[l]),'invalid_accounting_ranks':sum(r['global'].get('invalid_accounting_samples',0)>0 for r in reports[l]),'settlement_confirmed_ranks':sum(bool(r['global'].get('settlement_confirmed')) for r in reports[l]),'positive_grant_ranks':sum(r['global'].get('granted_total_seconds',0)>0 for r in reports[l]),'reattached_targets':sum(r['local']['reattached'] for r in reports[l]),'recorded_calls':sum(r['local']['calls'] for r in reports[l]),'local_windows':sum(r['local']['windows'] for r in reports[l]),'potential_selected_calls':sum(potential_calls(runs[l]).values()),'selected_call_fraction':sum(r['local']['calls'] for r in reports[l])/sum(potential_calls(runs[l]).values()),'observed_demand_ranks':sum(value>0 for value in potential_calls(runs[l]).values()),'ordinary_emergency_free':all(r['global'].get('emergency_fallback_count',0)==0 for r in reports[l]),'restoration_observed':any(r['local']['reattached']>0 and r['local']['revisited']>0 for r in reports[l])} for l in ('G0','G1')}
         acceptance={
-            'global_cumulative_work_mean_within_5pct':groups['global']['warmup_main']['ratio_to_native']<=1.05,
+            'global_cumulative_work_mean_within_5pct':groups['global']['measured_stages_total' if long_case else 'warmup_main']['ratio_to_native']<=1.05,
             'global_main_through_finalize_mean_within_5pct':groups['global']['main_to_finalize']['ratio_to_native']<=1.05,
             'ordinary_emergency_free':all(coord[l]['ordinary_emergency_free'] for l in ('G0','G1')),
-            'positive_credit_for_all_demand_ranks':all(all(reports[l][int(row['rank'])]['global'].get('granted_total_seconds',0)>0 for row in runs[l]['phases']['phase']['ranks'] if int(row['potential_profiled_calls'])>0) for l in ('G0','G1')),
+            'positive_credit_for_all_demand_ranks':all(all(reports[l][rank]['global'].get('granted_total_seconds',0)>0 for rank,value in potential_calls(runs[l]).items() if value>0) for l in ('G0','G1')),
             'coverage_not_below_local':sum(r['local']['profiled_targets'] for l in ('G0','G1') for r in reports[l])>=sum(r['local']['profiled_targets'] for l in ('L0','L1') for r in reports[l]),
             'any_restore_revisit_observed':any(coord[l]['restoration_observed'] for l in ('G0','G1')),
             'restoration_after_root_wave_requires_event_order_proof':True,
+            'strict_recovery_proof_ranks':{l:sum(bool(r['post_wave_restoration_proofs']) for r in reports[l]) for l in ('G0','G1')},
             'interpretation':'Grant distribution and coverage comparisons diagnose utility, not universal budget correctness. Exhausted pools may deny a hot rank. Per-case restoration is not required when work ends; assess separate recovery diagnostics. Emergency counts require available-funding, healthy-view and deadline context. No combined pass is inferred from these flags.',
         }
         cases[name]={'acceptance_findings':acceptance,'performance':groups,'coordination_diagnostics':coord,'reports':reports,'workloads':runs}
@@ -195,6 +265,7 @@ def main():
         try:
             work=workload(root,'D0');rows=[]
             if a.set=='activation_probe':validate_meter(root,'D0',work,'post-init' if name.startswith('post-init-') else 'immediate',True)
+            elif a.set in ('final_candidate','final_matrix'):validate_meter(root,'D0',work,'default',True)
             for rank in range(32):
                 text=(root/'D0'/f'rank-{rank}.err').read_text();parsed=timing_and_events(text)
                 local=peak(text);glob=global_report(text)
@@ -204,7 +275,11 @@ def main():
                 if a.require_final_members:
                     if glob['diagnostic_origin']!='final_settlement' or glob.get('member',{}).get('cohort_finalized')!=1 or glob['shutdown_confirmed']!=1:raise ValueError('diagnostic cohort settlement not confirmed')
                     if glob['member'].get('accounting_invalid',0)!=0:raise ValueError('diagnostic final cohort accounting invalid')
+                if a.set in ('final_candidate','final_matrix'):validate_final_runtime(glob,rank)
                 rows.append({'rank':rank,'local':local,'global':glob,'timing_events':parsed,'post_wave_restoration_proofs':restoration_proof(text,parsed)})
+            if a.require_native_broker:
+                broker=rows[0]['global'].get('native_broker',{})
+                if broker.get('pid',0)<=0 or broker.get('all_final_replies_written')!=1 or broker.get('reap_confirmed')!=1:raise ValueError('diagnostic missing confirmed native broker')
             diagnostics[name]={'workload':work,'ranks':rows,'restoration_proof_ranks':sum(bool(r['post_wave_restoration_proofs']) for r in rows)}
         except (OSError,ValueError,KeyError) as e:errors[name]=str(e)
     pooled={}
@@ -218,7 +293,7 @@ def main():
         # Keep all independently matched groups visible; pool all six samples equally.
         for group in ('native','local','global'):
             pooled[group]={}
-            for metric in (('main','warmup_main','main_to_finalize','exec_to_finalize') if a.set=='activation_probe' else ('main','warmup_main','main_to_finalize')):
+            for metric in (('main','warmup_main','main_to_finalize','exec_to_finalize') if a.set in ('activation_probe','final_candidate','final_matrix') else ('main','warmup_main','main_to_finalize')):
                 samples=[sample for name in repeat_names for sample in cases[name]['performance'][group][metric]['samples']]
                 pooled[group][metric]={'samples':samples,'mean':statistics.mean(samples),'minimum':min(samples),'maximum':max(samples),'source_cases':list(repeat_names)}
         for group in pooled.values():

@@ -92,7 +92,7 @@ def validate_lifecycle(directory, receipt):
     if mode == 'recovery':
         assert receipt.get('postwave_restore_revisit'), 'no actual post-wave restore/revisit proved'
     root_text = (directory / 'rank-0.err').read_text()
-    if mode == 'recovery' and 'policy=fund-before-attach-post-init' in root_text:
+    if mode == 'recovery' and 'policy=fund-before-attach' in root_text:
         batches = receipt.get('first_paid_batches') or [
             {'rank': rank['rank'], 'batch_sizes': first_paid_batches(
                 (directory / ('rank-' + str(rank['rank']) + '.err')).read_text())}
@@ -210,7 +210,8 @@ parser.add_argument('--mpiexec', default='/usr/lib64/mpich/bin/mpiexec')
 parser.add_argument('--ranks', type=int, default=2)
 parser.add_argument('--mode', choices=('skew', 'recovery', 'unfunded', 'initial-once', 'fallback', 'multiwindow'))
 parser.add_argument('--targets', type=Path)
-parser.add_argument('--activation-policy', choices=('immediate', 'post-init'))
+parser.add_argument('--activation-policy', choices=('immediate', 'post-init', 'prepare'))
+parser.add_argument('--bootstrap-fail', action='store_true', help='fallback fixture: reject native broker helper before readiness')
 parser.add_argument('--output', type=Path, default=Path('/tmp'))
 parser.add_argument('--timeout', type=float, default=35)
 args = parser.parse_args()
@@ -221,20 +222,34 @@ if args.library is None or args.mode is None:
     parser.error('--library and --mode are required without --replay')
 
 repo = Path(__file__).resolve().parents[2]
-if args.targets is None:
-    args.targets = repo / 'benchmarks/mpi_rank_budget/targets.txt'
 cpus = sorted(os.sched_getaffinity(0))
 assert 2 <= args.ranks <= 64 and len(cpus) >= 2 * args.ranks
 args.output.mkdir(parents=True, exist_ok=True)
 directory = Path(tempfile.mkdtemp(prefix='peak-mpi-' + args.mode + '-' + sha(args.library)[:12] + '-', dir=args.output))
 shutil.copy2(args.library, directory / 'libpeak.so')
+if args.targets is None:
+    if args.mode == 'multiwindow':
+        args.targets = directory / 'targets-80.txt'
+        args.targets.write_text(''.join(f'pressure_{index:03d}\n' for index in range(80)))
+    else:
+        args.targets = repo / 'benchmarks/mpi_rank_budget/targets.txt'
 sources = ('src/general_listener.c', 'src/mpi_interceptor.c', 'src/global_budget.c',
+           'src/global_budget_spawn.c', 'include/internal/global_budget_spawn.h',
+           'src/detach_helper.c', 'src/CMakeLists.txt',
            'src/peak.c', 'src/exec_interceptor.c', 'include/internal/global_budget.h',
            'src/logging.c', 'include/logging.h', 'src/general_listener/report_formatter.c',
            'include/general_listener.h', 'include/mpi_interceptor.h', 'include/internal/exec_interceptor_internal.h',
            'test/global_budget/mpi_lifecycle.c', 'benchmarks/mpi_rank_budget/targets.inc')
+helper = args.library.resolve().parent / 'peak_detach_helper'
+if helper.is_file():
+    shutil.copy2(helper, directory / 'peak_detach_helper')
+    helper = directory / 'peak_detach_helper'
+else:
+    helper = None
 provenance = {'library_sha256': sha(directory / 'libpeak.so'), 'harness_sha256': sha(__file__), 'targets_sha256': sha(args.targets),
-              'source_sha256': {name: sha(repo / name) for name in sources}}
+              'source_sha256': {name: sha(repo / name) for name in sources},
+              'helper_path': str(helper) if helper else None,
+              'helper_sha256': sha(helper) if helper else None}
 assert run([args.mpicc, '-O2', '-g', '-fopenmp', '-fno-ipa-icf', '-rdynamic',
             '-I' + str(repo / 'include'), str(repo / 'test/global_budget/mpi_lifecycle.c'),
             '-ldl', '-o', str(directory / 'fixture')], os.environ.copy(), 30, directory, 'build') == 0
@@ -264,8 +279,13 @@ env.update(OMP_NUM_THREADS='2', OMP_DYNAMIC='FALSE', OMP_PROC_BIND='close',
            PEAK_OUTPUT_AGGREGATION='local', PEAK_TEXT_OUTPUT='1', PEAK_MPI_REAL_FINALIZE='1',
            PEAK_MPI_TIMING_TRACE='1', PEAK_MPI_GLOBAL_TRACE='1', PEAK_MAX_NUM_THREADS='32',
            TEST_DEST=str(directory))
+if helper:
+    env['PEAK_DETACH_HELPER'] = str(helper)
 if args.activation_policy:
     env['PEAK_MPI_ACTIVATION_POLICY'] = args.activation_policy
+if args.bootstrap_fail:
+    assert args.mode == 'fallback', '--bootstrap-fail requires --mode fallback'
+    env['PEAK_DETACH_HELPER'] = '/nonexistent/peak-bootstrap-failure-helper'
 if args.mode == 'initial-once':
     env['PEAK_ENABLE_REATTACH'] = '0'
 if args.mode == 'unfunded':

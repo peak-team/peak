@@ -22,6 +22,7 @@ set(sources_peak
     dlopen_interceptor.c
     general_listener.c
     global_budget.c
+    global_budget_spawn.c
     general_listener/attach_policy.c
     general_listener/exec_checkpoint_writer.c
     general_listener/output_identity.c
@@ -109,13 +110,16 @@ target_link_libraries(peak_inspect_symbols PRIVATE
     ${M_LIBRARY})
 
 if(PEAK_DETACH_HELPER_SUPPORTED)
-    add_executable(peak_detach_helper detach_helper.c)
+    add_executable(peak_detach_helper detach_helper.c global_budget.c)
+    target_compile_definitions(peak_detach_helper PRIVATE PEAK_GLOBAL_BUDGET_HELPER=1)
+    target_link_libraries(peak_detach_helper PRIVATE Threads::Threads ${M_LIBRARY})
     target_include_directories(peak_detach_helper
         PRIVATE
             ${PROJECT_SOURCE_DIR}/include
     )
     target_compile_definitions(peak
         PRIVATE
+            PEAK_GLOBAL_BUDGET_NATIVE=1
             "PEAK_DEFAULT_DETACH_HELPER_PATH=\"${CMAKE_CURRENT_BINARY_DIR}/peak_detach_helper\""
             "PEAK_INSTALL_DETACH_HELPER_PATH=\"${CMAKE_INSTALL_FULL_BINDIR}/peak_detach_helper\""
     )

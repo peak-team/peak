@@ -235,7 +235,52 @@ Existing phase and main-through-finalize measurements remain available.
 --require-diagnostics` requires meter data and empty-preload/policy proof on every
 rank. It reports `exec_to_finalize` alongside the existing intervals, separately
 for both policies; missing meter records are errors. This probe isolates
-activation placement and does not assert an overhead improvement. The meter
-source SHA256 is `b679162c832e4d3ceafd8cde3ad6247cff731834ff2329a7b312c83b3639a9d8`;
+activation placement and does not assert an overhead improvement. The activation-probe meter
+source SHA256 was `b679162c832e4d3ceafd8cde3ad6247cff731834ff2329a7b312c83b3639a9d8`;
 the pressure source with optional meter reporting is
 `6243c35a549c29456f0441acd9e1795fd759cb767988d25bcd95aaae07340fc1`.
+
+`recovery_pressure.c` is a separate `earned-recovery-long` fixture; it does not
+change the synchronization matrix. It performs four fixed stages on every rank:
+200000 native-twin calls per thread at 131072 LCG steps/call; 250000 rounds of
+all sixteen hooked addresses at 512 real LCG steps/call; 150000 native-twin calls
+at the same native work; and the same sixteen-address burst again. Each burst
+makes 4000000 calls per thread and is expected to last seconds even without
+instrumentation, allowing natural later calls across cooldown intervals.
+All OpenMP threads participate by default. The native intervals use real integer
+work, with no sleep, PEAK-state query, conditional wait or forced detach/restore.
+Each stage has one start and one completion measurement barrier. Both C and an
+independent arbitrary-precision Python oracle check every thread after every
+stage. Meter, affinity, per-thread calls/steps/checksum/CPU and rank completion
+records are retained. `recovery_analyze.py` validates this distinct schema.
+
+The planning estimate is roughly 40 + 30 seconds of native work on the measured
+HPC CPUs, not a wall-clock-controlled loop. Using a conservative background CPU
+slope of 0.025 seconds/second, the 5% pool has net earning of 0.025. A forecast
+of startup 0.15 + summed physical controls 0.8 + peak credit reservation 0.2 +
+closing/grace reserve 0.112 + profiling observation 0.2 + margin 0.2 = 1.662 seconds
+requires about 66.48 seconds of earned runtime. The closing component uses all 32
+ranks × at least 3 ms = 96 ms; adding the separate full 16 ms grace gives the
+112 ms conservative closing/grace reserve.
+The forecast is not a hard cost bound; actual S/R/D and proof determine coverage.
+The long case alone gets a 180-second launch timeout; original cases stay at 90.
+
+The final fixture has matrix134 and funded/recovery36 launches (170 total).
+Use `global_analyze.py --set final_matrix --require-final-members
+--require-native-broker --require-diagnostics` and `--set funded_recovery
+--require-final-members --require-native-broker`. `--set final_candidate` accepts
+a combined tree. Historical sets keep their original mappings and requirements.
+The new sets require meter policy `default`, which removes an inherited explicit
+policy: local uses its ordinary default while global uses the new prepare/paid
+admission feature. This does not imply identical physical installation strategies.
+Every global rank must prove prepare/native-until-paid and correct startup-charge
+composition, broker-authenticated startup seal, service PID/CPU and own final cohort acknowledgment. Root also must
+prove independent native broker PID, all final replies written and successful
+reaping. A peer's final broker-final-written bit may legally remain zero after
+its own acknowledgment. Raw control costs remain summed; no wave discount is
+inferred. The independent long case reports native/burst/stage totals, whole and
+exec-inclusive intervals separately, and strict restore/revisit evidence.
+
+The subsequent default-policy meter revision also accepts `--policy default`,
+which unsets `PEAK_MPI_ACTIVATION_POLICY` in the child. The explicit immediate
+and post-init controls retain their original behavior.

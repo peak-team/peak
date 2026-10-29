@@ -377,10 +377,11 @@ peak_mpi_global_budget_bootstrap(int result, int required, double original_secon
     const char* enabled = getenv("PEAK_MPI_GLOBAL_BUDGET");
     if (result != MPI_SUCCESS || enabled == NULL || strcmp(enabled, "1") != 0)
         return;
+    double preparation_seconds = peak_mpi_runtime_preparation_seconds();
     struct timespec budget_started = {0};
     int clock_valid = clock_gettime(CLOCK_MONOTONIC, &budget_started) == 0 &&
         (budget_started.tv_sec != 0 || budget_started.tv_nsec != 0) &&
-        original_seconds >= 0.0 && activation_seconds >= 0.0;
+        original_seconds >= 0.0 && activation_seconds >= 0.0 && preparation_seconds >= 0.0;
     int rank, size, actual_thread_level = MPI_THREAD_SINGLE;
     (void)PMPI_Query_thread(&actual_thread_level);
     peak_log_report("[peak] MPI global bootstrap: backend=tcp required_thread_level=%d provided_thread_level=%d all_world_optin_required=1\n", required, actual_thread_level);
@@ -434,8 +435,14 @@ peak_mpi_global_budget_bootstrap(int result, int required, double original_secon
         peak_general_listener_global_budget_startup(-1.0, 0);
         return;
     }
-    double startup_seconds = activation_seconds + final_elapsed / 1000.0;
-    peak_global_budget_startup(startup_seconds);
+    double startup_seconds = preparation_seconds + activation_seconds + final_elapsed / 1000.0;
+    peak_log_report("[peak] MPI preparation: preparation_seconds=%.9g activation_seconds=%.9g bootstrap_seconds=%.9g charged_startup_seconds=%.9g startup_ready=%d\n",
+        preparation_seconds, activation_seconds, final_elapsed / 1000.0,
+        ready ? startup_seconds : 0.0, ready);
+    if (ready)
+        peak_global_budget_startup(startup_seconds);
+    else
+        peak_global_budget_stop(); /* A timed-out cohort cannot revive local fallback. */
     peak_general_listener_global_budget_startup(startup_seconds, ready);
 }
 

@@ -1286,17 +1286,10 @@ peak_mpi_activation_policy_post_init(void)
     const char* value = getenv(PEAK_MPI_ACTIVATION_POLICY_ENV);
 
     if (value == NULL || value[0] == '\0') {
-        const char* global_mode = getenv("PEAK_MPI_GLOBAL_BUDGET");
-        /* Only an already identified MPI process gets the opt-in default.
-         * A non-MPI process must not wait forever for an MPI_Init callback. */
-#if defined(__linux__) && UINTPTR_MAX == UINT64_MAX
-        return found_MPI && global_mode != NULL && strcmp(global_mode, "1") == 0;
-#else
-        (void)global_mode;
-        return FALSE;
-#endif
+        return FALSE; /* The global default prepares eagerly; targets stay native. */
     }
-    if (g_ascii_strcasecmp(value, "immediate") == 0) return FALSE;
+    if (g_ascii_strcasecmp(value, "immediate") == 0 ||
+        g_ascii_strcasecmp(value, "prepare") == 0) return FALSE;
     if (g_ascii_strcasecmp(value, "post-init") == 0 ||
         g_ascii_strcasecmp(value, "defer") == 0 ||
         g_ascii_strcasecmp(value, "deferred") == 0) {
@@ -1308,6 +1301,33 @@ peak_mpi_activation_policy_post_init(void)
         PEAK_MPI_ACTIVATION_POLICY_ENV,
         value);
     return FALSE;
+}
+#endif
+
+#ifdef HAVE_MPI
+static _Atomic double peak_mpi_preparation_seconds;
+
+PEAK_API double
+peak_mpi_runtime_preparation_seconds(void)
+{
+    return atomic_load_explicit(&peak_mpi_preparation_seconds, memory_order_acquire);
+}
+
+static gboolean
+peak_mpi_activation_policy_prepare(void)
+{
+#if defined(__linux__) && UINTPTR_MAX == UINT64_MAX
+    const char* policy = getenv(PEAK_MPI_ACTIVATION_POLICY_ENV);
+    const char* global = getenv("PEAK_MPI_GLOBAL_BUDGET");
+    gboolean explicit_prepare = policy != NULL &&
+        g_ascii_strcasecmp(policy, "prepare") == 0;
+    return (found_MPI || explicit_prepare) && global != NULL && strcmp(global, "1") == 0 &&
+        (policy == NULL || policy[0] == '\0' ||
+         g_ascii_strcasecmp(policy, "prepare") == 0) &&
+        heartbeat_time != 0 && (enable_per_target_heartbeat || enable_global_heartbeat);
+#else
+    return FALSE;
+#endif
 }
 #endif
 
@@ -1596,9 +1616,15 @@ peak_mpi_init_completed(int result)
             global_mode != NULL && strcmp(global_mode, "1") == 0)
             peak_general_listener_enable_funded_initial_attach();
         peak_activate_runtime();
-    } else if (atomic_load_explicit(&peak_runtime_activation_state,
-                                    memory_order_acquire) ==
-               PEAK_RUNTIME_ACTIVATION_READY) {
+    } else {
+        found_MPI = 0;
+        peak_detach_controller_configure_mpi_process(FALSE);
+        peak_general_listener_funded_initial_attach_fallback();
+        if (atomic_load_explicit(&peak_runtime_activation_state,
+                                 memory_order_acquire) != PEAK_RUNTIME_ACTIVATION_READY) {
+            peak_log_warn("[peak] MPI initialization failed after preparation; using local admission\n");
+            return;
+        }
         peak_log_warn(
             "[peak] MPI initialization failed while runtime activation was "
             "deferred; falling back to immediate non-MPI activation\n");
@@ -1693,6 +1719,13 @@ peak_test_heartbeat_started(void)
 void peak_init()
 {
     if (peak_exec_skip_mpi_runtime_child(0, NULL)) return;
+#ifdef HAVE_MPI
+    struct timespec preparation_started = {0};
+    const char* preparation_global = getenv("PEAK_MPI_GLOBAL_BUDGET");
+    gboolean preparation_clock_valid = preparation_global != NULL &&
+        strcmp(preparation_global, "1") == 0 &&
+        clock_gettime(CLOCK_MONOTONIC, &preparation_started) == 0;
+#endif
     peak_output_identity_initialize();
     PeakRuntimeNumericConfig numeric_config;
     PeakEnvUnsignedSchema activation_wait_timeout_schema = {
@@ -1786,12 +1819,12 @@ void peak_init()
     gboolean activate_post_mpi_init =
         peak_mpi_activation_policy_post_init();
     /*
-     * An explicit post-init policy is authoritative even for singleton MPI
-     * launches whose runtime provides none of the rank environment variables
+     * Explicit post-init and eligible prepare policies declare an MPI lifecycle
+     * even for singleton launches with none of the rank environment variables
      * used by check_MPI(). Programs without a traditional interposable
      * MPI_Init* lifecycle must leave the default immediate policy selected.
      */
-    if (activate_post_mpi_init) {
+    if (activate_post_mpi_init || peak_mpi_activation_policy_prepare()) {
         found_MPI = 1;
     }
     peak_requested_output_aggregation =
@@ -1829,7 +1862,30 @@ void peak_init()
         }
     }
 #endif
+#ifdef HAVE_MPI
+    gboolean prepare = peak_mpi_activation_policy_prepare();
+    if (prepare) {
+        /* ACTIVE can be observed before activation returns. Until publication,
+         * concurrent MPI initialization must fail closed rather than charge 0. */
+        atomic_store_explicit(&peak_mpi_preparation_seconds, -1.0, memory_order_release);
+        peak_general_listener_enable_funded_initial_attach();
+        peak_log_report("[peak] MPI activation: policy=prepare targets=native-until-paid\n");
+    }
+#endif
     peak_activate_runtime();
+#ifdef HAVE_MPI
+    if (prepare) {
+        struct timespec finished = {0};
+        double duration = -1.0;
+        if (preparation_clock_valid && clock_gettime(CLOCK_MONOTONIC, &finished) == 0 &&
+            (finished.tv_sec > preparation_started.tv_sec ||
+             (finished.tv_sec == preparation_started.tv_sec &&
+              finished.tv_nsec >= preparation_started.tv_nsec)))
+            duration = (double)(finished.tv_sec - preparation_started.tv_sec) +
+                (double)(finished.tv_nsec - preparation_started.tv_nsec) / 1e9;
+        atomic_store_explicit(&peak_mpi_preparation_seconds, duration, memory_order_release);
+    }
+#endif
 }
 
 #ifdef HAVE_MPI
