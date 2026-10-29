@@ -6,13 +6,13 @@
 #include <string.h>
 
 #define PEAK_GLOBAL_BUDGET_PROTOCOL_MAGIC UINT32_C(0x50474231)
-#define PEAK_GLOBAL_BUDGET_PROTOCOL_VERSION 5
+#define PEAK_GLOBAL_BUDGET_PROTOCOL_VERSION 6
 
 typedef struct {
     uint32_t magic, version, rank, size;
     uint64_t reply_sequence, consumed_profile_ns, consumed_control_ns, nonce,
         requested_ns, demand_generation, message_sequence, returned_ns;
-    bool request_credit, root_startup_sealed;
+    bool request_credit, root_startup_sealed, request_reply;
     double root_origin_seconds, root_startup_seconds;
     PeakGlobalBudgetSample sample;
     PeakGlobalBudgetView view;
@@ -49,7 +49,9 @@ typedef struct {
     F64(view.budget_seconds) F64(view.reserved_seconds) \
     F64(view.control_reserve_seconds) F64(view.startup_seconds) \
     F64(view.transport_seconds) F64(view.refill_rtt_seconds) \
-    F64(view.consumption_rate)
+    F64(view.consumption_rate) \
+    U64(sample.background_period_ns) U64(view.background_period_ns) \
+    U64(view.freshness_ns) BOOL(request_reply)
 
 #define PEAK_WIRE_SIZE_U32(field) + 4
 #define PEAK_WIRE_SIZE_U64(field) + 8

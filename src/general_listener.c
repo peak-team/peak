@@ -312,7 +312,12 @@ static gboolean peak_detach_count_overridden = FALSE;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 /* An admission quote belongs to the next controller scan, including when
  * a partial initial batch already left physical targets active. */
-static gboolean peak_global_admission_waiting;
+static atomic_bool peak_global_admission_waiting;
+/* Read by the transport helper without taking the controller/listener lock. */
+bool peak_global_budget_listener_admission_waiting(void)
+{
+    return atomic_load_explicit(&peak_global_admission_waiting, memory_order_acquire);
+}
 
 /* Service-only idle-return guard. A paid queued mutation already owns its
  * observation lease, even before the backend has published physical targets.
@@ -334,7 +339,7 @@ PEAK_API bool
 peak_global_budget_listener_idle_try_guard(void)
 {
     if (pthread_mutex_trylock(&lock) != 0) return false;
-    if (peak_global_admission_waiting ||
+    if (atomic_load(&peak_global_admission_waiting) ||
         peak_general_listener_idle_has_pending_unlocked()) {
         pthread_mutex_unlock(&lock);
         return false;
@@ -1310,6 +1315,16 @@ static void peak_general_listener_test_fast_pause(
 pthread_once_t pthread_pause_once_ctrl = PTHREAD_ONCE_INIT;
 pthread_mutex_t heartbeat_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t  heartbeat_cond  = PTHREAD_COND_INITIALIZER;
+static atomic_bool peak_global_heartbeat_credit_ready;
+/* A newly funded admission must not wait for the ordinary background timer. */
+void peak_global_budget_listener_credit_ready(void)
+{
+    if (!peak_global_budget_listener_admission_waiting()) return;
+    pthread_mutex_lock(&heartbeat_mutex);
+    atomic_store(&peak_global_heartbeat_credit_ready, true);
+    pthread_cond_signal(&heartbeat_cond);
+    pthread_mutex_unlock(&heartbeat_mutex);
+}
 static __thread int last_cont_id = -1;
 static _Atomic int global_session_counter = 0;
 static int pthread_pause_ack_pipe[2] = { -1, -1 };
@@ -5622,12 +5637,13 @@ peak_general_listener_heartbeat_sample_can_reuse_cache_unlocked(
 }
 
 static gboolean
-peak_heartbeat_wait_us(unsigned int sleep_us)
+peak_heartbeat_wait_us(uint64_t sleep_us)
 {
     pthread_mutex_lock(&heartbeat_mutex);
-    if (!atomic_load(&heartbeat_running)) {
+    if (!atomic_load(&heartbeat_running) || atomic_load(&peak_global_heartbeat_credit_ready)) {
+        gboolean keep_running = atomic_load(&heartbeat_running);
         pthread_mutex_unlock(&heartbeat_mutex);
-        return FALSE;
+        return keep_running;
     }
 
     struct timespec ts;
@@ -5685,6 +5701,11 @@ void* peak_heartbeat_monitor(void* arg) {
         recent_baseline_ready[i] = TRUE;
     }
 
+    /* Admission opportunities retain their configured wall-clock spacing;
+     * check_interval must not multiply an adaptive background sleep. */
+    double admission_interval_seconds = (double)check_interval *
+        clipd((double)heartbeat_time, (double)hb_min_us, (double)hb_max_us) / 1e6;
+    double next_global_admission_time = now0 + admission_interval_seconds;
     /* Global heartbeat dynamics. */
     double prev_global_overhead = 0.0;
     double prev_global_time     = now0;
@@ -5709,6 +5730,8 @@ void* peak_heartbeat_monitor(void* arg) {
         gboolean management_cpu_checkpoint_valid =
             peak_general_listener_thread_cpu_ns(
                 &management_cpu_checkpoint_ns);
+        uint64_t heartbeat_cpu_start_ns = management_cpu_checkpoint_ns;
+        gboolean force_admission = atomic_exchange(&peak_global_heartbeat_credit_ready, false);
         gboolean wake_controller = FALSE;
         heartbeat_counter++;
         double now = peak_second();
@@ -6036,15 +6059,20 @@ void* peak_heartbeat_monitor(void* arg) {
             (admission_status.active &&
              admission_status.root_completed_wave < admission_status.wave)) {
             pthread_mutex_lock(&lock);
-            peak_global_admission_waiting = FALSE;
+            atomic_store_explicit(&peak_global_admission_waiting, false, memory_order_release);
             pthread_mutex_unlock(&lock);
         }
 
         /* 3) Reattach. */
+        gboolean admission_due = peak_global_configured
+            ? (force_admission || now >= next_global_admission_time)
+            : (check_interval && (heartbeat_counter % check_interval) == 0);
+        if (peak_global_configured && admission_due)
+            next_global_admission_time = now + admission_interval_seconds;
         if (detach_observation_ready &&
             (enable_reattach || peak_global_funded_initial_attach) &&
             check_interval != 0 &&
-            (heartbeat_counter % check_interval) == 0) {
+            admission_due) {
             double reattach_gate_ratio = 0.0;
             double reattach_spent_seconds = 0.0;
             double reattach_risk_spent_ratio = 0.0;
@@ -6145,7 +6173,7 @@ void* peak_heartbeat_monitor(void* arg) {
                  * consume it. A grant ACK precedes that scan and does not make
                  * these operating funds idle. */
                 pthread_mutex_lock(&lock);
-                peak_global_admission_waiting = FALSE;
+                atomic_store_explicit(&peak_global_admission_waiting, false, memory_order_release);
                 if (reattach_accounting_coherent &&
                     (enable_per_target_heartbeat || enable_global_heartbeat) &&
                     !atomic_load(&peak_global_returning_idle) &&
@@ -6166,7 +6194,7 @@ void* peak_heartbeat_monitor(void* arg) {
                         if (enable_global_heartbeat ||
                             (enable_per_target_heartbeat &&
                              projected / total_execution_time <= target_profile_ratio)) {
-                            peak_global_admission_waiting = TRUE;
+                            atomic_store_explicit(&peak_global_admission_waiting, true, memory_order_release);
                             break;
                         }
                     }
@@ -6504,7 +6532,7 @@ void* peak_heartbeat_monitor(void* arg) {
                 }
                 /* Queued mutations now own the lease and are covered by the
                  * same idle guard; rejected/canceled candidates own no quote. */
-                peak_global_admission_waiting = FALSE;
+                atomic_store_explicit(&peak_global_admission_waiting, false, memory_order_release);
                 pthread_mutex_unlock(&lock);
             }
         }
@@ -6537,10 +6565,22 @@ void* peak_heartbeat_monitor(void* arg) {
                                        (double)hb_min_us,
                                        (double)hb_max_us) + 0.5);
 
+        uint64_t background_sleep_us = (uint64_t)sleep_us;
+        if (peak_global_configured) {
+            unsigned long long heartbeat_cpu_end_ns = 0;
+            uint64_t ordinary_cpu_ns = 0;
+            if (!wake_controller && !force_admission && management_cpu_checkpoint_valid &&
+                peak_general_listener_thread_cpu_ns(&heartbeat_cpu_end_ns) &&
+                heartbeat_cpu_end_ns >= heartbeat_cpu_start_ns)
+                ordinary_cpu_ns = heartbeat_cpu_end_ns - heartbeat_cpu_start_ns;
+            uint64_t period_ns = peak_global_budget_heartbeat_period_ns(
+                ordinary_cpu_ns, background_sleep_us * 1000);
+            background_sleep_us = (period_ns + 999) / 1000;
+        }
         peak_general_listener_management_cpu_checkpoint(
             &management_cpu_checkpoint_ns,
             &management_cpu_checkpoint_valid);
-        if (!peak_heartbeat_wait_us((unsigned int)sleep_us)) {
+        if (!peak_heartbeat_wait_us(background_sleep_us)) {
             break;
         }
     }
@@ -8120,7 +8160,7 @@ peak_general_listener_attach()
     peak_global_closing_window_seconds = 0.0;
     peak_global_closing_target_count = 0;
     peak_global_idle_returned = FALSE;
-    peak_global_admission_waiting = FALSE;
+    atomic_store_explicit(&peak_global_admission_waiting, false, memory_order_release);
     peak_global_idle_return_pending = FALSE;
     atomic_store(&peak_global_returning_idle, FALSE);
     peak_global_text_reported = FALSE;
@@ -9332,10 +9372,12 @@ peak_general_listener_write_global_budget_diagnostics(gboolean settled)
             (unsigned long long)atomic_load(&peak_global_degraded_samples),
             (unsigned long long)atomic_load(&peak_global_invalid_accounting),
             (double)MIN(atomic_load(&peak_global_grace_claimed_ns), PEAK_GLOBAL_GRACE_NS) / 1e9);
-        peak_log_report("[peak] MPI global service: settlement=%d parent_process_id=%llu broker_process_id=%llu broker_cpu_seconds=%.9g broker_final_written=%d startup_sealed=%d\n",
+        peak_log_report("[peak] MPI global service: settlement=%d parent_process_id=%llu broker_process_id=%llu broker_cpu_seconds=%.9g broker_final_written=%d startup_sealed=%d background_period_ns=%llu freshness_ns=%llu client_transport_cpu_seconds=%.9g\n",
             settled, (unsigned long long)getpid(),
             (unsigned long long)global.broker_process_id,
-            global.broker_cpu_seconds, global.broker_final_written, global.startup_sealed);
+            global.broker_cpu_seconds, global.broker_final_written, global.startup_sealed,
+            (unsigned long long)global.background_period_ns,
+            (unsigned long long)global.freshness_ns, global.transport_seconds);
         peak_log_report("[peak] MPI closing forecast: per_window_seconds=%.9g targets=%llu windows=%llu total_seconds=%.9g\n",
             peak_global_closing_window_seconds,
             (unsigned long long)peak_global_closing_target_count,
