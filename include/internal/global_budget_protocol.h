@@ -86,28 +86,17 @@ static inline uint64_t peak_budget_wire_get(const unsigned char **wire,
     return value;
 }
 
-static inline void peak_budget_wire_put_double(unsigned char **wire, double value)
-{
-    uint64_t bits;
-    memcpy(&bits, &value, sizeof bits);
-    peak_budget_wire_put(wire, bits, 8);
-}
-
-static inline double peak_budget_wire_get_double(const unsigned char **wire)
-{
-    uint64_t bits = peak_budget_wire_get(wire, 8);
-    double value;
-    memcpy(&value, &bits, sizeof value);
-    return value;
-}
-
 static inline void peak_global_budget_frame_encode(
     unsigned char wire[PEAK_GLOBAL_BUDGET_WIRE_SIZE], const PeakGlobalBudgetFrame *frame)
 {
 #define PEAK_WIRE_U32(field) peak_budget_wire_put(&wire, frame->field, 4);
 #define PEAK_WIRE_U64(field) peak_budget_wire_put(&wire, frame->field, 8);
 #define PEAK_WIRE_BOOL(field) *wire++ = frame->field ? 1 : 0;
-#define PEAK_WIRE_F64(field) peak_budget_wire_put_double(&wire, frame->field);
+#define PEAK_WIRE_F64(field) do { \
+    uint64_t bits; \
+    memcpy(&bits, &frame->field, sizeof bits); \
+    peak_budget_wire_put(&wire, bits, 8); \
+} while (0);
     PEAK_GLOBAL_BUDGET_WIRE_FIELDS(
         PEAK_WIRE_U32, PEAK_WIRE_U64, PEAK_WIRE_BOOL, PEAK_WIRE_F64)
 #undef PEAK_WIRE_U32
@@ -122,7 +111,10 @@ static inline bool peak_global_budget_frame_decode(PeakGlobalBudgetFrame *frame,
 #define PEAK_WIRE_U32(field) frame->field = (uint32_t)peak_budget_wire_get(&wire, 4);
 #define PEAK_WIRE_U64(field) frame->field = peak_budget_wire_get(&wire, 8);
 #define PEAK_WIRE_BOOL(field) if (*wire > 1) return false; frame->field = *wire++ != 0;
-#define PEAK_WIRE_F64(field) frame->field = peak_budget_wire_get_double(&wire);
+#define PEAK_WIRE_F64(field) do { \
+    uint64_t bits = peak_budget_wire_get(&wire, 8); \
+    memcpy(&frame->field, &bits, sizeof bits); \
+} while (0);
     PEAK_GLOBAL_BUDGET_WIRE_FIELDS(
         PEAK_WIRE_U32, PEAK_WIRE_U64, PEAK_WIRE_BOOL, PEAK_WIRE_F64)
 #undef PEAK_WIRE_U32
