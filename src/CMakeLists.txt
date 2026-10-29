@@ -156,6 +156,15 @@ endif()
 if(BUILD_TESTS OR BUILD_TESTING)
     target_compile_definitions(peak PRIVATE PEAK_ENABLE_TEST_HOOKS=1)
     target_compile_definitions(peak PRIVATE PEAK_TARGET_RESOLVER_TESTING=1)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+        foreach(_peak_exec_optional_test_hook IN ITEMS
+                peak_test_exec_resolver_reentry_hook
+                peak_test_exec_spawn_publication_hook
+                peak_test_exec_spawn_resolver_reentry_hook
+                peak_test_exec_spawn_waiter_hook)
+            target_link_options(peak PRIVATE "LINKER:-U,_${_peak_exec_optional_test_hook}")
+        endforeach()
+    endif()
     if(TARGET cuda_interceptor_obj)
         target_compile_definitions(cuda_interceptor_obj
             PRIVATE PEAK_ENABLE_TEST_HOOKS=1)
