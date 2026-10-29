@@ -223,3 +223,27 @@ jobs:
           build/macos-detach-concurrent-*.csv
         grep -E '^"peak_macos_smoke_target",.*,0,0$' \
           build/macos-detach-concurrent-*.csv
+
+    - name: Configure budget regression tests
+      run: >
+        cmake -S ${{ github.workspace }}
+        -B ${{ github.workspace }}/build-macos-budget
+        -DCMAKE_BUILD_TYPE=Release
+        -DBUILD_TESTS=ON
+        -DBUILD_TESTING=ON
+        -DPEAK_ENABLE_MPI=OFF
+        -DPEAK_ENABLE_OTF2=OFF
+        -DBUILD_CUDA_PROFILE=OFF
+        -DPEAK_BUILD_BENCHMARKS=OFF
+
+    - name: Build budget regression tests
+      run: >
+        cmake --build ${{ github.workspace }}/build-macos-budget --parallel
+        --target peak peak_budget_broker test_global_budget_ledger
+        test_global_budget_idle_return test_global_budget_native_broker
+
+    - name: Test budget regressions
+      run: >
+        ctest --test-dir ${{ github.workspace }}/build-macos-budget
+        -R '^test_global_budget_(ledger|idle_return|native_broker)$'
+        --no-tests=error --output-on-failure
