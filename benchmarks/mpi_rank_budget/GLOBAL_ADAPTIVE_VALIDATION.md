@@ -1,6 +1,6 @@
 # Adaptive global budget validation
 
-Current candidate `5afdccb7` has passed 78/78 selected local tests and five affected actual-MPI functional cases with raw emergency counts zero; this is a functional gate, **not a performance pass**. Full hardware jobs 3655586/3655587 are submitted and pending results. All earlier failed measurements and intermediate diagnostics below remain preserved.
+Current candidate `5afdccb7` has completed all 170 hardware launches on SPR with valid data, after 78/78 local tests and five affected actual-MPI functional checks. Measured-work growth is at most 1.2757% across the final configurations and repeats; all five concurrent funded modes have exec growth below 2.44%. Six of the twenty base configurations still exceed 5% in whole exec time, and cold-burst early closure remains a profiling-efficiency limitation. Complete measurements and earlier failed candidates are preserved below.
 
 Interpretation throughout this record uses three distinct scopes. The budget is
 the coordinator's reported lifetime bank: credited original MPI_Init time plus
@@ -425,6 +425,128 @@ feature; these are intentionally different physical admission paths. The new
 analysis checks the actual path, startup charge, broker-authenticated startup
 seal, native PID/CPU and final proofs. Only root requires all final replies
 written/reaped; peers require their own cohort acknowledgment and may legally
-retain a zero broker-final-written bit. Actual timing will be reported separately
+retain a zero broker-final-written bit. The completed measurements below report timing separately
 for exec-inclusive, main, native/burst stages, startup and report/finalization.
 No samples or failed/outlier runs will be selectively removed.
+
+
+## Final eager/broker hardware measurements (5afdccb7)
+
+Both jobs completed on **SPR**, exit `0:0`: 3655586 (134 launches, 17:26)
+and 3655587 (36 launches, 16:23). All **170** receipts and strict analyses are
+valid. This supersedes the pending status above, while retaining its submission
+provenance. The two compact records preserve all N/L/G timing samples, costs,
+coverage, strict recovery findings, stage decomposition and archive/product hashes:
+[repeated matrix](global_validation/5afdccb7-matrix-summary.json) and
+[funded/recovery](global_validation/5afdccb7-funded-recovery-summary.json).
+Runtime invalid/degraded counters are zero; all final cohort acknowledgments,
+authenticated startup seals and required root native-broker written/reap proofs pass.
+Nonroot cached broker-written zero remains legal.
+
+The table reports global/native paired means. Work is warmup+main for the
+original workloads and all four measured stages for the separate long fixture.
+Exec starts in the native meter and ends at the common post-original-MPI-Finalize
+endpoint; it includes loader/constructor costs but excludes launcher time.
+
+| Configuration | Work ratio | Main→Finalize ratio | Exec ratio | G recorded calls (two samples) |
+|---|---:|---:|---:|---:|
+| allreduce-rotating | 1.003440 | 1.056917 | 1.070487 | 734 / 1024 |
+| allreduce-slack | 1.004675 | 1.037073 | 1.043302 | 0 / 0 |
+| allreduce-critical | 1.010577 | 1.035879 | 1.044770 | 84233 / 78937 |
+| allreduce-aligned | 1.008064 | 1.033818 | 1.039984 | 0 / 0 |
+| barrier-rotating | 1.004405 | 1.058902 | 1.070604 | 506 / 461 |
+| barrier-slack | 1.008292 | 1.043371 | 1.049475 | 0 / 512 |
+| barrier-critical | 1.012185 | 1.031774 | 1.038205 | 108322 / 155621 |
+| barrier-aligned | 1.010185 | 1.036239 | 1.042474 | 30510 / 512 |
+| bcast-rotating | 1.004334 | 1.066392 | 1.077142 | 425 / 460 |
+| bcast-slack | 1.002103 | 1.034729 | 1.041059 | 24000 / 0 |
+| bcast-critical | 1.009144 | 1.030797 | 1.036928 | 117591 / 104077 |
+| bcast-aligned | 1.006093 | 1.035438 | 1.041560 | 3941 / 15485 |
+| ring-rotating | 1.003839 | 1.073043 | 1.087628 | 608 / 418 |
+| ring-slack | 1.003020 | 1.029156 | 1.035240 | 12928 / 0 |
+| ring-critical | 1.008361 | 1.041308 | 1.047305 | 157617 / 58672 |
+| ring-aligned | 1.007026 | 1.032883 | 1.038961 | 15479 / 15515 |
+| iallreduce-rotating | 1.004130 | 1.067857 | 1.079474 | 663 / 580 |
+| iallreduce-slack | 1.004373 | 1.036722 | 1.043039 | 14720 / 0 |
+| iallreduce-critical | 1.011408 | 1.046692 | 1.052833 | 62170 / 50580 |
+| iallreduce-aligned | 1.007615 | 1.038422 | 1.044665 | 0 / 0 |
+| bcast-rotating-repeat1 | 1.004456 | 1.051730 | 1.063871 | 649 / 433 |
+| bcast-rotating-repeat2 | 1.012757 | 1.088834 | 1.100235 | 604 / 403 |
+| funded-concurrent-allreduce-rotating | 1.003119 | 1.015964 | 1.019271 | 22475 / 10333 |
+| funded-concurrent-barrier-rotating | 1.003543 | 1.016551 | 1.019597 | 22795 / 22753 |
+| funded-concurrent-bcast-rotating | 1.004402 | 1.021288 | 1.024361 | 77983 / 22837 |
+| funded-concurrent-ring-rotating | 1.002860 | 1.017688 | 1.020832 | 22807 / 23196 |
+| funded-concurrent-iallreduce-rotating | 1.003608 | 1.016828 | 1.020061 | 10320 / 10320 |
+| earned-recovery-long | 1.005092 | 1.007842 | 1.008407 | 8449459 / 8767494 |
+
+Base 20 configurations have maximum measured-work growth **1.2185%**. Including
+the two additional bcast repeats, the maximum is **1.2757%**. Six base exec
+means exceed 5% (all five rotating modes and iallreduce-critical), as do both
+additional bcast repeat groups. The six-sample bcast pool has work ratio
+1.007184 and exec ratio 1.080410; individual samples/groups remain in the JSON.
+All five concurrent funded modes have exec growth below 5% (maximum 2.4361%).
+These observations do not establish a universal 5% whole-interval guarantee.
+
+### Startup and finalization contributions
+
+For the six base configurations with exec growth above 5%, the following are
+G−N mean elapsed differences in milliseconds. These are measured intervals,
+not additive CPU charges. Init includes original MPI initialization plus activation
+and bootstrap; finalize includes PEAK reporting/settlement and original MPI
+finalization. Per-stage preparation, CSV wall/CPU, release, flush and join samples
+are retained in the compact records. No particular syscall is identified by low CPU.
+
+| Configuration | Exec Δ ms | Pre-main Δ | Init Δ | Measured work Δ | Finalize Δ | Other Δ |
+|---|---:|---:|---:|---:|---:|---:|
+| allreduce-rotating | 261.907 | 50.608 | 39.146 | 7.159 | 166.096 | -1.103 |
+| barrier-rotating | 262.180 | 43.622 | 26.744 | 9.162 | 183.110 | -0.459 |
+| bcast-rotating | 284.827 | 40.062 | 36.629 | 8.970 | 199.975 | -0.810 |
+| ring-rotating | 323.680 | 54.088 | 19.429 | 7.936 | 242.271 | -0.044 |
+| iallreduce-rotating | 293.814 | 43.139 | 46.985 | 8.609 | 195.097 | -0.015 |
+| iallreduce-critical | 369.489 | 43.124 | 16.508 | 60.720 | 249.299 | -0.162 |
+
+### Ledger limits and useful profiling coverage
+
+Final S exceeds earned B in **18/44 matrix G samples**, by **1.342–19.956 ms**.
+Six already have debt in the pre-report snapshot; twelve first cross by final
+settlement. Late costs contribute, but snapshots cannot assign all debt exclusively
+to cleanup or demonstrate grant overissuance. For example ring-rotating G0
+pre S/B is .145684/.139240 s, final .166112/.146157 s. The complete pre/final
+comparison is retained. All twelve funded/long G samples finish with S≤B.
+S sums estimated profiling cost, measured rank control/CPU costs and broker CPU;
+wave span is diagnostic, with no overlap discount. Uncovered final costs remain
+disclosed debt.
+
+The fixed-work main and warmup+main intervals omit earlier original-MPI-init
+time and other native gaps that earn lifetime budget. Their ratios above 5% alone
+are therefore not a lifetime ledger violation. Whole exec overhead is reported
+separately and its short-case failures remain visible. Ten of 44 matrix G samples
+have zero useful profiling calls. This is a short-workload utility limitation,
+not evidence of a universally required per-case restore. The original two short
+diagnostics have no strict post-wave recovery proof; they are preserved unchanged.
+
+The independent earned-recovery-long fixture records **8,449,459 / 8,767,494**
+G calls versus **748,214 / 778,531** L calls (about **11.3×**). Both cover all
+512 rank/target combinations. G physical reattachments/revisited hooks are
+432/432 and 416/416, and strict DONE→physical restore→later real calls proof
+holds on **16 / 20 ranks**. Exec growth is **0.8407%**, measured-stage growth
+0.5092%; final S/B is 3.902660/3.966775 s and 3.886071/3.954866 s.
+
+Long emergency counters **315 / 268** count accepted per-hook safety requests,
+not physical stop windows or network failures. They correspond to **34 / 32**
+controller rank-close events, mostly wave0 cold bursts. Idle credit retained
+100 µs while the first refill took approximately 3 ms: representative grants
+arrived 2.87–3.11 ms after the accepted early-close event. This supports a
+cold-buffer/refill prediction limitation causing bounded early closure, rather
+than an already funded wallet being incorrectly reclaimed or a network fault.
+It is not accurate to call every event a global-STOP tail. Global invalid and
+degraded counters remain zero. Two later G0 closes occur near later waves;
+finite trace retention does not prove the complete earlier pool history.
+No runtime or workload changes were made after these results.
+
+Reproduction (with the separately archived raw trees):
+
+```sh
+python3 benchmarks/mpi_rank_budget/global_analyze.py /tmp/peak-eager-final-matrix-results/results --set final_matrix --require-final-members --require-native-broker --require-diagnostics
+python3 benchmarks/mpi_rank_budget/global_analyze.py /tmp/peak-eager-final-funded-results/results --set funded_recovery --require-final-members --require-native-broker
+```
