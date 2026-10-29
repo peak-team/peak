@@ -74,6 +74,8 @@ static _Atomic unsigned long long peak_darwin_failed_windows = 0;
 static _Atomic unsigned long long peak_darwin_window_wall_ns = 0;
 static _Atomic unsigned long long peak_darwin_accounting_sequence = 0;
 static double peak_darwin_last_stop_window_us;
+static __thread PeakDetachOperation peak_darwin_failure_operation;
+static __thread kern_return_t peak_darwin_failure_kr = KERN_SUCCESS;
 static __thread PeakDetachFailureDetail peak_darwin_failure = {
     "none", 0, 0, 0
 };
@@ -91,6 +93,7 @@ static void
 peak_darwin_clear_failure(void)
 {
     peak_darwin_failure = (PeakDetachFailureDetail){ "none", 0, 0, 0 };
+    peak_darwin_failure_kr = KERN_SUCCESS;
 }
 
 static void
@@ -334,7 +337,9 @@ peak_darwin_suspend_snapshot(thread_act_t controller_thread,
         }
 
         kr = thread_suspend(thread);
-        if (kr == KERN_INVALID_ARGUMENT) {
+        /* A short-lived pthread may terminate after task_threads returned
+         * its port. XNU reports inactive threads explicitly as TERMINATED. */
+        if (kr == KERN_INVALID_ARGUMENT || kr == KERN_TERMINATED) {
             (void)mach_port_deallocate(mach_task_self(), thread);
             threads[i] = MACH_PORT_NULL;
             continue;
@@ -421,7 +426,10 @@ peak_darwin_resume_threads(PeakDetachStatus* status_out)
         thread_act_t thread = peak_darwin_held.threads[i - 1];
         kern_return_t kr = thread_resume(thread);
 
-        if (kr != KERN_SUCCESS && kr != KERN_INVALID_ARGUMENT) {
+        /* An inactive thread has no user execution left to resume. Do not
+         * classify other errors as termination: they still fail closed. */
+        if (kr != KERN_SUCCESS && kr != KERN_INVALID_ARGUMENT && kr != KERN_TERMINATED) {
+            peak_darwin_failure_kr = kr;
             peak_darwin_note_failure("thread-resume-failed",
                                      (long)thread,
                                      0,
@@ -636,6 +644,7 @@ peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
     gboolean prepared = FALSE;
 
     peak_darwin_clear_failure();
+    if (request != NULL) peak_darwin_failure_operation = request->operation;
     if (!peak_darwin_validate_request(request, status_out)) {
         return FALSE;
     }
@@ -921,6 +930,7 @@ peak_detach_controller_finish_hook_mutation(const PeakDetachRequest* request,
     PeakDetachStatus status = PEAK_DETACH_STATUS_SAFE;
     gboolean finished = TRUE;
 
+    if (request != NULL) peak_darwin_failure_operation = request->operation;
     if (request != NULL && !peak_darwin_operation_is_valid(request->operation)) {
         peak_darwin_set_status(status_out, PEAK_DETACH_STATUS_ERROR);
         return FALSE;
@@ -984,16 +994,51 @@ peak_detach_controller_shutdown_helper(PeakDetachStatus* status_out)
     return idle;
 }
 
+/* Fatal diagnostics must not acquire stdio/allocator locks: a suspended
+ * application thread may own them. Bound formatting on the caller's stack. */
+static size_t
+peak_darwin_fatal_text(char* buffer, size_t used, size_t capacity, const char* text)
+{
+    if (text != NULL)
+        while (*text != '\0' && used < capacity) buffer[used++] = *text++;
+    return used;
+}
+
+static size_t
+peak_darwin_fatal_number(char* buffer, size_t used, size_t capacity,
+                          uintptr_t value, unsigned base)
+{
+    static const char digits[] = "0123456789abcdef";
+    char reversed[sizeof(uintptr_t) * 8];
+    size_t count = 0;
+    do { reversed[count++] = digits[value % base]; value /= base; } while (value != 0);
+    while (count > 0 && used < capacity) buffer[used++] = reversed[--count];
+    return used;
+}
+
 void
 peak_detach_controller_abort_after_failed_finish(const char* context,
                                                  PeakDetachStatus status)
 {
     static const char message[] =
         "[peak] fatal Darwin detach finish failure; terminating to avoid running with suspended threads\n";
-
-    (void)context;
-    (void)status;
+    char detail[512];
+    size_t used = 0;
+#define PEAK_FATAL_TEXT(text) used = peak_darwin_fatal_text(detail, used, sizeof(detail) - 1, text)
+#define PEAK_FATAL_NUMBER(value, base) used = peak_darwin_fatal_number(detail, used, sizeof(detail) - 1, (uintptr_t)(value), base)
+    PEAK_FATAL_TEXT("[peak] Darwin finish detail: context=");
+    PEAK_FATAL_TEXT(context);
+    PEAK_FATAL_TEXT(" operation="); PEAK_FATAL_NUMBER(peak_darwin_failure_operation, 10);
+    PEAK_FATAL_TEXT(" status="); PEAK_FATAL_NUMBER(status, 10);
+    PEAK_FATAL_TEXT(" reason="); PEAK_FATAL_TEXT(peak_darwin_failure.reason);
+    PEAK_FATAL_TEXT(" tid="); PEAK_FATAL_NUMBER(peak_darwin_failure.tid, 10);
+    PEAK_FATAL_TEXT(" kr=0x"); PEAK_FATAL_NUMBER(peak_darwin_failure_kr, 16);
+    PEAK_FATAL_TEXT(" aux=0x"); PEAK_FATAL_NUMBER(peak_darwin_failure.aux, 16);
+    detail[used++] = '\n';
+#undef PEAK_FATAL_TEXT
+#undef PEAK_FATAL_NUMBER
     (void)write(STDERR_FILENO, message, sizeof(message) - 1);
+    (void)write(STDERR_FILENO, detail, used);
     _exit(128);
 }
 

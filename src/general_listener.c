@@ -6030,8 +6030,8 @@ void* peak_heartbeat_monitor(void* arg) {
                     continue;
                 }
 
-                if (!peak_general_listener_initial_observation_pending_unlocked(i) &&
-                    calls_snapshot[i] >= PEAK_GLOBAL_DETACH_MIN_CALLS &&
+                if (peak_general_listener_initial_observation_pending_unlocked(i)) continue;
+                if (calls_snapshot[i] >= PEAK_GLOBAL_DETACH_MIN_CALLS &&
                     ratio_snapshot[i] > target_profile_ratio) {
                     gboolean accepted =
                         peak_general_listener_request_detach_with_context_unlocked(
@@ -6073,8 +6073,8 @@ void* peak_heartbeat_monitor(void* arg) {
                             i)) {
                         continue;
                     }
-                    if (peak_general_listener_initial_observation_pending_unlocked(i) ||
-                        calls_snapshot[i] < PEAK_GLOBAL_DETACH_MIN_CALLS) {
+                    if (peak_general_listener_initial_observation_pending_unlocked(i)) continue;
+                    if (calls_snapshot[i] < PEAK_GLOBAL_DETACH_MIN_CALLS) {
                         continue;
                     }
                     double contribution =
