@@ -6032,8 +6032,9 @@ void* peak_heartbeat_monitor(void* arg) {
         if (peak_global_configured) admission_status = peak_global_budget_view();
         if (!detach_observation_ready ||
             !(enable_reattach || peak_global_funded_initial_attach) ||
-            check_interval == 0 || !admission_status.active ||
-            admission_status.root_completed_wave < admission_status.wave) {
+            check_interval == 0 || !peak_global_budget_active() ||
+            (admission_status.active &&
+             admission_status.root_completed_wave < admission_status.wave)) {
             pthread_mutex_lock(&lock);
             peak_global_admission_waiting = FALSE;
             pthread_mutex_unlock(&lock);
