@@ -1254,6 +1254,19 @@ void peak_global_budget_stop(void)
 }
 int peak_global_budget_broker_main(int argc, char **argv)
 {
+    /* This trusted, non-preloaded helper closes application descriptors before
+     * readiness or protocol processing. Do not run application atfork handlers
+     * after MPI has initialized a transport such as libfabric/EFA. */
+#ifdef SYS_close_range
+    if (peak_exec_raw_syscall6(SYS_close_range, 5u, ~0u, 0, 0, 0, 0) < 0)
+#endif
+    {
+        long maxfd = sysconf(_SC_OPEN_MAX);
+        if (maxfd < 5 || maxfd > 1048576)
+            maxfd = 1048576;
+        for (int fd = 5; fd < maxfd; fd++)
+            peak_exec_raw_syscall6(SYS_close, fd, 0, 0, 0, 0, 0);
+    }
     if (argc != 9)
         return 2;
     char *end = NULL;

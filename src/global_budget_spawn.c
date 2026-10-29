@@ -1,17 +1,17 @@
 #define _GNU_SOURCE
 #include "internal/global_budget_spawn.h"
 #if defined(__linux__)
-#include "internal/exec_raw_syscall.h"
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
 #include <signal.h>
+#include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -149,35 +149,28 @@ pid_t peak_global_budget_spawn(int listener, unsigned size, double target, uint6
     snprintf(tracing, sizeof tracing, "%d", trace);
     char *argv[] = {path, "--global-budget-broker", "3", "4", world, ratio, token, parent, tracing,
                     NULL};
-    pid_t parent_pid = getpid();
-    long maxfd = sysconf(_SC_OPEN_MAX);
-    if (maxfd < 5 || maxfd > 1048576)
-        maxfd = 1048576;
-    pid_t pid = fork();
-    if (!pid) {
-        if (peak_exec_raw_syscall6(SYS_dup3, pass, 3, 0, 0, 0, 0) < 0 ||
-            peak_exec_raw_syscall6(SYS_dup3, ack, 4, 0, 0, 0, 0) < 0) {
-            peak_exec_raw_syscall6(SYS_exit_group, 126, 0, 0, 0, 0, 0);
-            __builtin_unreachable();
-        }
-#ifdef SYS_close_range
-        if (peak_exec_raw_syscall6(SYS_close_range, 5u, ~0u, 0, 0, 0, 0) < 0)
-#endif
-            for (int fd = 5; fd < maxfd; fd++)
-                peak_exec_raw_syscall6(SYS_close, fd, 0, 0, 0, 0, 0);
-        if (peak_exec_raw_syscall6(SYS_getppid, 0, 0, 0, 0, 0, 0) != parent_pid) {
-            peak_exec_raw_syscall6(SYS_exit_group, 126, 0, 0, 0, 0, 0);
-            __builtin_unreachable();
-        }
-        peak_exec_raw_syscall6(SYS_execve, (long)path, (long)argv, (long)env, 0, 0, 0);
-        peak_exec_raw_syscall6(SYS_exit_group, 127, 0, 0, 0, 0, 0);
-        __builtin_unreachable();
+    /* Use libc's native spawn directly. PEAK's public spawn interceptor
+     * intentionally propagates profiling policy to application children. */
+    typedef int (*SpawnFunction)(pid_t *, const char *,
+        const posix_spawn_file_actions_t *, const posix_spawnattr_t *,
+        char *const[], char *const[]);
+    SpawnFunction spawn_native = (SpawnFunction)dlsym(RTLD_NEXT, "posix_spawn");
+    posix_spawn_file_actions_t actions;
+    int result = spawn_native ? posix_spawn_file_actions_init(&actions) : ENOSYS;
+    pid_t pid = -1;
+    if (!result) {
+        result = posix_spawn_file_actions_adddup2(&actions, pass, 3);
+        if (!result)
+            result = posix_spawn_file_actions_adddup2(&actions, ack, 4);
+        if (!result)
+            result = spawn_native(&pid, path, &actions, NULL, argv, env);
+        posix_spawn_file_actions_destroy(&actions);
     }
     close(pass);
     close(ack);
     close(ready[1]);
     free_env(env);
-    if (pid < 0) {
+    if (result != 0) {
         close(ready[0]);
         return -1;
     }

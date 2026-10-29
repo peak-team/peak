@@ -10,15 +10,6 @@
 #include <unistd.h>
 
 extern char** environ;
-static _Thread_local int internal_context;
-
-/* Model the exported MPI wrapper predicate without requiring an MPI launch. */
-__attribute__((visibility("default"))) int peak_mpi_internal_context_active(void)
-{
-    const char* mode = getenv("PEAK_MPI_GLOBAL_BUDGET");
-    return internal_context && mode != NULL && strcmp(mode, "1") == 0;
-}
-
 __attribute__((noinline, visibility("default"))) void utility_target(void)
 {
     __asm__ volatile("" ::: "memory");
@@ -54,7 +45,14 @@ int main(int argc, char** argv)
     char command[4096];
     assert(snprintf(command, sizeof(command), "exec '%s' %s", argv[0],
                     strcmp(argv[1], "descendant") == 0 ? "descend" : "child") > 0);
-    internal_context = strcmp(argv[1], "normal") != 0;
+    void (*set_context)(int) = dlsym(RTLD_DEFAULT, "peak_mpi_test_set_internal_context");
+    int (*context_active)(void) = dlsym(RTLD_DEFAULT, "peak_mpi_internal_context_active");
+    assert(set_context != NULL && context_active != NULL);
+    assert(!context_active());
+    int internal_context = strcmp(argv[1], "normal") != 0;
+    set_context(internal_context);
+    assert(context_active() == (internal_context &&
+           strcmp(getenv("PEAK_MPI_GLOBAL_BUDGET"), "1") == 0));
     const char original_global_mode = getenv("PEAK_MPI_GLOBAL_BUDGET")[0];
     assert(getenv("PEAK_MPI_RUNTIME_CHILD") == NULL);
     if (strcmp(argv[1], "popen") == 0) {
@@ -104,7 +102,8 @@ int main(int argc, char** argv)
     } else {
         check_status(system(command));
     }
-    internal_context = 0;
+    set_context(0);
+    assert(!context_active());
     assert(getenv("PEAK_MPI_RUNTIME_CHILD") == NULL);
     assert(getenv("PEAK_MPI_GLOBAL_BUDGET")[0] == original_global_mode);
     utility_target();

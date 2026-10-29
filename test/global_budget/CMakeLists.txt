@@ -18,6 +18,7 @@ peak_add_budget_test(test_global_budget_idle_return test_idle_return.c)
 if(TARGET peak_detach_helper)
     peak_add_budget_test(test_global_budget_native_broker test_native_broker.c
         $<TARGET_FILE:peak_detach_helper> $<TARGET_FILE:peak>)
+    target_link_libraries(test_global_budget_native_broker PRIVATE ${CMAKE_DL_LIBS})
     target_sources(test_global_budget_native_broker PRIVATE
         ${PROJECT_SOURCE_DIR}/src/global_budget_spawn.c)
 endif()

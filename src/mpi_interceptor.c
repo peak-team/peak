@@ -76,6 +76,15 @@ int peak_mpi_internal_context_active(void)
     return peak_mpi_internal_depth != 0 && mode && strcmp(mode, "1") == 0;
 }
 
+#ifdef PEAK_ENABLE_TEST_HOOKS
+/* Exercise the actual wrapper TLS without relying on ELF symbol preemption. */
+__attribute__((visibility("default"))) void
+peak_mpi_test_set_internal_context(int active)
+{
+    peak_mpi_internal_depth = active ? 1 : 0;
+}
+#endif
+
 
 static void
 mpi_interceptor_configure_finalize_owner_timeout(void)

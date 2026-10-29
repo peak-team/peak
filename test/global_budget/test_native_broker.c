@@ -6,6 +6,13 @@
 #include <sys/prctl.h>
 #include <sys/wait.h>
 
+static void reject_late_fork(void)
+{
+    /* MPI providers may reject fork after initialization; broker launch must
+     * use spawn without invoking application/provider atfork callbacks. */
+    _exit(86);
+}
+
 static void wait_active(void)
 {
     uint64_t until = ns_now(CLOCK_MONOTONIC) + UINT64_C(2000000000);
@@ -42,6 +49,7 @@ int main(int argc, char **argv)
     assert(!pipe(commands) && !pipe(ready));
     pid_t parent = getpid(), root = fork();
     assert(root >= 0);
+    assert(!pthread_atfork(reject_late_fork, NULL, NULL));
     if (!root) {
         /* Keep the paused test rank bounded even if its test parent fails. */
         assert(!prctl(PR_SET_PDEATHSIG, SIGKILL));

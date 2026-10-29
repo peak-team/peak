@@ -711,8 +711,10 @@ error count. Cold bursts may close early if replenishment arrives too late.
 
 A separate native `peak_detach_helper --global-budget-broker` process owns the
 ledger. Every rank, including root, is a client, so root's safe thread pauses
-cannot freeze coordination. The broker starts without PEAK preload/audit
-libraries. Its process CPU is charged to the job budget.
+cannot freeze coordination. PEAK uses native `posix_spawn` to avoid calling
+MPI providers' post-initialization fork handlers. The broker starts without
+PEAK preload/audit libraries and closes unrelated file descriptors before
+signaling readiness. Its process CPU is charged to the job budget.
 
 A rank entering MPI finalization suspends callbacks and drains its controller,
 then retires while its client continues serving peers that still do application
