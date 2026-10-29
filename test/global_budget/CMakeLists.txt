@@ -1,7 +1,7 @@
 # Focused regressions for the shared MPI budget. Protocol tests run without MPI;
 # the application lifecycle tests require the enabled MPI profiler backend.
 function(peak_add_budget_test name source)
-    add_executable(${name} ${source})
+    add_executable(${name} ${source} ${PROJECT_SOURCE_DIR}/src/global_budget_causal.c)
     peak_budget_configure_optional_runtime(${name})
     target_include_directories(${name} PRIVATE ${PROJECT_SOURCE_DIR}/include)
     target_compile_options(${name} PRIVATE -UNDEBUG)

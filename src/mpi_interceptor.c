@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "mpi_interceptor.h"
+#include "internal/mpi_budget_events.h"
 #include "general_listener.h"
 #include "internal/global_budget.h"
 #include "internal/global_budget_protocol.h"
@@ -70,6 +71,18 @@ static pthread_once_t real_mpi_init_thread_once = PTHREAD_ONCE_INIT;
 static pthread_once_t real_pmpi_init_thread_once = PTHREAD_ONCE_INIT;
 static _Thread_local unsigned int peak_mpi_init_wrapper_depth;
 static _Thread_local unsigned int peak_mpi_internal_depth;
+
+int peak_mpi_application_enter(void)
+{
+    if (peak_mpi_internal_depth != 0) return 0;
+    peak_mpi_internal_depth++;
+    return 1;
+}
+
+void peak_mpi_application_leave(void)
+{
+    if (peak_mpi_internal_depth != 0) peak_mpi_internal_depth--;
+}
 
 int peak_mpi_internal_context_active(void)
 {
@@ -478,9 +491,16 @@ mpi_interceptor_call_init(PeakMpiInitFunction init,
         double activation_start = timed ? peak_mpi_trace_clock() : 0.0;
         peak_mpi_init_completed(result);
         double bootstrap_start = timed ? peak_mpi_trace_clock() : 0.0;
+        peak_mpi_internal_depth++;
         peak_mpi_global_budget_bootstrap(result, MPI_THREAD_SINGLE, original_seconds,
             activation_start >= 0.0 && bootstrap_start >= activation_start
                 ? bootstrap_start - activation_start : -1.0);
+        peak_mpi_internal_depth--;
+        if (result == MPI_SUCCESS) {
+            peak_mpi_internal_depth++;
+            peak_mpi_budget_events_initialize();
+            peak_mpi_internal_depth--;
+        }
         if (peak_mpi_timing_enabled())
             peak_log_report("[peak] MPI timing: stage=init original_seconds=%.9g activation_seconds=%.9g bootstrap_seconds=%.9g\n",
                 original_seconds, bootstrap_start - activation_start,
@@ -519,9 +539,16 @@ mpi_interceptor_call_init_thread(PeakMpiInitThreadFunction init,
         double activation_start = timed ? peak_mpi_trace_clock() : 0.0;
         peak_mpi_init_completed(result);
         double bootstrap_start = timed ? peak_mpi_trace_clock() : 0.0;
+        peak_mpi_internal_depth++;
         peak_mpi_global_budget_bootstrap(result, required, original_seconds,
             activation_start >= 0.0 && bootstrap_start >= activation_start
                 ? bootstrap_start - activation_start : -1.0);
+        peak_mpi_internal_depth--;
+        if (result == MPI_SUCCESS) {
+            peak_mpi_internal_depth++;
+            peak_mpi_budget_events_initialize();
+            peak_mpi_internal_depth--;
+        }
         if (peak_mpi_timing_enabled())
             peak_log_report("[peak] MPI timing: stage=init original_seconds=%.9g activation_seconds=%.9g bootstrap_seconds=%.9g\n",
                 original_seconds, bootstrap_start - activation_start,
@@ -765,7 +792,9 @@ peak_pmpi_finalize(void)
         return mpi_interceptor_call_original_finalize_once();
     }
     __atomic_store_n(&peak_finalize_path_active, 1, __ATOMIC_RELEASE);
+    peak_mpi_internal_depth++;
     peak_fini();
+    peak_mpi_internal_depth--;
     __atomic_store_n(&peak_finalize_path_active, 0, __ATOMIC_RELEASE);
     int result = mpi_interceptor_call_original_finalize_once();
     peak_general_listener_global_budget_shutdown(0); /* failed/early teardown fallback */

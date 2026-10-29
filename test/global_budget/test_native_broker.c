@@ -9,6 +9,10 @@
 #include <spawn.h>
 #include <sys/wait.h>
 
+/* Exercise the v7 metadata payload from a capable application through the
+ * MPI-free native broker, not just a local encoder/decoder round trip. */
+void peak_mpi_budget_events_frontier(void) {}
+
 extern char **environ;
 static volatile sig_atomic_t owned_child = -1;
 static int preload_writer = -1;
@@ -126,7 +130,7 @@ static void cohort(unsigned count)
     assert(!peak_global_budget_start("127.0.0.1", port, 0, count, .05, NULL));
     peak_global_budget_origin(10);
     peak_global_budget_startup(.001);
-    peak_global_budget_publish(&(PeakGlobalBudgetSample){.sequence = 1});
+    peak_global_budget_publish(&(PeakGlobalBudgetSample){.sequence = 1, .closing_seconds = .003});
     int *sockets = calloc(count, sizeof(*sockets));
     assert(sockets);
     for (unsigned rank = 1; rank < count; rank++) {
@@ -137,17 +141,58 @@ static void cohort(unsigned count)
         assert(!setsockopt(sockets[rank], SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout));
         Frame sample = {.magic = MAGIC, .version = PROTOCOL_VERSION,
             .nonce = job_nonce, .rank = rank, .size = count, .message_sequence = 1,
-            .sample = {.sequence = 1}, .request_credit = rank == count - 1,
+            .sample = {.sequence = 1, .closing_seconds = .003}, .request_credit = rank == count - 1,
             .requested_ns = 1000000, .demand_generation = 1};
         send_sample(sockets[rank], &sample);
     }
     wait_active();
     if (count == 1) {
+        int member = 0;
+        peak_global_budget_mpi_context_register(0, 1, &member, 1);
+        assert(peak_global_budget_mpi_trace_begin());
+        PeakMpiBudgetEvent event = {.rank=0, .kind=PEAK_MPI_EVENT_FRONTIER,
+            .context_owner=0, .comm=1, .seq=1};
+        PeakMpiBudgetCostSnapshot cost = {0};
+        peak_global_budget_mpi_event_submit(&event, &cost);
+        peak_global_budget_mpi_frontend_charge(1000);
+        peak_global_budget_publish(&(PeakGlobalBudgetSample){.sequence=2, .closing_seconds=.003});
+        assert(peak_global_budget_flush(2000));
+        assert(!peak_global_budget_view().metadata_closed);
+        assert(peak_global_budget_mpi_events_enabled());
+
         peak_global_budget_request_credit(1000000);
         uint64_t until = ns_now(CLOCK_MONOTONIC) + UINT64_C(2000000000);
         while (peak_global_budget_view().local_credit_ns < 1000000 &&
                ns_now(CLOCK_MONOTONIC) < until) usleep(1000);
         assert(peak_global_budget_view().local_credit_ns >= 1000000);
+        /* Exhaust the shared observation seed, then pay for real metadata
+         * admission from the broker-funded wallet, with independent cash. */
+        for (unsigned operation=0;operation<64;++operation) {
+            assert(peak_global_budget_mpi_trace_begin());
+            peak_global_budget_mpi_frontend_charge(1000);
+        }
+        assert(atomic_load(&consumed_frontend_ns)>0);
+        assert(peak_global_budget_mpi_trace_begin());
+        event.seq=2;
+        peak_global_budget_mpi_event_submit(&event,&cost);
+        peak_global_budget_mpi_frontend_charge(1000);
+        peak_global_budget_publish(&(PeakGlobalBudgetSample){.sequence=3,.closing_seconds=.003});
+        assert(peak_global_budget_flush(2000));
+        assert(!peak_global_budget_view().metadata_closed);
+        assert(atomic_load(&consumed_frontend_ns)+atomic_load(&available_ns)==atomic_load(&granted_ns));
+        assert(peak_global_budget_mpi_trace_begin());
+        event.kind=PEAK_MPI_EVENT_UNKNOWN;event.seq=3;
+        event.closure_flags=PEAK_MPI_OPAQUE_LIVE;
+        peak_global_budget_mpi_event_submit(&event,&cost);
+        peak_global_budget_mpi_frontend_charge(1000);
+        uint64_t opaque_until=ns_now(CLOCK_MONOTONIC)+UINT64_C(2000000000);
+        while(!peak_global_budget_view().metadata_closed && ns_now(CLOCK_MONOTONIC)<opaque_until)usleep(1000);
+        PeakGlobalBudgetView opaque=peak_global_budget_view();
+        assert(opaque.active&&opaque.metadata_closed&&!opaque.accounting_invalid);
+        metadata_settle_closed();
+        assert(atomic_load(&settled_frontend_ns)==atomic_load(&consumed_frontend_ns));
+        assert(!atomic_load(&metadata_tokens));
+
     } else {
         Frame reply;
         do {
@@ -185,15 +230,15 @@ static void coalesced_debt(void)
     assert(!peak_global_budget_start("127.0.0.1", port, 0, 2, .05, NULL));
     peak_global_budget_origin(1);
     peak_global_budget_startup(1);
-    peak_global_budget_publish(&(PeakGlobalBudgetSample){.sequence = 1, .retiring = true});
+    peak_global_budget_publish(&(PeakGlobalBudgetSample){.sequence = 1, .closing_seconds = .003, .retiring = true});
     int socket = connect_host("127.0.0.1", port);
     assert(socket >= 0 && !fcntl(socket, F_SETFL, 0));
     struct timeval timeout = {.tv_sec = 2};
     assert(!setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout));
     Frame sample = {.magic = MAGIC, .version = PROTOCOL_VERSION, .nonce = job_nonce,
         .rank = 1, .size = 2, .message_sequence = 1, .request_reply = true,
-        .request_credit = true, .requested_ns = 1000000, .demand_generation = 1,
-        .sample = {.sequence = 1, .attached_targets = 2}};
+        .request_credit = true, .requested_ns = 1000000, .minimum_ns=1000000, .demand_generation = 1,
+        .sample = {.sequence = 1, .closing_seconds = .003, .attached_targets = 2}};
     send_sample(socket, &sample);
     Frame reply;
     do { receive_reply(socket, &reply); } while (!reply.view.wave);
@@ -204,6 +249,7 @@ static void coalesced_debt(void)
         sample.sample.sequence++;
         sample.demand_generation = generation;
         sample.requested_ns = generation * UINT64_C(1000000);
+        sample.minimum_ns=sample.requested_ns;
         sample.sample.control_seconds = generation * .00001;
         send_sample(socket, &sample);
         do { receive_reply(socket, &reply); }
@@ -229,12 +275,21 @@ static void coalesced_debt(void)
     do { receive_reply(socket, &reply); } while (!reply.view.granted_total_ns);
     assert(reply.view.wave == 1);
     uint64_t granted = reply.view.granted_total_ns;
+    /* The real observed failure: partial desired-runway funding is not
+     * insolvency while the immediate next quantum is fully reserved. */
+    sample.message_sequence++;sample.sample.sequence++;sample.demand_generation++;
+    sample.sample.profile_seconds=3.95;sample.requested_ns=212000000;sample.minimum_ns=10000;
+    send_sample(socket,&sample);
+    do { receive_reply(socket,&reply); } while(reply.view.acknowledged_sequence<sample.sample.sequence);
+    assert(reply.view.wave==1 && reply.view.granted_total_ns>granted &&
+        reply.view.granted_total_ns<212000000);
+    granted=reply.view.granted_total_ns;
     sample.message_sequence++;
     sample.sample.sequence++;
     sample.sample.profile_seconds = 10;
     sample.consumed_profile_ns = granted;
     sample.demand_generation++;
-    sample.requested_ns = 20000000;
+    sample.requested_ns = 20000000;sample.minimum_ns=20000000;
     send_sample(socket, &sample);
     do { receive_reply(socket, &reply); } while (reply.view.wave < 2);
     assert(reply.view.wave == 2 && reply.view.root_completed_wave == 1);
@@ -298,7 +353,7 @@ int main(int argc, char **argv)
         assert(!peak_global_budget_start("127.0.0.1", port, 0, 2, .05, NULL));
         peak_global_budget_origin(10);
         peak_global_budget_publish(&(PeakGlobalBudgetSample){
-            .sequence = 1, .initial_unexposed = true});
+            .sequence = 1, .closing_seconds = .003, .initial_unexposed = true});
         wait_active();
         assert(broker_pid != getpid());
         assert(write(ready[1], &broker_pid, sizeof broker_pid) == sizeof broker_pid);
@@ -327,13 +382,13 @@ int main(int argc, char **argv)
     peak_global_budget_set_nonce(nonce);
     assert(!peak_global_budget_start("127.0.0.1", port, 1, 2, .05, NULL));
     peak_global_budget_publish(&(PeakGlobalBudgetSample){
-        .sequence = 1, .initial_unexposed = true});
+        .sequence = 1, .closing_seconds = .003, .initial_unexposed = true});
     wait_active();
     pid_t broker;
     assert(read(ready[0], &broker, sizeof broker) == sizeof broker);
     peak_global_budget_request_credit(1000000);
     peak_global_budget_publish(&(PeakGlobalBudgetSample){
-        .sequence = 2, .initial_unexposed = true});
+        .sequence = 2, .closing_seconds = .003, .initial_unexposed = true});
     uint64_t flush_deadline = ns_now(CLOCK_MONOTONIC) + UINT64_C(2000000000);
     bool flushed;
     do { flushed = peak_global_budget_flush(100); }

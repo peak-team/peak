@@ -150,15 +150,24 @@ static int cold_targets_attached(void)
     return 1;
 }
 
-static int wait_physical(unsigned count, double timeout)
+static int wait_physical(unsigned count, double timeout, int require_observation)
 {
     uint64_t x = 1;
+    uint64_t calls_before = target_calls();
     double deadline = now() + timeout;
     do {
         x = native_work(x);
         if (!coordinator_active() || !cold_targets_attached())
             return 1;
         if ((count ? physical_targets() == count : physical_targets() > 0)) {
+            if (require_observation) {
+                /* Physical attachment does not prove paid profiling has resumed. */
+                uint64_t expected = A * x + B;
+                x = budget_target_0(x);
+                if (x != expected) return 1;
+                if (target_calls() <= calls_before) continue;
+                if (now() >= deadline) return 1;
+            }
             printf("physical=%u checksum=%llu\n", count, (unsigned long long)x);
             return 0;
         }
@@ -215,12 +224,12 @@ int main(int argc, char **argv)
             MPI_Finalize();
             return 0;
         }
-        bad = wait_physical(0, 8) || work(.1, 1) || work(.1, 0);
+        bad = wait_physical(0, 8, 0) || work(.1, 1) || work(.1, 0);
     } else if (!strcmp(argv[1], "recovery")) {
-        bad = wait_physical(80, 8);
+        bad = wait_physical(80, 8, 0);
         if (target_calls() != 64 || !cold_targets_attached()) bad = 1;
         int exhausted = exhaust_credit();
-        int restored = wait_physical(80, 8);
+        int restored = wait_physical(80, 8, 1);
         int sampled = work(.05, 1);
         printf("stages initial=%d exhausted=%d restored=%d sampled=%d\n", bad, exhausted, restored, sampled);
         bad |= exhausted || restored || sampled;

@@ -27,7 +27,7 @@ static inline uint64_t peak_global_admission_closing_windows(uint64_t targets)
 static inline double peak_global_admission_closing_forecast(double previous,
     double per_window, uint64_t targets)
 {
-    return fmax(previous, fmax(.003, per_window) *
+    return fmax(previous, per_window *
         (double)peak_global_admission_closing_windows(targets));
 }
 #endif /* PEAK_GLOBAL_ADMISSION_H */

@@ -1,8 +1,17 @@
 #define _GNU_SOURCE
+static void reply_claim_hook(void);
+#define PEAK_GLOBAL_BUDGET_TEST_REPLY_CLAIM_HOOK reply_claim_hook
 #include "../../src/global_budget.c"
 #include "internal/global_budget_protocol.h"
 #include <assert.h>
 
+static bool reply_newer_during_claim;
+static void reply_claim_hook(void)
+{
+    if (!reply_newer_during_claim) return;
+    reply_newer_during_claim=false;
+    pthread_mutex_lock(&sample_mutex);request_reply_goal_locked(5);pthread_mutex_unlock(&sample_mutex);
+}
 static atomic_uint credit_wakes;
 static atomic_bool admission_waiting, budget_wake_pending;
 bool peak_global_budget_listener_admission_waiting(void) { return atomic_load(&admission_waiting); }
@@ -36,21 +45,33 @@ static void check_wire_format(void)
     source.root_origin_seconds = 1.0;
     source.sample.attached_targets = UINT32_C(0x11223344);
     source.view.active = true;
+    source.sample.ignored_seconds = 1.0;
+    source.sample.profile_inside_seconds = 2.0;
+    source.consumed_frontend_ns = UINT64_C(0x0102030405060708);
+    source.payload_words = 2;
+    source.minimum_ns=UINT64_C(0x0102030405060708);
+    source.view.causal_confirmed_seconds = 1.0;
+    source.view.causal_pending_seconds = 2.0;
     unsigned char wire[PEAK_GLOBAL_BUDGET_WIRE_SIZE], again[PEAK_GLOBAL_BUDGET_WIRE_SIZE];
     peak_global_budget_frame_encode(wire, &source);
     static const unsigned char prefix[] = {
-        0x50, 0x47, 0x42, 0x31, 0, 0, 0, 6,
+        0x50, 0x47, 0x42, 0x31, 0, 0, 0, 7,
         1, 2, 3, 4, 1, 2, 3, 5
     };
     static const unsigned char nonce[] = {1, 2, 3, 4, 5, 6, 7, 8};
     static const unsigned char one[] = {0x3f, 0xf0, 0, 0, 0, 0, 0, 0};
     static const unsigned char targets[] = {0x11, 0x22, 0x33, 0x44};
-    assert(sizeof wire == 434);
+    assert(sizeof wire == 538);
     assert(!memcmp(wire, prefix, sizeof prefix));
     assert(!memcmp(wire + 40, nonce, sizeof nonce));
-    assert(wire[80] == 1 && wire[196] == 1);
-    assert(!memcmp(wire + 82, one, sizeof one));
-    assert(!memcmp(wire + 186, targets, sizeof targets));
+    assert(!memcmp(wire + 530, nonce, sizeof nonce));
+    assert(wire[96] == 1 && wire[252] == 1);
+    assert(!memcmp(wire + 80, nonce, sizeof nonce));
+    assert(wire[95] == 2);
+    assert(!memcmp(wire + 154, one, sizeof one));
+    assert(!memcmp(wire + 385, one, sizeof one));
+    assert(!memcmp(wire + 98, one, sizeof one));
+    assert(!memcmp(wire + 234, targets, sizeof targets));
     /* Different host padding must never affect the serialized result. */
     memset(&decoded, 0x5a, sizeof decoded);
     assert(peak_global_budget_frame_decode(&decoded, wire));
@@ -69,6 +90,98 @@ static void check_wire_format(void)
     peak_global_budget_endpoint_decode(&restored, address);
     assert(!strcmp(restored.host, endpoint.host));
     assert(restored.port == endpoint.port && restored.nonce == endpoint.nonce);
+}
+
+static void check_metadata_prefetch(void)
+{
+    atomic_store(&owner,getpid());atomic_store(&running,true);
+    atomic_store(&metadata_enabled,true);atomic_store(&local_retiring,false);
+    atomic_store(&local_attached,0);atomic_store(&public_local_closing,.003);
+    atomic_store(&low_water_ns,100000);metadata_prefetch_goal=0;
+    metadata_prefetch(1000);
+    uint64_t generation=atomic_load(&demand_generation);
+    assert(generation&&atomic_load(&pressure_notice));
+    assert(atomic_load(&requested_ns)==164000);
+    assert(!atomic_load(&recovery_target_ns)&&atomic_load(&request_metadata));
+    metadata_prefetch(1000);
+    assert(atomic_load(&demand_generation)==generation);
+    metadata_prefetch(2000);
+    assert(atomic_load(&demand_generation)==generation+1);
+    assert(atomic_load(&requested_ns)==228000);
+    peak_global_budget_request_credit(1000000);
+    assert(atomic_load(&recovery_target_ns)==1000000);
+    assert(atomic_load(&requested_ns)==1000000);
+    assert(atomic_load(&demand_generation)==generation+2);
+    assert(!atomic_load(&request_metadata));
+    acknowledge_request(generation+1,ns_now(CLOCK_MONOTONIC));
+    assert(atomic_load(&pressure_notice)); /* Old metadata ACK is not profile proof. */
+    assert(!atomic_load(&available_ns)&&!atomic_load(&consumed_frontend_ns));
+    atomic_store(&metadata_enabled,false);metadata_prefetch(4000);
+    assert(atomic_load(&demand_generation)==generation+2);
+    double previous_rtt=atomic_load(&refill_rtt);
+    atomic_store(&request_metadata,true);atomic_store(&request_recovery,false);
+    uint64_t now=ns_now(CLOCK_MONOTONIC);
+    atomic_store(&request_started_ns,now-1000000000);
+    acknowledge_request(generation+2,now);
+    assert(atomic_load(&refill_rtt)==previous_rtt); /* Funding wait is not profile RTT. */
+    atomic_store(&running,false);atomic_store(&local_attached,0);
+    atomic_store(&public_local_closing,0);atomic_store(&low_water_ns,0);
+    atomic_store(&pressure_notice,false);atomic_store(&demand_generation,0);
+    atomic_store(&requested_ns,0);atomic_store(&request_started_ns,0);
+    atomic_store(&public_deadline,0);atomic_store(&recovery_target_ns,0);
+    atomic_store(&request_metadata,false);atomic_store(&request_recovery,false);metadata_prefetch_goal=0;
+}
+
+static void check_reply_snapshot_order(void)
+{
+    atomic_store(&owner,getpid());atomic_store(&running,true);rank_id=0;world=1;
+    atomic_store(&heartbeat_period,BACKGROUND_NS);atomic_store(&transport_period,BACKGROUND_NS);
+    local_sample=(PeakGlobalBudgetSample){.sequence=2};
+    Frame old=request_snapshot();old.sample.background_period_ns=local_background_period();
+    pthread_mutex_lock(&sample_mutex);
+    local_sample.sequence=3;request_reply_goal_locked(3);
+    pthread_mutex_unlock(&sample_mutex);
+    assert(!frame_reply_requested(old.sample.sequence));
+    assert(atomic_load(&flush_requested));
+    Peer client={.fd=-1,.outgoing=old,.last_send=ns_now(CLOCK_MONOTONIC)};
+    assert(service_poll_timeout(&client,0,false,false,client.last_send)==0);
+    assert(frame_reply_requested(3)&&!atomic_load(&flush_requested));
+    pthread_mutex_lock(&sample_mutex);request_reply_goal_locked(4);pthread_mutex_unlock(&sample_mutex);
+    assert(!frame_reply_requested(3)&&atomic_load(&flush_requested));
+    reply_newer_during_claim=true;
+    assert(!frame_reply_requested(4)&&atomic_load(&flush_requested));
+    assert(frame_reply_requested(5)); /* New producer between load and CAS survives. */
+    atomic_store(&reply_goal_sequence,0);atomic_store(&flush_requested,false);
+    atomic_store(&heartbeat_period,0);atomic_store(&transport_period,0);
+    local_sample=(PeakGlobalBudgetSample){0};atomic_store(&running,false);
+}
+
+static void check_required_vs_desired(void)
+{
+    Rank rank={.wants_credit=true,.registered=true,.credit_total_ns=17000000,
+        .requested_ns=212000000,.minimum_ns=10000,.demand_generation=2,.actioned_generation=1,
+        .latest={.attached_targets=1}};
+    assert(!rank_minimum_unfunded(&rank));
+    assert(!stop_needed(true,true,false,rank_minimum_unfunded(&rank),true,false));
+    rank.minimum_ns=18000000;
+    assert(rank_minimum_unfunded(&rank));
+    assert(stop_needed(true,true,false,rank_minimum_unfunded(&rank),true,false));
+    rank.minimum_ns=0;
+    assert(stop_needed(true,true,true,false,true,false)); /* Actual debt still stops. */
+    atomic_store(&owner,getpid());atomic_store(&running,true);atomic_store(&local_attached,1);
+    atomic_store(&metadata_enabled,false);atomic_store(&minimum_target_ns,0);
+    request_credit_internal(212000000,false,false);
+    assert(!atomic_load(&minimum_target_ns));
+    uint64_t generation=atomic_load(&demand_generation);
+    peak_global_budget_request_credit(10000);
+    assert(atomic_load(&minimum_target_ns)==10000);
+    assert(atomic_load(&demand_generation)>generation);
+    atomic_store(&debit_ns,4000);
+    assert(atomic_load(&minimum_target_ns)-atomic_load(&debit_ns)==6000);
+    peak_global_budget_return_idle();
+    assert(!atomic_load(&minimum_target_ns));
+    atomic_store(&debit_ns,0);atomic_store(&local_attached,0);atomic_store(&running,false);
+    atomic_store(&demand_generation,0);
 }
 
 static void *spend_credit(void *unused)
@@ -117,7 +230,7 @@ static void check_control_settlement(void)
 {
     Rank rank = {.credit_total_ns = 6000000, .consumed_ns = 3000000,
                  .control_ns = 3000000, .reservation = .003};
-    receive(&rank, (PeakGlobalBudgetSample){.sequence = 1});
+    receive(&rank, (PeakGlobalBudgetSample){.sequence = 1, .closing_seconds = .003});
     assert(fabs(control_escrow(&rank) - .003) < 1e-12);
     /* The controller finishes after heartbeat captured its settlement mark.
      * Actual cost must not permanently absorb the still-pending prepayment. */
@@ -233,7 +346,7 @@ static void check_background_rounds(void)
     assert(peak_global_budget_listen(&port) == 0);
     assert(peak_global_budget_start("127.0.0.1", port, 0, 1, .5, NULL) == 0);
     (void)peak_global_budget_heartbeat_period_ns(125000000, 10000000);
-    peak_global_budget_publish(&(PeakGlobalBudgetSample){.sequence = 1});
+    peak_global_budget_publish(&(PeakGlobalBudgetSample){.sequence = 1, .closing_seconds = .003});
     (void)wait_view(1, false);
     pause_ms(25); /* Earn the existing closing reservation before requesting. */
     unsigned prior_wakes = atomic_load(&credit_wakes);
@@ -246,7 +359,7 @@ static void check_background_rounds(void)
     atomic_store(&admission_waiting, false);
     prior_wakes = atomic_load(&credit_wakes);
     peak_global_budget_physical_targets(1);
-    peak_global_budget_publish(&(PeakGlobalBudgetSample){.sequence = 2, .attached_targets = 1});
+    peak_global_budget_publish(&(PeakGlobalBudgetSample){.sequence = 2, .attached_targets = 1, .closing_seconds = .003});
     assert(peak_global_budget_try_spend(1000));
     peak_global_budget_request_credit(2000000);
     PeakGlobalBudgetView refilled = {0};
@@ -266,9 +379,347 @@ static void check_background_rounds(void)
         bill.management_sent_seconds + bill.transport_seconds);
 }
 
+static void consume_queued(PeakGlobalBudgetCausal *model, Rank ranks[2], unsigned rank)
+{
+    uint64_t count;
+    unsigned char *payload = metadata_batch(&count);
+    assert(payload && count);
+    Frame frame = {.rank=rank,.payload_words=count};
+    BrokerMetadata metadata;
+    assert(broker_metadata_init(&metadata,model,ranks,2));
+    assert(consume_metadata(&metadata,&frame,payload));
+    broker_metadata_clear(&metadata);
+    free(payload);
+}
+static void causal_event(PeakGlobalBudgetCausal *model, Rank ranks[2], unsigned rank,
+    uint64_t seq[2], uint64_t last[2], PeakMpiEventKind kind, PeakMpiEventOp op,
+    uint64_t cost, uint64_t request, int peer)
+{
+    rank_id=rank;
+    uint64_t id=request;
+    PeakMpiBudgetEvent event={.rank=(int)rank,.seq=++seq[rank],.last_mpi_seq=last[rank],
+        .kind=kind,.op=op,.context_owner=0,.comm=1,.round=1,.tag=7,.peer=peer,
+        .request=request};
+    if(kind==PEAK_MPI_EVENT_WAIT||kind==PEAK_MPI_EVENT_COMPLETE){event.requests=&id;event.count=1;}
+    if(kind!=PEAK_MPI_EVENT_FRONTIER)last[rank]=seq[rank];
+    PeakMpiBudgetCostSnapshot snapshot={.active_outside_ns=cost};
+    peak_global_budget_mpi_event_submit(&event,&snapshot);
+    id=UINT64_MAX; /* The async sink must already own the copied request set. */
+    consume_queued(model,ranks,rank);
+}
+static void check_causal_wire_integration(void)
+{
+    atomic_store(&owner,getpid());atomic_store(&running,true);atomic_store(&metadata_enabled,true);
+    atomic_store(&local_retiring,false);atomic_store(&frontend_cpu_ns,0);world=2;rank_id=0;
+    PeakGlobalBudgetCausal *model=peak_global_budget_causal_new(2);assert(model);
+    Rank ranks[2]={0};int members[2]={0,1};
+    peak_global_budget_mpi_context_register(0,1,members,2);
+    members[1]=0; /* Context membership must be copied as well. */
+    consume_queued(model,ranks,0);
+    uint64_t seq[2]={0},last[2]={0};
+    peak_global_budget_causal_reserve_outside(model,0,1000000);
+    peak_global_budget_causal_reserve_outside(model,1,1000000);
+    PeakGlobalBudgetCausalView pending=peak_global_budget_causal_view(model);
+    assert(pending.confirmed_ns==0&&pending.unresolved_ns==2000000);
+    for(unsigned r=0;r<2;r++)causal_event(model,ranks,r,seq,last,PEAK_MPI_EVENT_POST,PEAK_MPI_OP_COLLECTIVE,1000000,1,0);
+    PeakGlobalBudgetCausalView view=peak_global_budget_causal_view(model);
+    assert(view.raw_cost_ns==2000000&&view.confirmed_ns==1000000&&view.unresolved_ns==0);
+    for(unsigned r=0;r<2;r++)causal_event(model,ranks,r,seq,last,PEAK_MPI_EVENT_WAIT,PEAK_MPI_OP_COLLECTIVE,1000000,1,0);
+    for(unsigned r=0;r<2;r++)causal_event(model,ranks,r,seq,last,PEAK_MPI_EVENT_COMPLETE,PEAK_MPI_OP_COLLECTIVE,1000000,1,0);
+    view=peak_global_budget_causal_view(model);
+    assert(view.confirmed_ns==1000000&&view.unresolved_ns==0&&!view.sum_mode);
+    causal_event(model,ranks,0,seq,last,PEAK_MPI_EVENT_FRONTIER,PEAK_MPI_OP_SEND,1500000,0,1);
+    causal_event(model,ranks,0,seq,last,PEAK_MPI_EVENT_POST,PEAK_MPI_OP_SEND,1500000,2,1);
+    causal_event(model,ranks,1,seq,last,PEAK_MPI_EVENT_POST,PEAK_MPI_OP_RECV,1000000,2,0);
+    causal_event(model,ranks,0,seq,last,PEAK_MPI_EVENT_WAIT,PEAK_MPI_OP_SEND,1500000,2,1);
+    causal_event(model,ranks,1,seq,last,PEAK_MPI_EVENT_WAIT,PEAK_MPI_OP_RECV,1000000,2,0);
+    causal_event(model,ranks,0,seq,last,PEAK_MPI_EVENT_COMPLETE,PEAK_MPI_OP_SEND,1500000,2,1);
+    causal_event(model,ranks,1,seq,last,PEAK_MPI_EVENT_COMPLETE,PEAK_MPI_OP_RECV,1000000,2,0);
+    causal_event(model,ranks,1,seq,last,PEAK_MPI_EVENT_FRONTIER,PEAK_MPI_OP_RECV,1800000,0,0);
+    view=peak_global_budget_causal_view(model);
+    assert(view.confirmed_ns==2300000&&view.unresolved_ns==0&&!view.sum_mode);
+    PeakGlobalBudgetSample additive={.profile_seconds=.001,.ignored_seconds=.002};
+    assert(fabs(ledger_cost(&additive,3000000)-.005)<1e-12);
+    peak_global_budget_causal_free(model);metadata_clear();atomic_store(&running,false);
+}
+
+static void prefix_record(BrokerMetadata *metadata, unsigned rank,
+    uint64_t seq[2], uint64_t last[2], PeakGlobalBudgetCausalKind kind,
+    uint64_t round, uint64_t outside, uint64_t inside, unsigned certification)
+{
+    uint64_t record[18]={18,2,0,1,kind,PEAK_CAUSAL_COLLECTIVE,
+        ++seq[rank],last[rank],round,0,0,rank,0,outside,inside,outside+inside,0,
+        certification};
+    if(kind!=PEAK_CAUSAL_FRONTIER)last[rank]=seq[rank];
+    unsigned char payload[18*8],*output=payload;
+    for(size_t i=0;i<18;++i)peak_budget_wire_put(&output,record[i],8);
+    if(certification==(PEAK_MPI_CLOSED_WORLD_PREFIX|PEAK_MPI_ENTRY_FENCE))
+        assert(payload[17*8+7]==3); /* Canonical flags word, independent byte value. */
+    Frame frame={.rank=rank,.payload_words=18};
+    assert(consume_metadata(metadata,&frame,payload));
+}
+static void check_closed_cost_prefix(void)
+{
+    PeakGlobalBudgetCausal *model=peak_global_budget_causal_new(2);assert(model);
+    Rank ranks[2]={0};BrokerMetadata metadata;
+    assert(broker_metadata_init(&metadata,model,ranks,2));
+    size_t members[]={0,1};assert(peak_global_budget_causal_context(model,0,1,members,2));
+    uint64_t seq[2]={0},last[2]={0};
+    for(unsigned r=0;r<2;r++){
+        prefix_record(&metadata,r,seq,last,PEAK_CAUSAL_UNKNOWN,0,100+r*100,0,false);
+        prefix_record(&metadata,r,seq,last,PEAK_CAUSAL_MPI_ENTER,1,100+r*100,0,false);
+    }
+    assert(peak_global_budget_causal_view(model).sum_mode);
+    prefix_record(&metadata,0,seq,last,PEAK_CAUSAL_MPI_EXIT,1,100,0,true);
+    prefix_record(&metadata,0,seq,last,PEAK_CAUSAL_FRONTIER,1,1000,50,false);
+    assert(metadata.lanes[0].head&&metadata.checkpoints==0);
+    assert(ranks[0].represented_outside==100&&ranks[0].represented_inside==50);
+    assert(ranks[0].raw_profile-ranks[0].represented_outside-ranks[0].represented_inside==900);
+    prefix_record(&metadata,1,seq,last,PEAK_CAUSAL_MPI_EXIT,1,200,0,true);
+    assert(metadata.checkpoints==1&&!metadata.lanes[0].head);
+    assert(!peak_global_budget_causal_view(model).sum_mode);
+    prefix_record(&metadata,1,seq,last,PEAK_CAUSAL_FRONTIER,1,1100,0,false);
+    PeakGlobalBudgetCausalView view=peak_global_budget_causal_view(model);
+    assert(view.confirmed_ns==1200&&view.raw_cost_ns==2100&&view.unresolved_ns==0);
+    /* A same-round noncertificate must release held data conservatively,
+     * never turn the other rank's local certificate into a global cut. */
+    for(unsigned r=0;r<2;r++){
+        prefix_record(&metadata,r,seq,last,PEAK_CAUSAL_UNKNOWN,0,1000+r*100,0,false);
+        prefix_record(&metadata,r,seq,last,PEAK_CAUSAL_MPI_ENTER,2,1000+r*100,0,false);
+    }
+    prefix_record(&metadata,0,seq,last,PEAK_CAUSAL_MPI_EXIT,2,1000,0,true);
+    prefix_record(&metadata,0,seq,last,PEAK_CAUSAL_FRONTIER,2,2000,0,false);
+    assert(metadata.lanes[0].head);
+    prefix_record(&metadata,1,seq,last,PEAK_CAUSAL_MPI_EXIT,2,1100,0,false);
+    assert(metadata.checkpoints==1&&!metadata.cut_active&&!metadata.lanes[0].head);
+    assert(peak_global_budget_causal_view(model).sum_mode);
+    assert(ranks[0].represented_outside==2000);
+    /* A newer certified round can replace an abandoned candidate without
+     * recursive replay or admitting that rank's future records too early. */
+    prefix_record(&metadata,0,seq,last,PEAK_CAUSAL_MPI_ENTER,3,2000,0,false);
+    prefix_record(&metadata,0,seq,last,PEAK_CAUSAL_MPI_EXIT,3,2000,0,true);
+    prefix_record(&metadata,0,seq,last,PEAK_CAUSAL_MPI_ENTER,4,2100,0,false);
+    prefix_record(&metadata,0,seq,last,PEAK_CAUSAL_MPI_EXIT,4,2100,0,true);
+    prefix_record(&metadata,1,seq,last,PEAK_CAUSAL_MPI_ENTER,4,1200,0,false);
+    prefix_record(&metadata,1,seq,last,PEAK_CAUSAL_MPI_EXIT,4,1200,0,true);
+    assert(metadata.checkpoints==2&&!metadata.cut_active);
+    assert(!metadata.lanes[0].head&&!metadata.lanes[1].head);
+    assert(!peak_global_budget_causal_view(model).sum_mode);
+    broker_metadata_clear(&metadata);peak_global_budget_causal_free(model);
+}
+
+static void prefix_point(BrokerMetadata *metadata, unsigned rank,
+    uint64_t seq[2],uint64_t last[2],PeakGlobalBudgetCausalKind kind,
+    PeakGlobalBudgetCausalOperation operation,uint64_t cost)
+{
+    uint64_t record[19]={18,2,0,1,kind,operation,++seq[rank],last[rank],
+        1,7,1,rank,1-rank,cost,0,cost,0,0,1};
+    if(kind==PEAK_CAUSAL_WAIT||kind==PEAK_CAUSAL_COMPLETE){record[0]=19;record[16]=1;}
+    last[rank]=seq[rank];
+    unsigned char payload[19*8],*output=payload;
+    for(size_t i=0;i<record[0];++i)peak_budget_wire_put(&output,record[i],8);
+    Frame frame={.rank=rank,.payload_words=record[0]};
+    assert(consume_metadata(metadata,&frame,payload));
+}
+static void check_asymmetric_closed_prefix(void)
+{
+    PeakGlobalBudgetCausal *model=peak_global_budget_causal_new(2);assert(model);
+    Rank ranks[2]={0};BrokerMetadata metadata;
+    assert(broker_metadata_init(&metadata,model,ranks,2));
+    size_t members[]={0,1};assert(peak_global_budget_causal_context(model,0,1,members,2));
+    uint64_t seq[2]={0},last[2]={0};
+    for(unsigned r=0;r<2;r++)prefix_record(&metadata,r,seq,last,PEAK_CAUSAL_UNKNOWN,0,0,0,false);
+    /* Nonbarrier Bcast: rank0 returns, then sends to rank1 BEFORE rank1
+     * enters Bcast. Identical collective EXITs do not define a closed cut. */
+    prefix_record(&metadata,0,seq,last,PEAK_CAUSAL_MPI_ENTER,1,0,0,false);
+    prefix_record(&metadata,0,seq,last,PEAK_CAUSAL_MPI_EXIT,1,0,0,true);
+    prefix_point(&metadata,0,seq,last,PEAK_CAUSAL_POST,PEAK_CAUSAL_AMBIGUOUS_SEND,10);
+    prefix_point(&metadata,0,seq,last,PEAK_CAUSAL_WAIT,PEAK_CAUSAL_AMBIGUOUS_SEND,10);
+    prefix_point(&metadata,0,seq,last,PEAK_CAUSAL_COMPLETE,PEAK_CAUSAL_AMBIGUOUS_SEND,10);
+    prefix_point(&metadata,1,seq,last,PEAK_CAUSAL_POST,PEAK_CAUSAL_RECV,0);
+    prefix_point(&metadata,1,seq,last,PEAK_CAUSAL_WAIT,PEAK_CAUSAL_RECV,0);
+    prefix_point(&metadata,1,seq,last,PEAK_CAUSAL_COMPLETE,PEAK_CAUSAL_RECV,0);
+    prefix_record(&metadata,1,seq,last,PEAK_CAUSAL_FRONTIER,0,10,0,false);
+    prefix_record(&metadata,1,seq,last,PEAK_CAUSAL_MPI_ENTER,1,10,0,false);
+    prefix_record(&metadata,1,seq,last,PEAK_CAUSAL_MPI_EXIT,1,10,0,true);
+    assert(!metadata.checkpoints&&!metadata.cut_active&&!metadata.lanes[0].head);
+    prefix_record(&metadata,1,seq,last,PEAK_CAUSAL_FRONTIER,1,20,0,false);
+    assert(peak_global_budget_causal_view(model).effective_ns>=30);
+    /* Matching the held send permits a later genuinely closed prefix. */
+    for(unsigned r=0;r<2;r++){
+        uint64_t cost=r?20:10;
+        prefix_record(&metadata,r,seq,last,PEAK_CAUSAL_MPI_ENTER,2,cost,0,false);
+        prefix_record(&metadata,r,seq,last,PEAK_CAUSAL_MPI_EXIT,2,cost,0,true);
+    }
+    assert(metadata.checkpoints==1);
+    assert(peak_global_budget_causal_view(model).effective_ns>=30);
+    broker_metadata_clear(&metadata);peak_global_budget_causal_free(model);
+}
+
+static void check_reverse_and_entry_fence(void)
+{
+    PeakGlobalBudgetCausal *model=peak_global_budget_causal_new(2);assert(model);
+    Rank ranks[2]={0};BrokerMetadata metadata;
+    assert(broker_metadata_init(&metadata,model,ranks,2));
+    size_t members[]={0,1};assert(peak_global_budget_causal_context(model,0,1,members,2));
+    uint64_t seq[2]={0},last[2]={0};
+    for(unsigned r=0;r<2;r++)prefix_record(&metadata,r,seq,last,PEAK_CAUSAL_UNKNOWN,0,0,0,0);
+    prefix_record(&metadata,0,seq,last,PEAK_CAUSAL_MPI_ENTER,1,0,0,0);
+    prefix_record(&metadata,0,seq,last,PEAK_CAUSAL_MPI_EXIT,1,0,0,PEAK_MPI_CLOSED_WORLD_PREFIX);
+    prefix_point(&metadata,0,seq,last,PEAK_CAUSAL_POST,PEAK_CAUSAL_RECV,10);
+    prefix_point(&metadata,0,seq,last,PEAK_CAUSAL_WAIT,PEAK_CAUSAL_RECV,10);
+    prefix_point(&metadata,0,seq,last,PEAK_CAUSAL_COMPLETE,PEAK_CAUSAL_RECV,10);
+    /* A pre-cut rendezvous SEND completed only because the held post-cut
+     * RECV was posted. Completed SEND alone is not a forward-edge proof. */
+    prefix_point(&metadata,1,seq,last,PEAK_CAUSAL_POST,PEAK_CAUSAL_AMBIGUOUS_SEND,0);
+    prefix_point(&metadata,1,seq,last,PEAK_CAUSAL_WAIT,PEAK_CAUSAL_AMBIGUOUS_SEND,0);
+    prefix_point(&metadata,1,seq,last,PEAK_CAUSAL_COMPLETE,PEAK_CAUSAL_AMBIGUOUS_SEND,0);
+    prefix_record(&metadata,1,seq,last,PEAK_CAUSAL_FRONTIER,0,10,0,0);
+    prefix_record(&metadata,1,seq,last,PEAK_CAUSAL_MPI_ENTER,1,10,0,0);
+    prefix_record(&metadata,1,seq,last,PEAK_CAUSAL_MPI_EXIT,1,10,0,PEAK_MPI_CLOSED_WORLD_PREFIX);
+    assert(!metadata.checkpoints&&!metadata.lanes[0].head);
+    prefix_record(&metadata,1,seq,last,PEAK_CAUSAL_FRONTIER,1,20,0,0);
+    assert(peak_global_budget_causal_view(model).effective_ns>=30);
+    broker_metadata_clear(&metadata);peak_global_budget_causal_free(model);
+
+    model=peak_global_budget_causal_new(2);assert(model);
+    memset(ranks,0,sizeof ranks);memset(seq,0,sizeof seq);memset(last,0,sizeof last);
+    assert(broker_metadata_init(&metadata,model,ranks,2));
+    assert(peak_global_budget_causal_context(model,0,1,members,2));
+    for(unsigned r=0;r<2;r++)prefix_record(&metadata,r,seq,last,PEAK_CAUSAL_UNKNOWN,0,0,0,0);
+    prefix_point(&metadata,0,seq,last,PEAK_CAUSAL_POST,PEAK_CAUSAL_SEND,10);
+    prefix_point(&metadata,0,seq,last,PEAK_CAUSAL_WAIT,PEAK_CAUSAL_SEND,10);
+    prefix_point(&metadata,0,seq,last,PEAK_CAUSAL_COMPLETE,PEAK_CAUSAL_SEND,10);
+    for(unsigned r=0;r<2;r++){
+        prefix_record(&metadata,r,seq,last,PEAK_CAUSAL_MPI_ENTER,1,r?0:10,0,0);
+        prefix_record(&metadata,r,seq,last,PEAK_CAUSAL_MPI_EXIT,1,r?0:10,0,
+            PEAK_MPI_CLOSED_WORLD_PREFIX|(r?0:PEAK_MPI_ENTRY_FENCE));
+    }
+    assert(!metadata.checkpoints); /* AND all members, never any-member fence. */
+    for(unsigned r=0;r<2;r++){
+        prefix_record(&metadata,r,seq,last,PEAK_CAUSAL_MPI_ENTER,2,r?0:10,0,0);
+        prefix_record(&metadata,r,seq,last,PEAK_CAUSAL_MPI_EXIT,2,r?0:10,0,
+            PEAK_MPI_CLOSED_WORLD_PREFIX|PEAK_MPI_ENTRY_FENCE);
+    }
+    assert(metadata.checkpoints==1&&metadata.fenced_checkpoints==1);
+    prefix_point(&metadata,1,seq,last,PEAK_CAUSAL_POST,PEAK_CAUSAL_RECV,0);
+    prefix_point(&metadata,1,seq,last,PEAK_CAUSAL_WAIT,PEAK_CAUSAL_RECV,0);
+    prefix_point(&metadata,1,seq,last,PEAK_CAUSAL_COMPLETE,PEAK_CAUSAL_RECV,0);
+    prefix_record(&metadata,1,seq,last,PEAK_CAUSAL_FRONTIER,2,10,0,0);
+    assert(peak_global_budget_causal_view(model).effective_ns>=20);
+    broker_metadata_clear(&metadata);peak_global_budget_causal_free(model);
+}
+
+static void check_opaque_live_closure(void)
+{
+    PeakGlobalBudgetCausal *model=peak_global_budget_causal_new(2);assert(model);
+    Rank ranks[2]={0};BrokerMetadata metadata;
+    assert(broker_metadata_init(&metadata,model,ranks,2));
+    size_t members[]={0,1};assert(peak_global_budget_causal_context(model,0,1,members,2));
+    uint64_t seq[2]={0},last[2]={0};
+    prefix_record(&metadata,0,seq,last,PEAK_CAUSAL_FRONTIER,0,10,0,0);
+    prefix_record(&metadata,0,seq,last,PEAK_CAUSAL_MPI_ENTER,1,10,0,0);
+    prefix_record(&metadata,0,seq,last,PEAK_CAUSAL_MPI_EXIT,1,10,0,PEAK_MPI_CLOSED_WORLD_PREFIX);
+    prefix_record(&metadata,0,seq,last,PEAK_CAUSAL_FRONTIER,1,20,0,0);
+    assert(metadata.lanes[0].head);
+    prefix_record(&metadata,1,seq,last,PEAK_CAUSAL_UNKNOWN,0,5,0,PEAK_MPI_OPAQUE_LIVE);
+    assert(metadata.closed&&!metadata.invalid&&!metadata.cut_active&&!metadata.lanes[0].head);
+    PeakGlobalBudgetCausalView closed=peak_global_budget_causal_view(model);
+    assert(closed.sum_mode&&!closed.resource_failed&&!closed.saturated);
+    uint64_t tail=0;for(unsigned r=0;r<2;r++)tail+=ranks[r].raw_profile-ranks[r].represented_outside-ranks[r].represented_inside;
+    assert(closed.effective_ns+tail>=25); /* Held outside cost is not forgiven. */
+    prefix_point(&metadata,0,seq,last,PEAK_CAUSAL_POST,PEAK_CAUSAL_SEND,50);
+    assert(peak_global_budget_causal_view(model).raw_cost_ns==closed.raw_cost_ns);
+    assert(ranks[0].raw_profile==50); /* Raw SUM bill grows, core allocation stops. */
+    assert(!metadata.checkpoints&&!metadata.invalid);
+    broker_metadata_clear(&metadata);peak_global_budget_causal_free(model);
+}
+
+static void *interleaved_frontier(void *unused)
+{
+    (void)unused;
+    /* HB owns this call's CPU in management SUM; no foreground operation,
+     * seed token or frontend charge may be invented for its frontier. */
+    PeakMpiBudgetEvent event={.kind=PEAK_MPI_EVENT_FRONTIER,.rank=0,.seq=2,.last_mpi_seq=1};
+    PeakMpiBudgetCostSnapshot cost={0};peak_global_budget_mpi_event_submit(&event,&cost);
+    return NULL;
+}
+static void check_settled_operation_prefix(void)
+{
+    atomic_store(&owner,getpid());atomic_store(&running,true);rank_id=0;world=2;
+    atomic_store(&local_retiring,false);atomic_store(&metadata_enabled,true);atomic_store(&metadata_seed,64);
+    atomic_store(&metadata_tokens,0);atomic_store(&metadata_inflight,0);atomic_store(&frontend_cpu_ns,0);
+    atomic_store(&metadata_block_credit,0);atomic_store(&metadata_unassigned_frontend,0);metadata_ordered_frontend=0;
+    assert(peak_global_budget_mpi_trace_begin());
+    PeakMpiBudgetEvent event={.kind=PEAK_MPI_EVENT_ENTER,.rank=0,.seq=1,.request=UINT64_C(0x0102030405060708)};
+    PeakMpiBudgetCostSnapshot cost={0};peak_global_budget_mpi_event_submit(&event,&cost);
+    assert(atomic_load(&metadata_pending)&&!atomic_load(&metadata_ready));
+    pthread_t heartbeat;assert(!pthread_create(&heartbeat,NULL,interleaved_frontier,NULL));assert(!pthread_join(heartbeat,NULL));
+    uint64_t count=99;assert(!metadata_batch(&count)&&count==0);
+    assert(!atomic_load(&metadata_ready)); /* The complete later operation cannot pass ENTER. */
+    event=(PeakMpiBudgetEvent){.kind=PEAK_MPI_EVENT_EXIT,.rank=0,.seq=3,.last_mpi_seq=1};
+    peak_global_budget_mpi_event_submit(&event,&cost);peak_global_budget_mpi_frontend_charge(1000);
+    assert(atomic_load(&metadata_ready));
+    unsigned char *payload=metadata_batch(&count);assert(payload&&count==54);
+    static const unsigned char identity[]={1,2,3,4,5,6,7,8};
+    assert(!memcmp(payload+10*8,identity,sizeof identity)); /* Independent dynamic-payload endian golden. */
+    uint64_t words[54];const unsigned char *cursor=payload;
+    for(unsigned i=0;i<54;i++)words[i]=peak_budget_wire_get(&cursor,8);
+    assert(words[13]>0&&words[18+13]==words[13]);
+    assert(words[36+13]==words[18+13]&&words[36+13]==atomic_load(&frontend_cpu_ns));
+    /* Force partial fixed header AND partial dynamic payload, no ABI casts. */
+    int sockets[2];assert(!socketpair(AF_UNIX,SOCK_STREAM,0,sockets));
+    Frame frame={.magic=MAGIC,.version=PROTOCOL_VERSION,.payload_words=count};
+    unsigned char fixed[PEAK_GLOBAL_BUDGET_WIRE_SIZE];peak_global_budget_frame_encode(fixed,&frame);
+    Peer receiver={.fd=sockets[1]};
+    assert(send(sockets[0],fixed,17,0)==17);assert(read_frame(&receiver)==0);
+    assert(send(sockets[0],fixed+17,sizeof fixed-17,0)==sizeof fixed-17);
+    assert(send(sockets[0],payload,7,0)==7);assert(read_frame(&receiver)==0);
+    assert(send(sockets[0],payload+7,count*8-7,0)==count*8-7);assert(read_frame(&receiver)==1);
+    assert(!memcmp(receiver.incoming_payload,payload,count*8));read_frame_done(&receiver);
+    free(payload);close(sockets[0]);close(sockets[1]);
+    metadata_clear();
+    /* Retirement cancels the unused remainder of a paid block only after
+     * admitted operations have published their real costs. */
+    atomic_store(&metadata_seed, 0);
+    atomic_store(&metadata_tokens, 0);
+    atomic_store(&metadata_estimate, 1000);
+    atomic_store(&available_ns, 64000);
+    atomic_store(&consumed_frontend_ns, 0);
+    atomic_store(&settled_frontend_ns, 0);
+    assert(peak_global_budget_mpi_trace_begin());
+    assert(atomic_load(&metadata_tokens) == 63);
+    assert(atomic_load(&consumed_frontend_ns) == 64000);
+    assert(!atomic_load(&available_ns));
+    peak_global_budget_retire();
+    assert(!atomic_load(&metadata_enabled));
+    assert(!atomic_load(&settled_frontend_ns));
+    peak_global_budget_mpi_frontend_charge(1000);
+    assert(!atomic_load(&metadata_inflight));
+    assert(!atomic_load(&metadata_tokens));
+    assert(!atomic_load(&metadata_block_credit));
+    assert(atomic_load(&settled_frontend_ns) == 64000);
+    assert(!peak_global_budget_mpi_trace_begin());
+    atomic_store(&local_retiring,false);
+    atomic_store(&consumed_frontend_ns,0);
+    atomic_store(&debit_ns,0);
+    atomic_store(&settled_frontend_ns,0);
+    local_sample=(PeakGlobalBudgetSample){0};
+    atomic_store(&running,false);
+}
+
 int main(void)
 {
     check_wire_format();
+    check_metadata_prefetch();
+    check_reply_snapshot_order();
+    check_required_vs_desired();
+    check_causal_wire_integration();
+    check_closed_cost_prefix();
+    check_asymmetric_closed_prefix();
+    check_reverse_and_entry_fence();
+    check_opaque_live_closure();
+    check_settled_operation_prefix();
     check_credit_conservation();
     check_control_settlement();
     check_startup_handoff();

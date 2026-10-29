@@ -5,10 +5,25 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
 import tempfile
+from contextlib import contextmanager
+
+@contextmanager
+def artifact_directory():
+    root = Path(tempfile.mkdtemp(prefix='peak-budget-mpi-'))
+    try:
+        yield root
+    except BaseException:
+        # Keep the original complete run, rather than losing raw evidence
+        # when an oracle or launcher fails inside a temporary-directory scope.
+        print(f'preserved_mpi_failure={root}', file=sys.stderr)
+        raise
+    else:
+        shutil.rmtree(root)
 
 p = argparse.ArgumentParser()
 p.add_argument('--exe', type=Path, required=True)
@@ -20,8 +35,7 @@ p.add_argument('--preflags', default='')
 p.add_argument('--ranks', type=int, default=2)
 p.add_argument('--mode', choices=('recovery', 'early-finalize'), required=True)
 a = p.parse_args()
-with tempfile.TemporaryDirectory(prefix='peak-budget-mpi-') as temporary:
-    root = Path(temporary)
+with artifact_directory() as root:
     targets = root / 'targets.txt'
     targets.write_text(''.join(f'budget_target_{i}\n' for i in range(80)))
     env = {k: v for k, v in os.environ.items()
@@ -78,9 +92,14 @@ with tempfile.TemporaryDirectory(prefix='peak-budget-mpi-') as temporary:
             assert broker['reap_confirmed'] == '1', text
         if a.mode == 'recovery':
             member = records('MPI global member:')[-1]
-            profile_spent = (int(member['granted_total_ns']) - int(member['returned_total_ns'])
-                             - int(member['control_consumed_ns']) - int(member['local_credit_ns']))
-            assert profile_spent > 0, member
+            bill = records('MPI global local bill:')[-1]
+            # Metadata prepayment is a separate typed debit, never evidence
+            # that a target actually produced paid profiling work.
+            assert int(bill['profile_debit_ns']) > 0, bill
+            assert int(member['granted_total_ns']) == (
+                int(member['returned_total_ns']) + int(member['control_consumed_ns'])
+                + int(bill['frontend_debit_ns']) + int(bill['profile_debit_ns'])
+                + int(member['local_credit_ns'])), (member, bill)
             events = records('global controller event:')
             # Initial hooks use the standard constructor installation. Paid
             # continuation/recovery remains mandatory, but no initial runtime

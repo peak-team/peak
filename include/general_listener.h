@@ -102,6 +102,12 @@ struct _PeakGeneralListener {
     /* One initial observation window per hook, shared by every thread and
      * never replenished by physical reattachment. */
     _Atomic unsigned initial_observation_remaining;
+    /* Logical admission is independent of the installed physical trampoline. */
+    _Atomic gboolean soft_paused;
+    _Atomic uint64_t retired_ignored_ns;
+    _Atomic uint64_t ignored_rent_base_ns;
+    _Atomic uint64_t soft_resume_sample;
+    gboolean soft_pause_calibration;
     _Atomic guint fast_lifetime_closing;
     _Atomic guint fast_lifetime_abandoners;
     GumPeakFastListener fast_listener;
@@ -128,6 +134,7 @@ struct _PeakGeneralListener {
     gfloat retired_min_time;
     PeakGeneralListenerCheckpointShadow* checkpoint_shadow;
     size_t checkpoint_shadow_mapping_size;
+    _Atomic gboolean initial_unfunded_close_eligible;
 };
 
 struct _PeakGumTargetAttachPlan;

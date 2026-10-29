@@ -3,13 +3,14 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <time.h>
-typedef struct { uint64_t sequence, completed_wave, settled_control_credit_ns, background_period_ns; double profile_seconds, control_seconds, management_seconds, elapsed_seconds, pressure, unfunded_seconds, transport_seconds, closing_seconds; uint32_t attached_targets; bool retiring, final, finalizer_invalid, initial_unexposed; } PeakGlobalBudgetSample;
-typedef struct { bool startup_sealed, broker_final_written, active, wave_participant, cohort_finalized, accounting_invalid, recovery_pending; uint64_t background_period_ns, freshness_ns, broker_process_id, wave, decision_sequence, view_epoch, root_completed_wave, acknowledged_sequence, acknowledged_demand_generation, request_deadline_ns, local_credit_ns, returned_total_ns, recovery_target_ns, rejected_spend_count, granted_total_ns; double broker_cpu_seconds, global_spent_seconds, remaining_seconds, allowance_seconds, wave_span_seconds, granted_total_seconds, budget_seconds, reserved_seconds, control_reserve_seconds, startup_seconds, transport_seconds, refill_rtt_seconds, consumption_rate; } PeakGlobalBudgetView;
+typedef struct { uint64_t sequence, completed_wave, settled_control_credit_ns, background_period_ns, settled_frontend_credit_ns; double ignored_seconds, profile_inside_seconds, frontend_seconds, profile_seconds, control_seconds, management_seconds, elapsed_seconds, pressure, unfunded_seconds, transport_seconds, closing_seconds; uint32_t attached_targets, credit_exposed_targets; bool credit_exposure_known, causal_supported, causal_fallback, retiring, final, finalizer_invalid, initial_unexposed; } PeakGlobalBudgetSample;
+typedef struct { bool metadata_closed, startup_sealed, broker_final_written, active, wave_participant, cohort_finalized, accounting_invalid, recovery_pending; uint64_t background_period_ns, freshness_ns, broker_process_id, wave, decision_sequence, view_epoch, root_completed_wave, acknowledged_sequence, acknowledged_demand_generation, request_deadline_ns, local_credit_ns, returned_total_ns, recovery_target_ns, rejected_spend_count, granted_total_ns; double local_closing_reserved_seconds, causal_confirmed_seconds, causal_pending_seconds, causal_raw_seconds, causal_unrepresented_seconds, broker_cpu_seconds, global_spent_seconds, remaining_seconds, allowance_seconds, wave_span_seconds, granted_total_seconds, budget_seconds, reserved_seconds, control_reserve_seconds, startup_seconds, transport_seconds, refill_rtt_seconds, consumption_rate; } PeakGlobalBudgetView;
 /* Host-only diagnostic snapshot; deliberately absent from the wire schema.
  * A complete socket write is not a per-message broker acknowledgment. */
 typedef struct {
     bool written, retiring, final, finalizer_registered;
-    uint64_t sample_sequence, message_sequence, profile_debit_ns;
+    uint64_t sample_sequence, message_sequence, profile_debit_ns, frontend_debit_ns;
+    double ignored_seconds, profile_inside_seconds, frontend_seconds;
     double profile_sample_seconds, profile_billed_seconds, control_seconds;
     double management_input_seconds, management_sent_seconds, transport_seconds;
     double finalizer_baseline_seconds, finalizer_cpu_seconds;

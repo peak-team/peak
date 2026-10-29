@@ -6,16 +6,17 @@
 #include <string.h>
 
 #define PEAK_GLOBAL_BUDGET_PROTOCOL_MAGIC UINT32_C(0x50474231)
-#define PEAK_GLOBAL_BUDGET_PROTOCOL_VERSION 6
+#define PEAK_GLOBAL_BUDGET_PROTOCOL_VERSION 7
 
 typedef struct {
     uint32_t magic, version, rank, size;
     uint64_t reply_sequence, consumed_profile_ns, consumed_control_ns, nonce,
-        requested_ns, demand_generation, message_sequence, returned_ns;
+        requested_ns, demand_generation, message_sequence, returned_ns, consumed_frontend_ns, payload_words;
     bool request_credit, root_startup_sealed, request_reply;
     double root_origin_seconds, root_startup_seconds;
     PeakGlobalBudgetSample sample;
     PeakGlobalBudgetView view;
+    uint64_t minimum_ns; /* Immediate required cash, distinct from desired runway. */
 } PeakGlobalBudgetFrame;
 
 /* One field list fixes wire order independently of host layout and padding. */
@@ -23,18 +24,18 @@ typedef struct {
     U32(magic) U32(version) U32(rank) U32(size) \
     U64(reply_sequence) U64(consumed_profile_ns) U64(consumed_control_ns) \
     U64(nonce) U64(requested_ns) U64(demand_generation) \
-    U64(message_sequence) U64(returned_ns) \
+    U64(message_sequence) U64(returned_ns) U64(consumed_frontend_ns) U64(payload_words) \
     BOOL(request_credit) BOOL(root_startup_sealed) \
     F64(root_origin_seconds) F64(root_startup_seconds) \
     U64(sample.sequence) U64(sample.completed_wave) \
-    U64(sample.settled_control_credit_ns) \
-    F64(sample.profile_seconds) F64(sample.control_seconds) \
+    U64(sample.settled_control_credit_ns) U64(sample.settled_frontend_credit_ns) \
+    F64(sample.profile_seconds) F64(sample.ignored_seconds) F64(sample.profile_inside_seconds) F64(sample.frontend_seconds) F64(sample.control_seconds) \
     F64(sample.management_seconds) F64(sample.elapsed_seconds) \
     F64(sample.pressure) F64(sample.unfunded_seconds) \
     F64(sample.transport_seconds) F64(sample.closing_seconds) \
-    U32(sample.attached_targets) BOOL(sample.retiring) BOOL(sample.final) \
-    BOOL(sample.finalizer_invalid) BOOL(sample.initial_unexposed) \
-    BOOL(view.startup_sealed) BOOL(view.broker_final_written) BOOL(view.active) \
+    U32(sample.attached_targets) U32(sample.credit_exposed_targets) BOOL(sample.credit_exposure_known) BOOL(sample.causal_supported) BOOL(sample.retiring) BOOL(sample.final) \
+    BOOL(sample.finalizer_invalid) BOOL(sample.initial_unexposed) BOOL(sample.causal_fallback) \
+    BOOL(view.metadata_closed) BOOL(view.startup_sealed) BOOL(view.broker_final_written) BOOL(view.active) \
     BOOL(view.wave_participant) BOOL(view.cohort_finalized) \
     BOOL(view.accounting_invalid) BOOL(view.recovery_pending) \
     U64(view.broker_process_id) U64(view.wave) U64(view.decision_sequence) \
@@ -43,7 +44,7 @@ typedef struct {
     U64(view.request_deadline_ns) U64(view.local_credit_ns) \
     U64(view.returned_total_ns) U64(view.recovery_target_ns) \
     U64(view.rejected_spend_count) U64(view.granted_total_ns) \
-    F64(view.broker_cpu_seconds) F64(view.global_spent_seconds) \
+    F64(view.local_closing_reserved_seconds) F64(view.broker_cpu_seconds) F64(view.global_spent_seconds) F64(view.causal_confirmed_seconds) F64(view.causal_pending_seconds) F64(view.causal_raw_seconds) F64(view.causal_unrepresented_seconds) \
     F64(view.remaining_seconds) F64(view.allowance_seconds) \
     F64(view.wave_span_seconds) F64(view.granted_total_seconds) \
     F64(view.budget_seconds) F64(view.reserved_seconds) \
@@ -51,7 +52,7 @@ typedef struct {
     F64(view.transport_seconds) F64(view.refill_rtt_seconds) \
     F64(view.consumption_rate) \
     U64(sample.background_period_ns) U64(view.background_period_ns) \
-    U64(view.freshness_ns) BOOL(request_reply)
+    U64(view.freshness_ns) BOOL(request_reply) U64(minimum_ns)
 
 #define PEAK_WIRE_SIZE_U32(field) + 4
 #define PEAK_WIRE_SIZE_U64(field) + 8

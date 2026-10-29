@@ -678,9 +678,11 @@ With heartbeat admission available, global mode defaults to
 `PEAK_MPI_ACTIVATION_POLICY=prepare`: PEAK initializes before MPI and performs
 the standard initial target installation. Each initial hook gets one shared
 64-call observation window across threads; reattachment does not reset it.
-Measured callback cost is included in global accounting. The call count does not
-bound physical-stop wall time; measured control cost is billed separately.
-Global pressure can selectively close sampled hot hooks. Later loader/JIT
+Measured callback cost is included in global accounting. PEAK's function
+statistics count callbacks actually observed; ignored callbacks are charged as
+overhead without increasing those counts. The call count does not bound
+physical-stop wall time; measured control cost is billed separately. Global
+pressure can selectively close sampled hot hooks. Later loader/JIT
 installations and physical recovery require funded leases. Explicit `post-init`
 defers all runtime preparation until MPI initialization returns and omits
 pre-MPI profiling; `prepare` allows initial observations before MPI.
@@ -696,12 +698,23 @@ The coordinator lends only available lifetime headroom:
 available = max(0, target * job_elapsed - spent - outstanding - closing_reserve)
 ```
 
-`spent` combines estimated callback cost, measured control-window wall time,
-management CPU and broker/client CPU. Control costs are conservatively summed
-across ranks. `outstanding` includes unspent issued credit and control
-prepayments awaiting settlement; actual control cost is charged once when its
-settlement watermark arrives. Credits use integer nanoseconds and are released
-only by actual consumption or an explicit return.
+`spent` combines calibrated profiling cost (including active and ignored-hook
+overhead), measured control-window wall time, management CPU, and broker/client
+CPU. Outside-MPI profiling costs are folded across ranks using observed
+communication dependencies. Inside-MPI costs and costs whose operation or
+synchronization cannot be modeled are conservatively summed across ranks under
+the same budget. Control and management costs are also summed across ranks.
+`spent` is the sum of confirmed and pending costs. `outstanding` includes
+unspent issued credit and control and frontend prepayments awaiting settlement.
+Measured cost enters `spent` when its cost sample is accounted; the matching
+prepayment is released when its settlement watermark is acknowledged. Credits
+use integer nanoseconds and are released only by actual consumption or an
+explicit return. Predictive refill may request more credit than is available;
+partial forecast funding alone does not stop the cohort. Admission still
+depends on cash for the next operation's minimum and closing costs, with
+measured global debt remaining binding. When sampling pauses at its budget edge,
+PEAK wakes the heartbeat once to reconsider demand; ignored calls do not repeat
+that wake.
 
 Root publishes preparation and bootstrap costs before sealing startup. An online
 cohort alone cannot authorize credit. Only original MPI initialization and later
@@ -742,11 +755,12 @@ written before reaping the broker. Early root finalization therefore does not
 cut off the remaining ranks.
 
 `MPI initial admission:`, `MPI global budget:` and `MPI global settlement:`
-report admission, current accounting and final confirmation. A failed bootstrap
-stops the global service and releases initial admission to the existing local
-policy; failed or stale coordination is reported as unconfirmed global
-protection. The optional timing trace separates startup, report and settlement
-costs.
+report admission, current accounting and final confirmation. The global budget
+line's causal raw, confirmed, pending, and unrepresented fields distinguish
+measured cost from cost already resolved by MPI ordering and cost still waiting
+for enough event evidence. A failed bootstrap stops the global service; failed
+or stale coordination is reported as unconfirmed global protection. The
+optional timing trace separates startup, report and settlement costs.
 
 The target controls an estimated lifetime budget. Calibration and mutation-cost
 prediction can be imperfect, and short jobs can finish before startup/closing
