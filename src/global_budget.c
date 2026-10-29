@@ -82,7 +82,7 @@ typedef struct {
     bool seen, connected, wants_credit, registered, participant, grace_exposed, reply_requested;
     double reservation, previous_cost, granted_total, closing_estimate;
     uint64_t consumed_ns, requested_ns, demand_generation, actioned_generation, message_sequence, returned_ns;
-    uint64_t last_update, registration_generation, member_generation, member_sample_sequence, fulfilled_generation, credit_total_ns, profile_ns, control_ns;
+    uint64_t last_update, registration_generation, member_generation, member_sample_sequence, fulfilled_generation, credit_total_ns, stop_credit_ns, profile_ns, control_ns;
 } Rank;
 typedef struct {
     unsigned peers_count;
@@ -926,9 +926,16 @@ static void *service(void *data)
                 bool attached = false;
                 for (unsigned i = 0; i < world; ++i) attached |= ranks[i].latest.attached_targets > 0;
                 bool registration_blocked = false;
-                for (unsigned i = 0; i < world; ++i)
+                bool new_funding = wave == 0;
+                for (unsigned i = 0; i < world; ++i) {
                     registration_blocked |= ranks[i].wants_credit && !ranks[i].registered && ranks[i].latest.attached_targets > 0;
-                if (unfunded && attached && (remaining <= 1e-9 || registration_blocked) && wave != UINT64_MAX) {
+                    new_funding |= ranks[i].credit_total_ns > ranks[i].stop_credit_ns;
+                }
+                /* A completed wave may preserve cold hooks and old wallets.
+                 * Their cash remains reserved and local guards still apply.
+                 * A larger unfunded quote alone does not justify another
+                 * cohort STOP; only newly issued positive credit rearms it. */
+                if (new_funding && unfunded && attached && (remaining <= 1e-9 || registration_blocked) && wave != UINT64_MAX) {
                     ++wave; wave_start = seconds_now(); span = 0; wave_pending = true;
                     record_event('S', rank_id, 0, wave, remaining);
                     for (unsigned i = 0; i < world; ++i) {
@@ -936,6 +943,7 @@ static void *service(void *data)
                         ranks[i].member_generation = ranks[i].demand_generation;
                         ranks[i].member_sample_sequence = ranks[i].latest.sequence;
                         ranks[i].actioned_generation = ranks[i].demand_generation;
+                        ranks[i].stop_credit_ns = ranks[i].credit_total_ns;
                     }
                 }
             }

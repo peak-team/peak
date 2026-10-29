@@ -176,6 +176,93 @@ static void cohort(unsigned count)
     printf("native_cohort=%u settled_and_reaped=1\n", count);
 }
 
+/* Larger unpaid requests during one debt episode are not new exposure.
+ * Keep cold hooks physically present while acknowledging each STOP. */
+static void coalesced_debt(void)
+{
+    unsigned short port;
+    assert(!peak_global_budget_listen(&port));
+    assert(!peak_global_budget_start("127.0.0.1", port, 0, 2, .05, NULL));
+    peak_global_budget_origin(1);
+    peak_global_budget_startup(1);
+    peak_global_budget_publish(&(PeakGlobalBudgetSample){.sequence = 1, .retiring = true});
+    int socket = connect_host("127.0.0.1", port);
+    assert(socket >= 0 && !fcntl(socket, F_SETFL, 0));
+    struct timeval timeout = {.tv_sec = 2};
+    assert(!setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout));
+    Frame sample = {.magic = MAGIC, .version = PROTOCOL_VERSION, .nonce = job_nonce,
+        .rank = 1, .size = 2, .message_sequence = 1, .request_reply = true,
+        .request_credit = true, .requested_ns = 1000000, .demand_generation = 1,
+        .sample = {.sequence = 1, .attached_targets = 2}};
+    send_sample(socket, &sample);
+    Frame reply;
+    do { receive_reply(socket, &reply); } while (!reply.view.wave);
+    assert(reply.view.wave == 1 && reply.view.granted_total_ns == 0);
+    sample.sample.completed_wave = 1;
+    for (unsigned generation = 2; generation <= 9; ++generation) {
+        sample.message_sequence++;
+        sample.sample.sequence++;
+        sample.demand_generation = generation;
+        sample.requested_ns = generation * UINT64_C(1000000);
+        sample.sample.control_seconds = generation * .00001;
+        send_sample(socket, &sample);
+        do { receive_reply(socket, &reply); }
+        while (reply.view.acknowledged_sequence < sample.sample.sequence ||
+               reply.view.root_completed_wave < 1);
+        assert(reply.view.wave == 1 && reply.view.granted_total_ns == 0);
+    }
+    uint64_t quiet_decision = reply.view.decision_sequence;
+    double quiet_cpu = reply.view.broker_cpu_seconds;
+    usleep(250000);
+    sample.message_sequence++;
+    sample.sample.sequence++;
+    send_sample(socket, &sample);
+    do { receive_reply(socket, &reply); }
+    while (reply.view.acknowledged_sequence < sample.sample.sequence);
+    uint64_t quiet_replies = reply.view.decision_sequence - quiet_decision;
+    double quiet_cpu_delta = reply.view.broker_cpu_seconds - quiet_cpu;
+    assert(reply.view.wave == 1 && quiet_replies <= 32 && quiet_cpu_delta < .02);
+    printf("coalesced_debt_idle_seconds=.25 broker_cpu_seconds=%.9g decisions=%llu\n",
+        quiet_cpu_delta, (unsigned long long)quiet_replies);
+    /* Real earned headroom now funds a positive lease and rearms STOP. */
+    peak_global_budget_origin(100);
+    do { receive_reply(socket, &reply); } while (!reply.view.granted_total_ns);
+    assert(reply.view.wave == 1);
+    uint64_t granted = reply.view.granted_total_ns;
+    sample.message_sequence++;
+    sample.sample.sequence++;
+    sample.sample.profile_seconds = 10;
+    sample.consumed_profile_ns = granted;
+    sample.demand_generation++;
+    sample.requested_ns = 20000000;
+    send_sample(socket, &sample);
+    do { receive_reply(socket, &reply); } while (reply.view.wave < 2);
+    assert(reply.view.wave == 2 && reply.view.root_completed_wave == 1);
+    /* A repeated old DONE cannot acknowledge the newly funded wave. */
+    sample.message_sequence++;
+    sample.sample.sequence++;
+    send_sample(socket, &sample);
+    do { receive_reply(socket, &reply); }
+    while (reply.view.acknowledged_sequence < sample.sample.sequence);
+    assert(reply.view.wave == 2 && reply.view.root_completed_wave == 1);
+    sample.message_sequence++;
+    sample.sample.sequence++;
+    sample.sample.completed_wave = 2;
+    send_sample(socket, &sample);
+    do { receive_reply(socket, &reply); } while (reply.view.root_completed_wave < 2);
+    assert(reply.view.wave == 2);
+    sample.message_sequence++;
+    sample.sample.sequence++;
+    sample.sample.attached_targets = 0;
+    sample.sample.retiring = sample.sample.final = true;
+    sample.request_credit = false;
+    send_sample(socket, &sample);
+    finish();
+    do { receive_reply(socket, &reply); } while (!reply.view.cohort_finalized);
+    close(socket);
+    puts("native_debt_unfunded_coalesced_positive_credit_rearmed=1");
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGALRM, cleanup_signal);
@@ -188,6 +275,7 @@ int main(int argc, char **argv)
     int probe = preload_probe(argv[1], argv[2], argv[3]);
     cohort(1);
     cohort(65);
+    coalesced_debt();
     require_native(probe);
     unsigned short port;
     assert(!peak_global_budget_listen(&port));
