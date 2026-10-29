@@ -1313,10 +1313,11 @@ pthread_once_t pthread_pause_once_ctrl = PTHREAD_ONCE_INIT;
 pthread_mutex_t heartbeat_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t  heartbeat_cond  = PTHREAD_COND_INITIALIZER;
 static atomic_bool peak_global_heartbeat_credit_ready;
-/* A newly funded admission must not wait for the ordinary background timer. */
+/* Ordinary credit notifications are admission-gated by the transport caller.
+ * Startup also uses this sticky wake: its first real sample must not be lost
+ * behind an adaptive sleep chosen after a pre-start publication was dropped. */
 void peak_global_budget_listener_credit_ready(void)
 {
-    if (!peak_global_budget_listener_admission_waiting()) return;
     pthread_mutex_lock(&heartbeat_mutex);
     atomic_store(&peak_global_heartbeat_credit_ready, true);
     pthread_cond_signal(&heartbeat_cond);

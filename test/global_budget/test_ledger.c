@@ -4,9 +4,14 @@
 #include <assert.h>
 
 static atomic_uint credit_wakes;
-static atomic_bool admission_waiting;
+static atomic_bool admission_waiting, budget_wake_pending;
 bool peak_global_budget_listener_admission_waiting(void) { return atomic_load(&admission_waiting); }
-void peak_global_budget_listener_credit_ready(void) { atomic_fetch_add(&credit_wakes, 1); }
+void peak_global_budget_listener_credit_ready(void)
+{
+    assert(atomic_load_explicit(&running, memory_order_acquire));
+    atomic_fetch_add(&credit_wakes, 1);
+    atomic_store(&budget_wake_pending, true);
+}
 
 static void check_wire_format(void)
 {
@@ -142,6 +147,37 @@ static PeakGlobalBudgetView wait_view(uint64_t sequence, bool funded)
     assert(!"global budget service did not respond");
     return (PeakGlobalBudgetView){0};
 }
+/* Ordered version of the startup race: heartbeat published while inactive,
+ * then learns a long ordinary period after start. Its sticky lifecycle wake
+ * must survive until the heartbeat reaches the condition-wait boundary. */
+static void check_startup_handoff(void)
+{
+    PeakGlobalBudgetSample sample = {.sequence = 1, .management_seconds = .0001};
+    assert(!atomic_load(&running));
+    peak_global_budget_publish(&sample);
+    assert(!local_sample.sequence);
+    atomic_store(&budget_wake_pending, false);
+    atomic_store(&admission_waiting, false);
+    unsigned before = atomic_load(&credit_wakes);
+    unsigned short port;
+    assert(!peak_global_budget_listen(&port));
+    assert(!peak_global_budget_start("127.0.0.1", port, 0, 1, .05, NULL));
+    assert(atomic_load(&credit_wakes) == before + 1);
+    BackgroundCost cost = {0};
+    uint64_t period = background_period(&cost, 45568, 512, (double).05f);
+    assert(period > UINT64_C(1000000000));
+    atomic_store(&heartbeat_period, period);
+    Peer idle = {0};
+    assert(service_poll_timeout(&idle, 0, false, false, ns_now(CLOCK_MONOTONIC)) > 1000);
+    /* Production heartbeat_wait_us checks this sticky predicate before wait;
+     * no sleep or invented zero-cost HELLO is needed for the first sample. */
+    assert(atomic_exchange(&budget_wake_pending, false));
+    peak_global_budget_publish(&sample);
+    PeakGlobalBudgetView ready = wait_view(1, false);
+    assert(ready.active && ready.granted_total_ns == 0);
+    peak_global_budget_stop();
+}
+
 static void check_background_rounds(void)
 {
     BackgroundCost estimate = {0};
@@ -235,6 +271,7 @@ int main(void)
     check_wire_format();
     check_credit_conservation();
     check_control_settlement();
+    check_startup_handoff();
     check_background_rounds();
     puts("global_budget_ledger_ok");
 }

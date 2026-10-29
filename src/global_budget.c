@@ -1273,6 +1273,11 @@ int peak_global_budget_start(const char *host, unsigned short port, unsigned ran
 #endif
         return -1;
     }
+    /* HB may have dropped its current sample just before running became
+     * true, then selected a multi-second adaptive sleep. A sticky lifecycle
+     * wake requests the first real sample; it grants no credit itself. */
+    if (peak_global_budget_listener_credit_ready)
+        peak_global_budget_listener_credit_ready();
     return 0;
 }
 void peak_global_budget_publish(const PeakGlobalBudgetSample *s)
