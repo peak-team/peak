@@ -121,6 +121,7 @@ endif()
 
 if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
     add_executable(peak_budget_broker budget_broker.c global_budget.c)
+    peak_budget_configure_optional_runtime(peak_budget_broker)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
        CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
         target_sources(peak_budget_broker PRIVATE

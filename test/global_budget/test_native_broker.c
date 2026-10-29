@@ -217,6 +217,12 @@ int main(int argc, char **argv)
         char command;
         assert(read(commands[0], &command, 1) == 1);
         peak_global_budget_startup(.001);
+        /* Publish only after the independent broker acknowledges the seal.
+         * Stopping this rank before that ACK would prevent correct admission. */
+        uint64_t seal_deadline = ns_now(CLOCK_MONOTONIC) + UINT64_C(2000000000);
+        while (!peak_global_budget_view().startup_sealed &&
+               ns_now(CLOCK_MONOTONIC) < seal_deadline) usleep(1000);
+        assert(peak_global_budget_view().startup_sealed);
         assert(write(ready[1], "S", 1) == 1);
         assert(read(commands[0], &command, 1) == 1);
         peak_global_budget_physical_targets(1);
@@ -254,12 +260,21 @@ int main(int argc, char **argv)
     assert(!kill(root, SIGSTOP));
     int status;
     assert(waitpid(root, &status, WUNTRACED) == root && WIFSTOPPED(status));
-    uint64_t until = ns_now(CLOCK_MONOTONIC) + UINT64_C(1000000000);
-    while (peak_global_budget_view().local_credit_ns < 1000000 &&
-           ns_now(CLOCK_MONOTONIC) < until)
-        usleep(1000);
     view = peak_global_budget_view();
-    assert(view.active && view.startup_sealed && view.local_credit_ns >= 1000000);
+    uint64_t granted_before_pause = view.granted_total_ns;
+    /* The pre-seal proof requested a detached recovery lease. Return that
+     * unused lease to start a fresh demand, rather than coalescing its target. */
+    peak_global_budget_return_idle();
+    peak_global_budget_request_credit(2000000);
+    uint64_t until = ns_now(CLOCK_MONOTONIC) + UINT64_C(1000000000);
+    do {
+        view = peak_global_budget_view();
+        if (view.local_credit_ns >= 2000000 && view.granted_total_ns > granted_before_pause)
+            break;
+        usleep(1000);
+    } while (ns_now(CLOCK_MONOTONIC) < until);
+    assert(view.active && view.startup_sealed && view.local_credit_ns >= 2000000);
+    assert(view.granted_total_ns > granted_before_pause);
     assert(view.broker_process_id == (uint64_t)broker && view.broker_cpu_seconds > 0);
     assert(view.global_spent_seconds >= .001 + view.broker_cpu_seconds);
 #ifdef __linux__

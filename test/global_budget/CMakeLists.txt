@@ -2,6 +2,7 @@
 # the application lifecycle tests require the enabled MPI profiler backend.
 function(peak_add_budget_test name source)
     add_executable(${name} ${source})
+    peak_budget_configure_optional_runtime(${name})
     target_include_directories(${name} PRIVATE ${PROJECT_SOURCE_DIR}/include)
     target_compile_options(${name} PRIVATE -UNDEBUG)
     target_link_libraries(${name} PRIVATE Threads::Threads ${M_LIBRARY})
