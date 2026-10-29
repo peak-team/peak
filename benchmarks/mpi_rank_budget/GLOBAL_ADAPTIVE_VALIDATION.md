@@ -1,5 +1,28 @@
 # Adaptive global budget validation
 
+Current candidate `5afdccb7` has passed 78/78 selected local tests and five affected actual-MPI functional cases with raw emergency counts zero; this is a functional gate, **not a performance pass**. Full hardware jobs 3655586/3655587 are submitted and pending results. All earlier failed measurements and intermediate diagnostics below remain preserved.
+
+Interpretation throughout this record uses three distinct scopes. The budget is
+the coordinator's reported lifetime bank: credited original MPI_Init time plus
+service lifetime can earn budget, including native intervals outside measured
+work stages. S/R/D and any startup or settled-control debt are examined against
+that bank and subsequent grant decisions. Observing S above B records debt;
+without issuance/settlement evidence it does not by itself identify an incorrect
+grant or an unbounded-growth bug. Raw per-rank control costs remain summed.
+
+Main-phase and warmup+main ratios describe fixed-work subintervals. Both can
+spend credit earned during earlier MPI initialization or other native gaps, so
+a subinterval ratio above 5% is not itself a lifetime-budget violation. All
+predefined ratios and threshold flags remain unchanged as observations.
+Exec-inclusive elapsed measures the real reported user interval and retains
+startup/preparation and CSV/report wall costs; a real whole-interval increase
+above 5% is not hidden by the ledger model or by moving cost before main.
+
+Useful profiling coverage and independent long-case recovery are assessed
+separately. No universal restoration or coverage minimum is invented for every
+short case, and short-stage behavior alone does not refute instrumentation.
+
+
 Candidate `5e100d0` completed all 194 hardware launches with valid data, but **did not achieve the combined overhead, useful-coverage and recovery target**. The subsequent escrow correction `dd1d7e9` also completed its separate 32-launch diagnostic with valid data and did not establish acceptance. Several MPI configurations exceed 5% and the independent hardware recovery diagnostics show no restoration. The complete results below retain all repeats and earlier failures.
 
 Earlier measured revision `aa055912` uses funded admission before the first physical hook attachment in global mode, retains instrumentation and the safe controller, fixes the stop/wake ordering race, and exposes report-stage wall/CPU and final-flush/join timing. It remains experimental and opt-in. Targeted hardware job **3654296** completed all 26 launches with valid data, but failed combined performance/utility acceptance; no 5% performance pass is asserted. Its source is exact `git archive` of `aa05591223146834d6ae3ea5695c76317e855331`, archive SHA256 `42881e3d1a5627bd4c5b62004d41b457714ba86a451adf1cf19415bcca9c9bd1`. Historical evidence below is preserved.
@@ -364,3 +387,44 @@ Reported startup and teardown remain material fixed costs. Across group means, b
 The immediate short diagnostic proves one rank's participant-DONE → physical restoration → new calls. Post-init short has restoration activity but no qualifying later calls. Both independent funded diagnostics prove zero restoration; this remains a hardware-evidence gap. No requirement is invented that every short main phase must restore, and these observations do not by themselves argue for replacing instrumentation. They show that changing activation placement alone does not establish the full overhead/utility/recovery target.
 
 Verified result archive SHA256: `26351f8f6dc11fff148c6e19868d23ffe980be02e2c113133582ed8fb0639c35`; candidate library SHA256: `d799bfab9e419af710b064b6183c3449d53d5453b0c83b31b00fe5be87eecdb7`. Native meter binary SHA256: `230f3c2305735396686a3a117382a31dba8d107707fab155d720c87362f2eaed7`. Runtime source is unchanged from the c43 escrow correction; only benchmark timing and explicit activation controls differ.
+
+## Eager-prepare and native-broker candidate submission (5afdccb7)
+
+Exact commit `5afdccb7c55cb5038e17d44b0a5f57a149651c44` freezes the eager native
+preparation/paid target-admission path and independent native budget broker. Local
+78/78 selected tests and five affected actual-MPI cases pass, with emergency
+counters zero in those final cases. This does not establish performance success.
+The intermediate 00ece idle-credit-return E1 defect and f772 diagnostics remain
+in `global_validation/eager-broker-00ece204-local-summary.json` and
+`global_validation/eager-broker-f77222b9-local-summary.json`. The final gate is
+in `global_validation/eager-broker-local-summary.json`; it does not replace
+those earlier observations.
+
+Matrix job **3655586** contains 134 launches; funded/recovery job **3655587**
+contains 36, for **170** total. Each requests two nodes, 32 ranks × six threads,
+30 minutes, eligible for PVC or SPR. At submission both were pending for Priority
+with no start estimate; the next planned status check was 2026-10-29 00:42:27 UTC.
+No hardware outcome is inferred from submission or the local functional gate.
+
+Both exact source archives have SHA256
+`cf929731e7fa64a23e172b32f8f342bd7bd7946aed58d6ea0a06e059f59eca1d`
+and input-manifest SHA256
+`5648b84a0932bb8774fd136b4daf58b0649186639d463c818b1c2e6aa70a88a8`.
+All 161 inventoried source/test files and ten benchmark inputs were checked
+against the commit, with no working-tree overlay. Matrix stage is
+`/scratch/05450/wangyinz/codex-tests/peak-global-eager-broker-final-matrix-20261028/20261028-193220-matrix-5993e6e6`;
+funded/recovery stage is
+`/scratch/05450/wangyinz/codex-tests/peak-global-eager-broker-final-funded_recovery-20261028/20261028-193220-funded_recovery-132c23e4`.
+
+All original matrix/funded cases and their 90-second launch limits are unchanged.
+The separate earned-recovery-long fixture uses fixed real native work and two
+fixed 512-step target bursts, with a 180-second limit. The old work1 calibration
+is retained as calibration only. Default meter policy removes an explicit policy
+environment override: local uses its ordinary default, global its prepare/paid
+feature; these are intentionally different physical admission paths. The new
+analysis checks the actual path, startup charge, broker-authenticated startup
+seal, native PID/CPU and final proofs. Only root requires all final replies
+written/reaped; peers require their own cohort acknowledgment and may legally
+retain a zero broker-final-written bit. Actual timing will be reported separately
+for exec-inclusive, main, native/burst stages, startup and report/finalization.
+No samples or failed/outlier runs will be selectively removed.
