@@ -1,11 +1,20 @@
 #define _GNU_SOURCE
 static void reply_claim_hook(void);
+static void admission_snapshot_hook(void);
 #define PEAK_GLOBAL_BUDGET_TEST_REPLY_CLAIM_HOOK reply_claim_hook
+#define PEAK_GLOBAL_BUDGET_TEST_ADMISSION_SNAPSHOT_HOOK admission_snapshot_hook
 #include "../../src/global_budget.c"
 #include "internal/global_budget_protocol.h"
 #include <assert.h>
 
 static bool reply_newer_during_claim;
+static bool lower_admission_during_snapshot;
+static void admission_snapshot_hook(void)
+{
+    if (!lower_admission_during_snapshot) return;
+    lower_admission_during_snapshot=false;
+    peak_global_budget_request_admission(1000000,3000000);
+}
 static void reply_claim_hook(void)
 {
     if (!reply_newer_during_claim) return;
@@ -183,6 +192,45 @@ static void check_required_vs_desired(void)
     atomic_store(&debit_ns,0);atomic_store(&local_attached,0);atomic_store(&running,false);
     atomic_store(&demand_generation,0);
 }
+static void check_admission_revision(void)
+{
+    atomic_store(&owner,getpid());atomic_store(&running,true);atomic_store(&local_retiring,false);
+    atomic_store(&local_attached,1);atomic_store(&debit_ns,0);
+    atomic_store(&minimum_target_ns,2000000);atomic_store(&requested_ns,212000000);
+    atomic_store(&public_local_closing,.003);atomic_store(&available_ns,17000000);
+    peak_global_budget_request_admission(137000000,68535000);
+    uint64_t generation=atomic_load(&demand_generation);
+    assert(current_minimum(0)==137000000);
+    peak_global_budget_request_admission(1000000,3000000);
+    assert(atomic_load(&demand_generation)>generation);
+    assert(current_minimum(0)==2000000); /* Concurrent profile demand survives. */
+    acknowledge_request(generation,ns_now(CLOCK_MONOTONIC));
+    assert(atomic_load(&pressure_notice));
+    assert(atomic_load(&available_ns)==17000000 && !atomic_load(&debit_ns));
+    assert(atomic_load(&requested_ns)==212000000); /* Desired forecast unchanged. */
+    request_admission(4000000,0,false); /* Failed control cannot poison profile minimum. */
+    assert(atomic_load(&minimum_target_ns)==2000000 && current_minimum(0)==4000000);
+    peak_global_budget_ensure_admission(5000000,6000000);
+    peak_global_budget_ensure_admission(1000000,1000000);
+    assert(current_minimum(0)==5000000 && atomic_load(&admission_closing_ns)==6000000);
+    peak_global_budget_request_admission(1000000,3000000);
+    assert(current_minimum(0)==2000000);
+    peak_global_budget_request_admission(0,0);
+    assert(current_minimum(0)==2000000);
+    assert(current_minimum(1500000)==500000);
+    atomic_store(&minimum_target_ns,0);atomic_store(&requested_ns,0);
+    peak_global_budget_request_admission(9000000,3000000);
+    lower_admission_during_snapshot=true;
+    Frame frame={0};frame_credit_demand(&frame,0);
+    assert(frame.minimum_ns==9000000 && frame.requested_ns==9000000);
+    assert(current_minimum(0)==1000000);
+    peak_global_budget_request_admission(0,0);
+    assert(!atomic_load(&pressure_notice));
+    frame_credit_demand(&frame,0);
+    assert(!frame.minimum_ns && !frame.requested_ns);
+    atomic_store(&available_ns,0);atomic_store(&running,false);atomic_store(&local_attached,0);
+    atomic_store(&pressure_notice,false);atomic_store(&demand_generation,0);
+}
 
 static void *spend_credit(void *unused)
 {
@@ -242,6 +290,37 @@ static void check_control_settlement(void)
     assert(fabs(rank.previous_cost - .003) < 1e-12);
     assert(control_escrow(&rank) == 0);
     assert(rank.credit_total_ns - rank.consumed_ns - rank.returned_ns == 3000000);
+}
+
+static void check_closing_quote_epoch(void)
+{
+    Rank rank = {.registered = true, .registration_exposed = true,
+        .registration_sample_sequence = 10, .member_sample_sequence = 10,
+        .closing_estimate = .06853546, .grace_exposed = true,
+        .credit_total_ns = 1000, .control_ns = 1000, .consumed_ns = 1000};
+    receive(&rank, (PeakGlobalBudgetSample){.sequence = 10,
+        .control_seconds = .06853546, .closing_seconds = .002,
+        .credit_exposure_known = true, .credit_exposed_targets = 1});
+    assert(!release_closing_registration(&rank, 0));
+    assert(closing_reserve_ns(&rank) >= 68535460);
+    rank.latest.credit_exposed_targets = 0; /* Stale closed proof cannot reprice D. */
+    assert(!release_closing_registration(&rank, 0));
+    receive(&rank, (PeakGlobalBudgetSample){.sequence = 11,
+        .control_seconds = .06853546, .closing_seconds = .002,
+        .credit_exposure_known = false});
+    assert(!release_closing_registration(&rank, 0));
+    rank.latest.credit_exposure_known = true;
+    assert(!release_closing_registration(&rank, 0)); /* Control still unsettled. */
+    rank.latest.settled_control_credit_ns = 1000;
+    assert(release_closing_registration(&rank, 0));
+    assert(fabs(rank.previous_cost - .06853546) < 1e-12);
+    assert(closing_reserve_ns(&rank) == 2000000);
+    assert(rank.credit_total_ns == 1000 && rank.consumed_ns == 1000);
+    rank.wants_credit = true; rank.requested_ns = 100000;
+    CreditGrant grant = grant_rank_credit(&rank, 2100000);
+    assert(grant.closing == 2000000 && grant.credit == 100000);
+    assert(rank.credit_total_ns - rank.consumed_ns - rank.returned_ns == 100000);
+    assert(fabs(rank.previous_cost - .06853546) < 1e-12);
 }
 
 static void pause_ms(unsigned ms)
@@ -714,6 +793,7 @@ int main(void)
     check_metadata_prefetch();
     check_reply_snapshot_order();
     check_required_vs_desired();
+    check_admission_revision();
     check_causal_wire_integration();
     check_closed_cost_prefix();
     check_asymmetric_closed_prefix();
@@ -722,6 +802,7 @@ int main(void)
     check_settled_operation_prefix();
     check_credit_conservation();
     check_control_settlement();
+    check_closing_quote_epoch();
     check_startup_handoff();
     check_background_rounds();
     puts("global_budget_ledger_ok");

@@ -49,6 +49,13 @@ void peak_global_budget_finalizer(clockid_t thread_clock, uint64_t cpu_start_ns,
 /* FINAL is published only after the existing all-rank MPI teardown proof. */
 bool peak_global_budget_final_flush(unsigned timeout_ms);
 void peak_global_budget_request_credit(uint64_t cost_ns);
+/* Replace the current total-wallet admission requirement only after the
+ * caller has canceled/quiesced old mutations and published its current quote.
+ * closing_ns is this rank's total closing requirement; zero cash cancels only
+ * admission, never callback demand or already issued cash. */
+void peak_global_budget_request_admission(uint64_t cash_ns, uint64_t closing_ns);
+/* Increase only while an accepted admission/observation promise is live. */
+void peak_global_budget_ensure_admission(uint64_t cash_ns, uint64_t closing_ns);
 bool peak_global_budget_flush(unsigned timeout_ms);
 void peak_global_budget_stop(void);
 /* Native helper dispatch; not called by application callbacks. */

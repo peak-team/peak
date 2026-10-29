@@ -196,6 +196,15 @@ static PhysicalIdleSnapshot physical_idle_snapshot(uint64_t word, uint32_t fallb
     return (PhysicalIdleSnapshot){word, count != 0};
 }
 static atomic_uint_fast64_t recovery_target_ns, consumed_control_ns, consumed_frontend_ns;
+static atomic_uint_fast64_t admission_target_ns, admission_cash_ns, admission_closing_ns;
+static uint64_t current_minimum(uint64_t debit)
+{
+    uint64_t profile=atomic_load_explicit(&minimum_target_ns,memory_order_acquire);
+    uint64_t admission=atomic_load_explicit(&admission_target_ns,memory_order_acquire);
+    uint64_t target=profile>admission?profile:admission;
+    return target>debit?target-debit:0;
+}
+
 static atomic_uint_fast64_t frontend_cpu_ns, settled_frontend_ns;
 static atomic_bool causal_fallback, metadata_enabled;
 static atomic_uint metadata_seed, metadata_tokens, metadata_inflight;
@@ -258,6 +267,19 @@ extern void peak_global_budget_listener_idle_unguard(void) PEAK_BUDGET_WEAK;
 extern void peak_global_budget_listener_credit_ready(void) PEAK_BUDGET_WEAK;
 extern bool peak_global_budget_listener_admission_waiting(void) PEAK_BUDGET_WEAK;
 extern void peak_mpi_budget_events_frontier(void) PEAK_BUDGET_WEAK;
+static void frame_credit_demand(Frame *frame, uint64_t debit)
+{
+    uint64_t profile=atomic_load_explicit(&minimum_target_ns,memory_order_acquire);
+    uint64_t admission=atomic_load_explicit(&admission_target_ns,memory_order_acquire);
+    uint64_t desired=atomic_load_explicit(&requested_ns,memory_order_acquire);
+#ifdef PEAK_GLOBAL_BUDGET_TEST_ADMISSION_SNAPSHOT_HOOK
+    PEAK_GLOBAL_BUDGET_TEST_ADMISSION_SNAPSHOT_HOOK();
+#endif
+    uint64_t minimum=profile>admission?profile:admission;
+    if (minimum>desired) desired=minimum;
+    frame->minimum_ns=minimum>debit?minimum-debit:0;
+    frame->requested_ns=desired>debit?desired-debit:0;
+}
 static uint64_t ns_now(clockid_t clock)
 {
     struct timespec t;
@@ -1170,6 +1192,30 @@ static bool credit_exposure_closed(const Rank *r)
     return (r->latest.credit_exposure_known ? r->latest.credit_exposed_targets == 0 :
         r->latest.attached_targets == 0) && r->latest.settled_control_credit_ns == r->control_ns;
 }
+static bool release_closing_registration(Rank *r, uint64_t completed_wave)
+{
+    bool local_closed = r->latest.credit_exposure_known && credit_exposure_closed(r) &&
+        r->latest.sequence > r->registration_sample_sequence &&
+        (r->registration_exposed || (r->returned_ns > r->registration_returned_ns && !r->reservation));
+    bool wave_closed = r->participant && completed_wave &&
+        r->latest.completed_wave >= completed_wave && credit_exposure_closed(r) &&
+        r->latest.sequence > r->member_sample_sequence &&
+        r->registration_generation <= r->member_generation && r->registration_exposed;
+    if (!r->registered) {
+        if (r->latest.credit_exposure_known && credit_exposure_closed(r) &&
+            r->latest.sequence > r->registration_sample_sequence && r->latest.closing_seconds > 0)
+            r->closing_estimate = r->latest.closing_seconds;
+        return false;
+    }
+    if (!(r->latest.retiring || local_closed || wave_closed)) return false;
+    r->registered = false;
+    /* Actual C is already in S before this release. A fresh closed epoch may
+     * price the next exposure from the latest measured forecast; an exposed
+     * epoch retains its high-water reserve regardless of cheaper samples. */
+    if ((local_closed || wave_closed) && r->latest.closing_seconds > 0)
+        r->closing_estimate = r->latest.closing_seconds;
+    return true;
+}
 static bool rank_minimum_unfunded(const Rank *rank)
 {
     return rank->wants_credit && rank->minimum_ns>0 && rank->latest.attached_targets>0 &&
@@ -1687,14 +1733,7 @@ static void *service(void *data)
             double closing_reserve = 0;
             for (unsigned i = 0; i < world; ++i) {
                 Rank *r = &ranks[i];
-                bool local_closed = r->latest.credit_exposure_known && credit_exposure_closed(r) &&
-                    r->latest.sequence > r->registration_sample_sequence &&
-                    (r->registration_exposed || (r->returned_ns > r->registration_returned_ns && !r->reservation));
-                if (r->registered && (r->latest.retiring || local_closed || (r->participant && completed_wave &&
-                    r->latest.completed_wave >= completed_wave && credit_exposure_closed(r) &&
-                    r->latest.sequence > r->member_sample_sequence &&
-                    r->registration_generation <= r->member_generation && r->registration_exposed)))
-                    r->registered = false;
+                (void)release_closing_registration(r, completed_wave);
                 if (r->registered) closing_reserve += (double)closing_reserve_ns(r) / 1e9;
             }
             double budget = ratio * (seconds_now() - start + atomic_load(&earned_origin));
@@ -1705,10 +1744,7 @@ static void *service(void *data)
                 span = seconds_now() - wave_start; completed_wave = wave; wave_pending = false;
                 record_event('D', rank_id, 0, wave, span);
                 for (unsigned i = 0; i < world; ++i)
-                    if (ranks[i].participant && credit_exposure_closed(&ranks[i]) &&
-                        ranks[i].latest.sequence > ranks[i].member_sample_sequence &&
-                        ranks[i].registration_generation <= ranks[i].member_generation &&
-                        ranks[i].registration_exposed) ranks[i].registered = false;
+                    (void)release_closing_registration(&ranks[i], completed_wave);
             }
             if (all && !wave_pending && atomic_load(&startup_sealed)) {
                 /* Spend only already earned global headroom, prioritizing
@@ -1891,10 +1927,9 @@ static void *service(void *data)
             /* Describe demand against this frame's settlement, not a later local
              * debit: otherwise concurrent callbacks can make the broker
              * count already-consumed reservations as available credit. */
-            uint64_t minimum=atomic_load_explicit(&minimum_target_ns,memory_order_acquire);
-            uint64_t request_target = atomic_load(&requested_ns), debit = next.consumed_profile_ns + next.consumed_control_ns + next.consumed_frontend_ns + next.returned_ns;
-            next.requested_ns = request_target > debit ? request_target - debit : 0;
-            next.minimum_ns=minimum>debit?minimum-debit:0;
+            uint64_t debit = next.consumed_profile_ns + next.consumed_control_ns + next.consumed_frontend_ns + next.returned_ns;
+            frame_credit_demand(&next,debit);
+            uint64_t request_target=atomic_load(&requested_ns);
             next.request_credit = atomic_load(&pressure_notice);
             if (next.request_credit && !atomic_load(&request_recovery)) {
                 uint64_t predicted = atomic_load(&low_water_ns);
@@ -2089,13 +2124,13 @@ int peak_global_budget_start(const char *host, unsigned short port, unsigned ran
     atomic_store(&owner, getpid());
     atomic_store(&startup_sealed, !native_client);
     atomic_store(&physical_revision, 0);
-    atomic_store(&control_proof_sequence, 0); atomic_store(&reply_goal_sequence,0); atomic_store(&minimum_target_ns,0);
+    atomic_store(&control_proof_sequence, 0); atomic_store(&reply_goal_sequence,0); atomic_store(&minimum_target_ns,0); atomic_store(&admission_target_ns,0); atomic_store(&admission_cash_ns,0); atomic_store(&admission_closing_ns,0);
     atomic_store(&physical_targets, 0); atomic_store(&earned_origin, 0); atomic_store(&local_retiring, false);
     atomic_store(&rejected_spend_count, 0); atomic_store(&available_ns, 0); atomic_store(&local_attached, 0); atomic_store(&recovery_target_ns, 0); atomic_store(&request_recovery, false); atomic_store(&request_metadata,false);
     atomic_store(&finalizer_state, 0); atomic_store(&public_finalized, false);
     atomic_store(&public_accounting_invalid, false); atomic_store(&root_final_sent, false);
     atomic_store(&debit_ns, 0); atomic_store(&returned_ns, 0); atomic_store(&public_demand_ack, 0); atomic_store(&request_started_ns, 0); atomic_store(&public_deadline, 0); atomic_store(&low_water_ns, 100000); atomic_store(&refill_rtt, .005); atomic_store(&consumption_rate, 0);
-    atomic_store(&flush_requested, false); atomic_store(&local_transport_cpu, 0); atomic_store(&startup_charge, 0); atomic_store(&local_completed_wave, 0); atomic_store(&granted_ns, 0); atomic_store(&consumed_ns, 0); atomic_store(&consumed_control_ns, 0); atomic_store(&pressure_notice, false); atomic_store(&requested_ns, 0); atomic_store(&minimum_target_ns,0); atomic_store(&demand_generation, 0);
+    atomic_store(&flush_requested, false); atomic_store(&local_transport_cpu, 0); atomic_store(&startup_charge, 0); atomic_store(&local_completed_wave, 0); atomic_store(&granted_ns, 0); atomic_store(&consumed_ns, 0); atomic_store(&consumed_control_ns, 0); atomic_store(&pressure_notice, false); atomic_store(&requested_ns, 0); atomic_store(&minimum_target_ns,0); atomic_store(&admission_target_ns,0); atomic_store(&admission_cash_ns,0); atomic_store(&admission_closing_ns,0); atomic_store(&demand_generation, 0);
     metadata_clear();
     atomic_store(&frontend_cpu_ns, 0); atomic_store(&consumed_frontend_ns, 0); atomic_store(&settled_frontend_ns, 0);
     atomic_store(&metadata_close_reason,0); metadata_started_ns=ns_now(CLOCK_MONOTONIC);
@@ -2194,7 +2229,7 @@ void peak_global_budget_return_idle(void)
             atomic_fetch_add(&debit_ns, (uint64_t)balance);
             atomic_fetch_add(&returned_ns, (uint64_t)balance); break;
         }
-    atomic_store(&pressure_notice, false); atomic_store(&requested_ns, 0); atomic_store(&minimum_target_ns,0);
+    atomic_store(&pressure_notice, false); atomic_store(&requested_ns, 0); atomic_store(&minimum_target_ns,0); atomic_store(&admission_target_ns,0); atomic_store(&admission_cash_ns,0); atomic_store(&admission_closing_ns,0);
     atomic_store(&recovery_target_ns, 0); atomic_store(&request_recovery, false); atomic_store(&request_metadata,false);
     atomic_store(&request_started_ns, 0); atomic_store(&public_deadline, 0); poke();
 }
@@ -2305,20 +2340,66 @@ static void request_credit_internal(uint64_t amount, bool metadata, bool actual)
     }
 }
 void peak_global_budget_request_credit(uint64_t amount) { request_credit_internal(amount,false,true); }
+static void request_admission(uint64_t cash, uint64_t closing, bool replace)
+{
+    if (getpid()!=atomic_load(&owner) || atomic_load(&local_retiring)) return;
+    uint64_t debit=atomic_load_explicit(&debit_ns,memory_order_acquire);
+    uint64_t target=cash>UINT64_MAX-debit?UINT64_MAX:debit+cash;
+    uint64_t old=atomic_load(&admission_target_ns);
+    bool changed=false;
+    if (replace) {
+        changed=atomic_exchange(&admission_target_ns,cash?target:0)!=(cash?target:0);
+        changed|=atomic_exchange(&admission_cash_ns,cash)!=cash;
+        changed|=atomic_exchange(&admission_closing_ns,closing)!=closing;
+        atomic_store(&recovery_target_ns,cash);
+    } else {
+        for(unsigned attempt=0;attempt<2 && old<target;++attempt)
+            if(atomic_compare_exchange_strong(&admission_target_ns,&old,target)) { changed=true; break; }
+        old=atomic_load(&admission_closing_ns);
+        for(unsigned attempt=0;attempt<2 && old<closing;++attempt)
+            if(atomic_compare_exchange_strong(&admission_closing_ns,&old,closing)) { changed=true; break; }
+    }
+    bool missing_closing=cash && (double)closing/1e9>atomic_load(&public_local_closing);
+    if (!changed && !(missing_closing && atomic_load(&public_demand_ack)>=atomic_load(&demand_generation))) return;
+    atomic_store(&request_recovery,!effective_targets(atomic_load(&local_attached)));
+    atomic_store(&request_metadata,false);
+    uint64_t now=ns_now(CLOCK_MONOTONIC);
+    atomic_store(&request_started_ns,now);
+    atomic_store(&public_deadline,now+UINT64_C(100000000));
+    uint64_t generation=atomic_fetch_add_explicit(&demand_generation,1,memory_order_release)+1;
+    bool pending=atomic_load_explicit(&requested_ns,memory_order_acquire)>debit || current_minimum(debit)>0;
+    atomic_store_explicit(&pressure_notice,pending,memory_order_release);
+    /* Cancellation cannot erase a callback/metadata request published while
+     * its class was being cleared. A later producer sees false and wakes it. */
+    if (!pending && (atomic_load_explicit(&demand_generation,memory_order_acquire)!=generation ||
+        atomic_load_explicit(&requested_ns,memory_order_acquire)>debit || current_minimum(debit)>0))
+        atomic_store_explicit(&pressure_notice,true,memory_order_release);
+    poke();
+}
+void peak_global_budget_request_admission(uint64_t cash, uint64_t closing)
+{
+    request_admission(cash,closing,true);
+}
+void peak_global_budget_ensure_admission(uint64_t cash, uint64_t closing)
+{
+    request_admission(cash,closing,false);
+}
 static bool try_spend(uint64_t amount, bool control)
 {
     if (atomic_load(&local_retiring) || !peak_global_budget_active()) return false;
     if (amount > MAX_SPEND_NS) { atomic_fetch_add(&rejected_spend_count, 1); return false; }
     int64_t seen = atomic_load_explicit(&available_ns, memory_order_acquire);
     if (seen < 0 || (uint64_t)seen < amount) {
-        peak_global_budget_request_credit(amount); return false;
+        if(control) request_admission(amount,0,false); else peak_global_budget_request_credit(amount);
+        return false;
     }
     int64_t before = atomic_fetch_sub_explicit(&available_ns, (int64_t)amount, memory_order_acq_rel);
     if (before < 0 || (uint64_t)before < amount) {
         /* Only true depletion can enter the temporary negative marker. The
          * failed claim never enters the monotonic committed ledger. */
         atomic_fetch_add_explicit(&available_ns, (int64_t)amount, memory_order_release);
-        peak_global_budget_request_credit(amount); return false;
+        if(control) request_admission(amount,0,false); else peak_global_budget_request_credit(amount);
+        return false;
     }
     atomic_fetch_add_explicit(&debit_ns, amount, memory_order_release);
     atomic_fetch_add_explicit(control ? &consumed_control_ns : &consumed_ns, amount, memory_order_release);
