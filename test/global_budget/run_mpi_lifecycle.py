@@ -7,15 +7,17 @@ import re
 import shlex
 import signal
 import subprocess
+import sys
 import tempfile
 
 p = argparse.ArgumentParser()
 p.add_argument('--exe', type=Path, required=True)
 p.add_argument('--libpeak', type=Path, required=True)
-p.add_argument('--helper', type=Path, required=True)
+p.add_argument('--broker', type=Path, required=True)
 p.add_argument('--mpiexec', required=True)
 p.add_argument('--np-flag', default='-n')
 p.add_argument('--preflags', default='')
+p.add_argument('--ranks', type=int, default=2)
 p.add_argument('--mode', choices=('recovery', 'early-finalize'), required=True)
 a = p.parse_args()
 with tempfile.TemporaryDirectory(prefix='peak-budget-mpi-') as temporary:
@@ -23,7 +25,7 @@ with tempfile.TemporaryDirectory(prefix='peak-budget-mpi-') as temporary:
     targets = root / 'targets.txt'
     targets.write_text(''.join(f'budget_target_{i}\n' for i in range(80)))
     env = {k: v for k, v in os.environ.items()
-           if not k.startswith('PEAK_') and k != 'LD_PRELOAD'}
+           if not k.startswith('PEAK_') and k not in ('LD_PRELOAD', 'DYLD_INSERT_LIBRARIES')}
     env.update(PEAK_MPI_GLOBAL_BUDGET='1', PEAK_GLOBAL_OVERHEAD_RATIO='.05',
                PEAK_TARGET_FILE=str(targets), PEAK_ENABLE_GLOBAL_HEARTBEAT='1',
                PEAK_ENABLE_PER_TARGET_HEARTBEAT='1', PEAK_ENABLE_REATTACH='1',
@@ -32,14 +34,17 @@ with tempfile.TemporaryDirectory(prefix='peak-budget-mpi-') as temporary:
                PEAK_SAFE_DETACH_MODE='strict', PEAK_REQUIRE_SAFE_DETACH='1',
                PEAK_OUTPUT_AGGREGATION='local', PEAK_TEXT_OUTPUT='1',
                PEAK_MPI_GLOBAL_TRACE='1', PEAK_MPI_REAL_FINALIZE='1',
-               PEAK_DETACH_HELPER=str(a.helper.resolve()),
-               TEST_LIB=str(a.libpeak.resolve()), TEST_EXE=str(a.exe.resolve()),
+               PEAK_GLOBAL_BUDGET_BROKER=str(a.broker.resolve()),
+               TEST_LIB=str(a.libpeak.resolve()),
+               TEST_PRELOAD_ENV=('DYLD_INSERT_LIBRARIES' if sys.platform == 'darwin' else 'LD_PRELOAD'), TEST_EXE=str(a.exe.resolve()),
                TEST_MODE=a.mode, TEST_DEST=str(root))
+    if sys.platform == 'darwin':
+        env.pop('PEAK_DETACH_BACKEND', None)
     command = ('rank=${OMPI_COMM_WORLD_RANK:-${PMI_RANK:-${PMIX_RANK:?}}}; '
-               'export LD_PRELOAD="$TEST_LIB"; '
+               'export "$TEST_PRELOAD_ENV=$TEST_LIB"; '
                'exec "$TEST_EXE" "$TEST_MODE" '
                '> "$TEST_DEST/rank-$rank.out" 2> "$TEST_DEST/rank-$rank.err"')
-    process = subprocess.Popen([a.mpiexec, a.np_flag, '2', *shlex.split(a.preflags),
+    process = subprocess.Popen([a.mpiexec, a.np_flag, str(a.ranks), *shlex.split(a.preflags),
                                 '/bin/sh', '-c', command], env=env,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                text=True, start_new_session=True)
@@ -55,8 +60,8 @@ with tempfile.TemporaryDirectory(prefix='peak-budget-mpi-') as temporary:
             pass
         process.wait()
     logs = [(root / f'rank-{rank}.err').read_text()
-            if (root / f'rank-{rank}.err').exists() else '' for rank in range(2)]
-    rank_out = [(root / f'rank-{rank}.out').read_text() if (root / f'rank-{rank}.out').exists() else '' for rank in range(2)]
+            if (root / f'rank-{rank}.err').exists() else '' for rank in range(a.ranks)]
+    rank_out = [(root / f'rank-{rank}.out').read_text() if (root / f'rank-{rank}.out').exists() else '' for rank in range(a.ranks)]
     assert process.returncode == 0, (process.returncode, out, err, rank_out, logs)
     for rank, text in enumerate(logs):
         records = lambda label: [dict(re.findall(r'(\w+)=([^\s]+)', line))
@@ -72,6 +77,10 @@ with tempfile.TemporaryDirectory(prefix='peak-budget-mpi-') as temporary:
             broker = records('native global broker:')[-1]
             assert broker['reap_confirmed'] == '1', text
         if a.mode == 'recovery':
+            member = records('MPI global member:')[-1]
+            profile_spent = (int(member['granted_total_ns']) - int(member['returned_total_ns'])
+                             - int(member['control_consumed_ns']) - int(member['local_credit_ns']))
+            assert profile_spent > 0, member
             events = records('global controller event:')
             initial = [event for event in events if event['kind'] == '7']
             assert len(initial) == 80, text

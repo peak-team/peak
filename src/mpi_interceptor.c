@@ -2,6 +2,7 @@
 #include "mpi_interceptor.h"
 #include "general_listener.h"
 #include "internal/global_budget.h"
+#include "internal/global_budget_protocol.h"
 #include <unistd.h>
 #include <stdio.h>
 #include "internal/mpi_teardown_guard.h"
@@ -383,10 +384,10 @@ peak_mpi_global_budget_bootstrap(int result, int required, double original_secon
     int rank, size, actual_thread_level = MPI_THREAD_SINGLE;
     (void)PMPI_Query_thread(&actual_thread_level);
     peak_log_report("[peak] MPI global bootstrap: backend=tcp required_thread_level=%d provided_thread_level=%d all_world_optin_required=1\n", required, actual_thread_level);
-    struct { char host[256]; unsigned short port; uint64_t nonce; } endpoint;
-    memset(&endpoint, 0, sizeof(endpoint));
+    PeakGlobalBudgetEndpoint endpoint = {0};
+    unsigned char endpoint_wire[PEAK_GLOBAL_BUDGET_ENDPOINT_WIRE_SIZE];
     if (PMPI_Comm_rank(MPI_COMM_WORLD, &rank) != MPI_SUCCESS ||
-        PMPI_Comm_size(MPI_COMM_WORLD, &size) != MPI_SUCCESS || size < 2) {
+        PMPI_Comm_size(MPI_COMM_WORLD, &size) != MPI_SUCCESS || size < 1) {
         peak_general_listener_global_budget_startup(0.0, 0);
         return;
     }
@@ -394,8 +395,13 @@ peak_mpi_global_budget_bootstrap(int result, int required, double original_secon
         (void)gethostname(endpoint.host, sizeof(endpoint.host) - 1);
         endpoint.nonce = peak_global_budget_nonce();
     }
-    if (PMPI_Bcast(&endpoint, sizeof(endpoint), MPI_BYTE, 0, MPI_COMM_WORLD) != MPI_SUCCESS ||
-        endpoint.port == 0) {
+    if (rank == 0) peak_global_budget_endpoint_encode(endpoint_wire, &endpoint);
+    if (PMPI_Bcast(endpoint_wire, sizeof endpoint_wire, MPI_BYTE, 0, MPI_COMM_WORLD) != MPI_SUCCESS) {
+        peak_general_listener_global_budget_startup(0.0, 0);
+        return;
+    }
+    peak_global_budget_endpoint_decode(&endpoint, endpoint_wire);
+    if (endpoint.port == 0) {
         peak_general_listener_global_budget_startup(0.0, 0);
         return;
     }

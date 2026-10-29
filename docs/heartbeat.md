@@ -658,12 +658,21 @@ control whether stop-window accounting exists.
 ## Experimental cross-rank runtime budget
 
 Set `PEAK_MPI_GLOBAL_BUDGET=1` on every rank to use one adaptive budget for the
-MPI job. The option defaults off. It supports homogeneous Linux 64-bit C-MPI
-SPMD jobs with 2–64 ranks using the same PEAK build and configuration, including
-the matching `peak_detach_helper` executable. All `MPI_COMM_WORLD` ranks must
-participate: startup performs one endpoint broadcast on the application's MPI
-initialization thread. Partial opt-in is unsupported. Requested/provided MPI
-thread levels are preserved; background coordination uses TCP, never MPI.
+MPI job. The option defaults off. PEAK imposes no fixed rank-count cap:
+the broker allocates its cohort table from the actual world size, including a
+single rank, while each client uses constant-size storage. Ranks may run
+different executables, profiling targets and workloads; the budget does not
+require SPMD or C application source.
+
+The native broker runs on PEAK's Linux and macOS platforms. Its fixed-width,
+fixed-byte-order protocol does not depend on C structure padding or host ABI.
+Startup broadcasts one endpoint across `MPI_COMM_WORLD` on the application's
+MPI initialization thread. Background coordination uses TCP, never MPI, so
+requested/provided MPI thread levels are preserved. Bindings that enter the
+interposed `MPI_Init*`/`PMPI_Init*` lifecycle, including Fortran bindings, use
+the same bootstrap. MPI Sessions-only initialization and dynamic addition of
+new MPI worlds still need their own cohort-registration integration; they are
+not restrictions of the budget algorithm.
 
 With heartbeat admission available, global mode defaults to
 `PEAK_MPI_ACTIVATION_POLICY=prepare`: PEAK initializes before MPI, while user
@@ -709,12 +718,14 @@ error count. Cold bursts may close early if replenishment arrives too late.
 
 ### Coordinator lifecycle and reporting
 
-A separate native `peak_detach_helper --global-budget-broker` process owns the
+A separate native `peak_budget_broker` process owns the
 ledger. Every rank, including root, is a client, so root's safe thread pauses
 cannot freeze coordination. PEAK uses native `posix_spawn` to avoid calling
 MPI providers' post-initialization fork handlers. The broker starts without
 PEAK preload/audit libraries and closes unrelated file descriptors before
 signaling readiness. Its process CPU is charged to the job budget.
+The broker is installed alongside PEAK and is independent of the Linux
+physical-detach helper. `PEAK_GLOBAL_BUDGET_BROKER` can select its executable.
 
 A rank entering MPI finalization suspends callbacks and drains its controller,
 then retires while its client continues serving peers that still do application

@@ -110,24 +110,29 @@ target_link_libraries(peak_inspect_symbols PRIVATE
     ${M_LIBRARY})
 
 if(PEAK_DETACH_HELPER_SUPPORTED)
-    add_executable(peak_detach_helper detach_helper.c global_budget.c)
-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
-        target_sources(peak_detach_helper PRIVATE
+    add_executable(peak_detach_helper detach_helper.c)
+    target_link_libraries(peak_detach_helper PRIVATE Threads::Threads ${M_LIBRARY})
+    target_include_directories(peak_detach_helper PRIVATE ${PROJECT_SOURCE_DIR}/include)
+    target_compile_definitions(peak PRIVATE
+        "PEAK_DEFAULT_DETACH_HELPER_PATH=\"${CMAKE_CURRENT_BINARY_DIR}/peak_detach_helper\""
+        "PEAK_INSTALL_DETACH_HELPER_PATH=\"${CMAKE_INSTALL_FULL_BINDIR}/peak_detach_helper\"")
+    add_dependencies(peak peak_detach_helper)
+endif()
+
+if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
+    add_executable(peak_budget_broker budget_broker.c global_budget.c)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+       CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+        target_sources(peak_budget_broker PRIVATE
             ${PROJECT_SOURCE_DIR}/cmake/peak-gum/peak_aarch64_raw_syscall.S)
     endif()
-    target_compile_definitions(peak_detach_helper PRIVATE PEAK_GLOBAL_BUDGET_HELPER=1)
-    target_link_libraries(peak_detach_helper PRIVATE Threads::Threads ${M_LIBRARY})
-    target_include_directories(peak_detach_helper
-        PRIVATE
-            ${PROJECT_SOURCE_DIR}/include
-    )
-    target_compile_definitions(peak
-        PRIVATE
-            PEAK_GLOBAL_BUDGET_NATIVE=1
-            "PEAK_DEFAULT_DETACH_HELPER_PATH=\"${CMAKE_CURRENT_BINARY_DIR}/peak_detach_helper\""
-            "PEAK_INSTALL_DETACH_HELPER_PATH=\"${CMAKE_INSTALL_FULL_BINDIR}/peak_detach_helper\""
-    )
-    add_dependencies(peak peak_detach_helper)
+    target_link_libraries(peak_budget_broker PRIVATE Threads::Threads ${M_LIBRARY})
+    target_include_directories(peak_budget_broker PRIVATE ${PROJECT_SOURCE_DIR}/include)
+    target_compile_definitions(peak PRIVATE
+        PEAK_GLOBAL_BUDGET_NATIVE=1
+        "PEAK_DEFAULT_BUDGET_BROKER_PATH=\"${CMAKE_CURRENT_BINARY_DIR}/peak_budget_broker\""
+        "PEAK_INSTALL_BUDGET_BROKER_PATH=\"${CMAKE_INSTALL_FULL_BINDIR}/peak_budget_broker\"")
+    add_dependencies(peak peak_budget_broker)
 endif()
 
 target_include_directories(peak
@@ -248,4 +253,8 @@ install(TARGETS peak
 install(TARGETS peak_inspect_symbols DESTINATION ${CMAKE_INSTALL_BINDIR})
 if(TARGET peak_detach_helper)
     install(TARGETS peak_detach_helper DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
+
+if(TARGET peak_budget_broker)
+    install(TARGETS peak_budget_broker DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()

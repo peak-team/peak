@@ -6834,7 +6834,7 @@ static inline __attribute__((always_inline)) gboolean
 peak_general_listener_try_publish_burst_request(PeakGeneralListener* listener,
                                                 size_t thread_id)
 {
-    if (G_LIKELY(!peak_mpi_burst_guard_enabled)) {
+    if (G_LIKELY(!peak_mpi_burst_guard_enabled && !peak_global_configured)) {
         return FALSE;
     }
     PeakBurstBudgetSlot* slot =
@@ -6869,6 +6869,7 @@ peak_general_listener_try_publish_burst_request(PeakGeneralListener* listener,
         }
         return FALSE;
     }
+    if (!peak_mpi_burst_guard_enabled) return FALSE;
     unsigned long long control = atomic_load_explicit(
         &listener->callback_hook_control, memory_order_acquire);
     if (peak_general_listener_callback_hook_state(control) != PEAK_HOOK_ATTACHED ||

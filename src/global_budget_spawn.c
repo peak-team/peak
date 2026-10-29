@@ -1,6 +1,5 @@
 #define _GNU_SOURCE
 #include "internal/global_budget_spawn.h"
-#if defined(__linux__)
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -15,7 +14,12 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <crt_externs.h>
+#define environ (*_NSGetEnviron())
+#else
 extern char **environ;
+#endif
 static bool executable(const char *candidate, char *path)
 {
     struct stat st;
@@ -89,18 +93,18 @@ pid_t peak_global_budget_spawn(int listener, unsigned size, double target, uint6
                                bool trace)
 {
     char path[PATH_MAX];
-    const char *override = getenv("PEAK_DETACH_HELPER");
+    const char *override = getenv("PEAK_GLOBAL_BUDGET_BROKER");
     if (override) {
         if (!executable(override, path))
             return -1;
     } else {
         bool found = false;
-#ifdef PEAK_DEFAULT_DETACH_HELPER_PATH
-        found = executable(PEAK_DEFAULT_DETACH_HELPER_PATH, path);
+#ifdef PEAK_DEFAULT_BUDGET_BROKER_PATH
+        found = executable(PEAK_DEFAULT_BUDGET_BROKER_PATH, path);
 #endif
-#ifdef PEAK_INSTALL_DETACH_HELPER_PATH
+#ifdef PEAK_INSTALL_BUDGET_BROKER_PATH
         if (!found)
-            found = executable(PEAK_INSTALL_DETACH_HELPER_PATH, path);
+            found = executable(PEAK_INSTALL_BUDGET_BROKER_PATH, path);
 #endif
         if (!found)
             return -1;
@@ -114,6 +118,8 @@ pid_t peak_global_budget_spawn(int listener, unsigned size, double target, uint6
     size_t kept = 0;
     for (size_t i = 0; i < count; i++) {
         if (!strncmp(environ[i], "LD_PRELOAD=", 11) || !strncmp(environ[i], "LD_AUDIT=", 9) ||
+            !strncmp(environ[i], "DYLD_INSERT_LIBRARIES=", 22) ||
+            !strncmp(environ[i], "DYLD_FORCE_FLAT_NAMESPACE=", 26) ||
             !strncmp(environ[i], "PEAK_", 5))
             continue;
         env[kept] = strdup(environ[i]);
@@ -124,8 +130,13 @@ pid_t peak_global_budget_spawn(int listener, unsigned size, double target, uint6
         kept++;
     }
     int ready[2];
-    if (pipe2(ready, O_CLOEXEC)) {
+    if (pipe(ready)) {
         free_env(env);
+        return -1;
+    }
+    if (fcntl(ready[0], F_SETFD, FD_CLOEXEC) ||
+        fcntl(ready[1], F_SETFD, FD_CLOEXEC)) {
+        close(ready[0]); close(ready[1]); free_env(env);
         return -1;
     }
     int pass = fcntl(listener, F_DUPFD_CLOEXEC, 10), ack = fcntl(ready[1], F_DUPFD_CLOEXEC, 10);
@@ -182,19 +193,3 @@ pid_t peak_global_budget_spawn(int listener, unsigned size, double target, uint6
     }
     return pid;
 }
-#else
-pid_t peak_global_budget_spawn(int l, unsigned s, double t, uint64_t n, bool r)
-{
-    (void)l;
-    (void)s;
-    (void)t;
-    (void)n;
-    (void)r;
-    return -1;
-}
-bool peak_global_budget_reap(pid_t p)
-{
-    (void)p;
-    return true;
-}
-#endif

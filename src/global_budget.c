@@ -1,37 +1,14 @@
 #define _GNU_SOURCE
 #include "internal/global_budget.h"
+#include "internal/global_budget_protocol.h"
 #ifdef PEAK_GLOBAL_BUDGET_NATIVE
 #include "internal/global_budget_spawn.h"
 #endif
-#if !defined(__linux__) || UINTPTR_MAX != UINT64_MAX
-int peak_global_budget_listen(unsigned short *p) { (void)p; return -1; }
-uint64_t peak_global_budget_nonce(void) { return 0; }
-void peak_global_budget_set_nonce(uint64_t n) { (void)n; }
-int peak_global_budget_start(const char *h,unsigned short p,unsigned r,unsigned s,double t,void(*w)(void)) { (void)h;(void)p;(void)r;(void)s;(void)t;(void)w;return -1; }
-void peak_global_budget_publish(const PeakGlobalBudgetSample *s) { (void)s; }
-void peak_global_budget_physical_targets(uint32_t n) { (void)n; }
-PeakGlobalBudgetView peak_global_budget_view(void) { return (PeakGlobalBudgetView){0}; }
-bool peak_global_budget_active(void) { return false; }
-bool peak_global_budget_try_spend(uint64_t n) { (void)n;return false; }
-bool peak_global_budget_try_spend_control(uint64_t n) { (void)n;return false; }
-uint64_t peak_global_budget_control_consumed_ns(void) { return 0; }
-void peak_global_budget_pressure(void) {}
-void peak_global_budget_complete(uint64_t n) { (void)n; }
-void peak_global_budget_startup(double s) { (void)s; }
-void peak_global_budget_origin(double s) { (void)s; }
-void peak_global_budget_return_idle(void) {}
-void peak_global_budget_retire(void) {}
-void peak_global_budget_finalizer(clockid_t c,uint64_t n,double b) { (void)c;(void)n;(void)b; }
-bool peak_global_budget_final_flush(unsigned n) { (void)n;return false; }
-void peak_global_budget_request_credit(uint64_t n) { (void)n; }
-bool peak_global_budget_flush(unsigned n) { (void)n;return false; }
-void peak_global_budget_stop(void) {}
-int peak_global_budget_broker_main(int argc,char **argv) { (void)argc;(void)argv;return 2; }
-#else
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
+#include <limits.h>
 #include <netdb.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
@@ -41,40 +18,35 @@ int peak_global_budget_broker_main(int argc,char **argv) { (void)argc;(void)argv
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#if defined(__linux__)
 #include <sys/syscall.h>
 #include "internal/exec_raw_syscall.h"
-#include <sys/eventfd.h>
+#endif
 #include <time.h>
 #include <unistd.h>
 
-/* Version four is a homogeneous-host protocol, confined to an MPI job. */
+/* Canonical fixed-width frames are independent of rank host ABI. */
 _Static_assert(ATOMIC_LLONG_LOCK_FREE == 2, "budget credits require lock-free 64-bit atomics");
 _Static_assert(__atomic_always_lock_free(sizeof(double), 0), "budget views require lock-free doubles");
-#define LIMIT 64
-/* Positive Linux TIDs bound simultaneous reservations; even their worst
- * temporary failed debits cannot wrap the signed underflow marker. */
+/* Bound each debit so even INT32_MAX simultaneous failed reservations cannot
+ * wrap the signed underflow marker. */
 #define MAX_SPEND_NS UINT64_C(4000000000)
 #define MAX_TOTAL_NS UINT64_C(999999999000000000)
 _Static_assert(MAX_SPEND_NS <= INT64_MAX / INT32_MAX, "temporary debit marker must not overflow");
-#define MAGIC UINT32_C(0x50474231)
-#define PROTOCOL_VERSION 4
+#define MAGIC PEAK_GLOBAL_BUDGET_PROTOCOL_MAGIC
+#define PROTOCOL_VERSION PEAK_GLOBAL_BUDGET_PROTOCOL_VERSION
 #define GRACE_NS UINT64_C(500000)
 #define FRESH_NS UINT64_C(1000000000)
 #ifndef PEAK_GLOBAL_BUDGET_IO_CHUNK
 #define PEAK_GLOBAL_BUDGET_IO_CHUNK 65536
 #endif
 #define IO_CHUNK PEAK_GLOBAL_BUDGET_IO_CHUNK
-typedef struct {
-    uint32_t magic, version, rank, size;
-    uint64_t reply_sequence, consumed_profile_ns, consumed_control_ns, nonce, requested_ns, demand_generation, message_sequence, returned_ns;
-    bool request_credit, root_startup_sealed;
-    double root_origin_seconds, root_startup_seconds;
-    PeakGlobalBudgetSample sample;
-    PeakGlobalBudgetView view;
-} Frame;
+typedef PeakGlobalBudgetFrame Frame;
 typedef struct {
     int fd, rank;
     Frame incoming, outgoing;
+    unsigned char incoming_wire[PEAK_GLOBAL_BUDGET_WIRE_SIZE];
+    unsigned char outgoing_wire[PEAK_GLOBAL_BUDGET_WIRE_SIZE];
     size_t received, sent;
     bool pending, final_sent, proof_sent;
     uint64_t last_activity, last_send;
@@ -86,7 +58,49 @@ typedef struct {
     uint64_t consumed_ns, requested_ns, demand_generation, actioned_generation, message_sequence, returned_ns;
     uint64_t last_update, registration_generation, member_generation, member_sample_sequence, fulfilled_generation, credit_total_ns, profile_ns, control_ns;
 } Rank;
-static int listener = -1, client = -1, wake_fd = -1;
+typedef struct {
+    unsigned peers_count;
+    Peer *peers;
+    Rank *ranks;
+    struct pollfd *ready;
+    bool *reply_dirty;
+} ServiceStorage;
+
+static void service_storage_free(ServiceStorage *storage)
+{
+    if (!storage) return;
+    free(storage->peers);
+    free(storage->ranks);
+    free(storage->ready);
+    free(storage->reply_dirty);
+    free(storage);
+}
+
+static ServiceStorage *service_storage_new(unsigned count)
+{
+    if (count > INT_MAX || count > SIZE_MAX / sizeof(Peer) ||
+        count > SIZE_MAX / sizeof(Rank) ||
+        (size_t)count > SIZE_MAX / sizeof(struct pollfd) - 3)
+        return NULL;
+    ServiceStorage *storage = calloc(1, sizeof(*storage));
+    if (!storage) return NULL;
+    storage->peers_count = count;
+    if (count) {
+        storage->peers = calloc(count, sizeof(*storage->peers));
+        storage->ranks = calloc(count, sizeof(*storage->ranks));
+        storage->reply_dirty = calloc(count, sizeof(*storage->reply_dirty));
+    }
+    storage->ready = calloc((size_t)count + 3, sizeof(*storage->ready));
+    if (!storage->ready || (count && (!storage->peers || !storage->ranks || !storage->reply_dirty))) {
+        service_storage_free(storage);
+        return NULL;
+    }
+    for (unsigned i = 0; i < count; ++i)
+        storage->peers[i] = (Peer){.fd = -1, .rank = -1};
+    return storage;
+}
+
+static int listener = -1, client = -1, wake_fd = -1, wake_write_fd = -1;
 static unsigned rank_id, world;
 static uint64_t job_nonce;
 uint64_t peak_global_budget_nonce(void) { return job_nonce; }
@@ -160,10 +174,15 @@ static atomic_uint_fast64_t finalizer_start;
 static _Atomic double finalizer_baseline;
 static atomic_uint_fast64_t local_completed_wave, public_wave, public_decision, public_completed, public_ack, public_timestamp, granted_ns, consumed_ns, requested_ns, demand_generation, debit_ns, returned_ns, public_demand_ack, request_started_ns, public_deadline, low_water_ns;
 static _Atomic double public_spent, public_remaining, public_allowance, public_span, public_granted, public_budget, public_reserved, public_control_reserve, startup_charge, local_transport_cpu, earned_origin, refill_rtt, consumption_rate;
-extern void pthread_listener_exclude_current_thread(void) __attribute__((weak));
-extern void pthread_listener_mark_next_created_thread_helper(void) __attribute__((weak));
-extern bool peak_global_budget_listener_idle_try_guard(void) __attribute__((weak));
-extern void peak_global_budget_listener_idle_unguard(void) __attribute__((weak));
+#if defined(__APPLE__)
+#define PEAK_BUDGET_WEAK __attribute__((weak_import))
+#else
+#define PEAK_BUDGET_WEAK __attribute__((weak))
+#endif
+extern void pthread_listener_exclude_current_thread(void) PEAK_BUDGET_WEAK;
+extern void pthread_listener_mark_next_created_thread_helper(void) PEAK_BUDGET_WEAK;
+extern bool peak_global_budget_listener_idle_try_guard(void) PEAK_BUDGET_WEAK;
+extern void peak_global_budget_listener_idle_unguard(void) PEAK_BUDGET_WEAK;
 static uint64_t ns_now(clockid_t clock)
 {
     struct timespec t;
@@ -173,11 +192,43 @@ static uint64_t ns_now(clockid_t clock)
 static double seconds_now(void) { return (double)ns_now(CLOCK_MONOTONIC) / 1e9; }
 static void poke(void)
 {
-    if (!atomic_load_explicit(&running, memory_order_acquire) || wake_fd < 0) return;
+    if (!atomic_load_explicit(&running, memory_order_acquire) || wake_write_fd < 0) return;
     uint64_t value = 1;
-    (void)write(wake_fd, &value, sizeof(value)); /* EFD_NONBLOCK: EAGAIN is harmless. */
+    (void)write(wake_write_fd, &value, sizeof(value)); /* Nonblocking: EAGAIN is harmless. */
 }
 static void close_fd(int *fd) { if (*fd >= 0) close(*fd); *fd = -1; }
+static bool configure_fd(int fd)
+{
+    int flags = fcntl(fd, F_GETFL);
+    return flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0 &&
+        fcntl(fd, F_SETFD, FD_CLOEXEC) == 0;
+}
+static bool configure_socket(int fd)
+{
+    if (!configure_fd(fd)) return false;
+#ifdef SO_NOSIGPIPE
+    int one = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one)) return false;
+#endif
+    return true;
+}
+static int accept_peer(int fd)
+{
+    int peer = accept(fd, NULL, NULL);
+    if (peer >= 0 && !configure_socket(peer)) { close(peer); return -1; }
+    return peer;
+}
+static int create_wake_pipe(void)
+{
+    int pipefd[2];
+    if (pipe(pipefd)) return -1;
+    if (!configure_fd(pipefd[0]) || !configure_fd(pipefd[1])) {
+        close(pipefd[1]); close(pipefd[0]); return -1;
+    }
+    wake_fd = pipefd[0]; wake_write_fd = pipefd[1];
+    return 0;
+}
+
 static bool idle_return_due(PhysicalIdleSnapshot physical, uint64_t now,
     uint64_t last_activity, bool returned, int64_t balance, uint64_t keep)
 {
@@ -378,15 +429,16 @@ PeakGlobalBudgetView peak_global_budget_view(void)
 int peak_global_budget_listen(unsigned short *port)
 {
     if (!port || listener >= 0 || atomic_load(&running)) return -1;
-    int s = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    int s = socket(AF_INET, SOCK_STREAM, 0);
     if (s < 0) return -1;
+    if (!configure_socket(s)) { close(s); return -1; }
     struct sockaddr_in addr = {.sin_family = AF_INET,
         .sin_addr.s_addr = htonl(INADDR_ANY)};
     socklen_t length = sizeof(addr);
-    if (bind(s, (void *)&addr, sizeof(addr)) || listen(s, LIMIT) ||
+    if (bind(s, (void *)&addr, sizeof(addr)) || listen(s, SOMAXCONN) ||
         getsockname(s, (void *)&addr, &length)) { close(s); return -1; }
     ssize_t entropy_bytes = -1;
-#if defined(SYS_getrandom)
+#if defined(__linux__) && defined(SYS_getrandom)
     entropy_bytes = peak_exec_raw_syscall6(SYS_getrandom, (long)(uintptr_t)&job_nonce,
         sizeof(job_nonce), 0x0001u /* GRND_NONBLOCK */, 0, 0, 0);
 #endif
@@ -412,8 +464,9 @@ static int connect_host(const char *host, unsigned short port)
     if (getaddrinfo(host, service, &hints, &addresses)) return -1;
     int fd = -1;
     for (struct addrinfo *a = addresses; a; a = a->ai_next) {
-        fd = socket(a->ai_family, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+        fd = socket(a->ai_family, SOCK_STREAM, 0);
         if (fd < 0) continue;
+        if (!configure_socket(fd)) { close(fd); fd = -1; continue; }
         int result = connect(fd, a->ai_addr, a->ai_addrlen);
         if (result && errno == EINPROGRESS) {
             struct pollfd p = {fd, POLLOUT, 0};
@@ -431,22 +484,29 @@ static int connect_host(const char *host, unsigned short port)
 /* Return -1 on peer loss; partial I/O is retained across poll iterations. */
 static int read_frame(Peer *p)
 {
-    size_t count = sizeof(Frame) - p->received;
+    size_t count = PEAK_GLOBAL_BUDGET_WIRE_SIZE - p->received;
     if (count > IO_CHUNK) count = IO_CHUNK;
-    ssize_t n = recv(p->fd, (char *)&p->incoming + p->received, count, 0);
+    ssize_t n = recv(p->fd, p->incoming_wire + p->received, count, 0);
     if (n > 0) { p->received += (size_t)n; p->last_activity = ns_now(CLOCK_MONOTONIC); }
     else if (!n || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) return -1;
-    return p->received == sizeof(Frame) ? 1 : 0;
+    if (p->received != PEAK_GLOBAL_BUDGET_WIRE_SIZE) return 0;
+    return peak_global_budget_frame_decode(&p->incoming, p->incoming_wire) ? 1 : -1;
 }
 static int write_frame(Peer *p)
 {
     if (!p->pending) return 0;
-    size_t count = sizeof(Frame) - p->sent;
+    if (!p->sent) peak_global_budget_frame_encode(p->outgoing_wire, &p->outgoing);
+    size_t count = PEAK_GLOBAL_BUDGET_WIRE_SIZE - p->sent;
     if (count > IO_CHUNK) count = IO_CHUNK;
-    ssize_t n = send(p->fd, (char *)&p->outgoing + p->sent, count, MSG_NOSIGNAL);
+#ifdef MSG_NOSIGNAL
+    const int send_flags = MSG_NOSIGNAL;
+#else
+    const int send_flags = 0; /* SO_NOSIGPIPE was set when the socket was created. */
+#endif
+    ssize_t n = send(p->fd, p->outgoing_wire + p->sent, count, send_flags);
     if (n > 0) p->sent += (size_t)n;
     else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) return -1;
-    if (p->sent == sizeof(Frame)) {
+    if (p->sent == PEAK_GLOBAL_BUDGET_WIRE_SIZE) {
         if (p->outgoing.view.cohort_finalized) p->final_sent = true;
         if (p->outgoing.view.broker_final_written) p->proof_sent = true;
         p->sent = 0; p->pending = false;
@@ -566,14 +626,16 @@ static CreditGrant grant_rank_credit(Rank *r, uint64_t free_ns)
     r->reservation = (double)(reserved + grant.credit) / 1e9;
     return grant;
 }
-static void *service(void *unused)
+static void *service(void *data)
 {
-    (void)unused;
+    ServiceStorage *storage = data;
     uint64_t cpu_origin = ns_now(CLOCK_THREAD_CPUTIME_ID);
     if (pthread_listener_exclude_current_thread) pthread_listener_exclude_current_thread();
-    Peer peers[LIMIT], local = {.fd = client, .rank = (int)rank_id};
-    Rank ranks[LIMIT] = {0};
-    for (unsigned i = 0; i < LIMIT; ++i) peers[i] = (Peer){.fd = -1, .rank = -1};
+    Peer *peers = storage->peers, local = {.fd = client, .rank = (int)rank_id};
+    Rank *ranks = storage->ranks;
+    struct pollfd *ready = storage->ready;
+    bool *reply_dirty = storage->reply_dirty;
+    unsigned peers_count = storage->peers_count;
     double start = seconds_now(), transport_cpu = 0, span = 0, wave_start = 0;
     uint64_t wave = 0, reply_sequence = 0, received_reply = 0, last_wave = 0, completed_wave = 0, message_sequence = 0;
     bool wave_pending = false, idle_returned = false, final_announced = false, recheck_root = false;
@@ -588,27 +650,27 @@ static void *service(void *unused)
         if (broker_only && getppid() != broker_owner_pid)
             break;
         uint64_t now_ns = ns_now(CLOCK_MONOTONIC);
-        struct pollfd ready[LIMIT + 3];
         ready[0] = (struct pollfd){(rank_id == 0 && !native_client) ? listener : -1, POLLIN, 0};
         ready[1] = (struct pollfd){local.fd, POLLIN | (local.pending ? POLLOUT : 0), 0};
         ready[2] = (struct pollfd){wake_fd, POLLIN, 0};
-        for (unsigned i = 0; i < world; ++i)
+        for (unsigned i = 0; i < peers_count; ++i)
             ready[i + 3] = (struct pollfd){(rank_id == 0 && !native_client) ? peers[i].fd : -1, POLLIN | (peers[i].pending ? POLLOUT : 0), 0};
         int timeout = broker_only ? (recheck_root ? 0 : (broken ? 10 : 100)) : service_poll_timeout(&local, last_request_target, recheck_root, broken);
         recheck_root = false;
-        (void)poll(ready, world + 3, timeout);
+        (void)poll(ready, (nfds_t)peers_count + 3, timeout);
         now_ns = ns_now(CLOCK_MONOTONIC);
-        if (ready[2].revents & POLLIN) { uint64_t events; (void)read(wake_fd, &events, sizeof(events)); }
+        if (ready[2].revents & POLLIN) { unsigned char wakes[256]; (void)read(wake_fd, wakes, sizeof(wakes)); }
         if (rank_id == 0 && !native_client) {
             int s = ready[0].revents & POLLIN
-                ? accept4(listener, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC) : -1;
-            if (s >= 0) {
+                ? accept_peer(listener) : -1;
+            while (s >= 0) {
                 int one = 1; (void)setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
                 unsigned slot;
                 for (slot = 0; slot < world; ++slot) if (peers[slot].fd < 0 && !peers[slot].final_sent) {
                     peers[slot] = (Peer){.fd = s, .rank = -1, .last_activity = now_ns}; break;
                 }
                 if (slot == world) close(s);
+                s = accept_peer(listener);
             }
             for (unsigned i = 0; i < world; ++i)
                 if (peers[i].fd >= 0 && now_ns > peers[i].last_activity && now_ns - peers[i].last_activity > UINT64_C(2000000000)) {
@@ -749,7 +811,7 @@ static void *service(void *unused)
                 if (ranks[i].wants_credit && (ranks[i].credit_total_ns - ranks[i].consumed_ns - ranks[i].returned_ns) >= (ranks[i].requested_ns > 100000 ? ranks[i].requested_ns : 100000))
                     ranks[i].fulfilled_generation = ranks[i].demand_generation;
             }
-            bool reply_dirty[LIMIT] = {false};
+            memset(reply_dirty, 0, world * sizeof(*reply_dirty));
             for (unsigned i = 0; i < world; ++i) {
                 Peer *p = &peers[i];
                 if (p->fd < 0 || p->rank < 0) continue;
@@ -934,15 +996,16 @@ static void *service(void *unused)
         atomic_store_explicit(&local_transport_cpu, transport_cpu, memory_order_relaxed);
 
     }
-    for (unsigned i = 0; i < world; ++i) close_fd(&peers[i].fd);
+    for (unsigned i = 0; i < peers_count; ++i) close_fd(&peers[i].fd);
     close_fd(&local.fd); client = -1;
+    service_storage_free(storage);
     PeakGlobalBudgetView old = peak_global_budget_view(); old.active = false; publish_view(old);
     return NULL;
 }
 int peak_global_budget_start(const char *host, unsigned short port, unsigned rank,
                             unsigned size, double target, void (*wake)(void))
 {
-    if (!job_nonce || !host || !port || !size || size > LIMIT || rank >= size || !number(target) ||
+    if (!job_nonce || !host || !port || !size || size > INT_MAX || rank >= size || !number(target) ||
         atomic_load(&running) || (rank == 0 && listener < 0)) return -1;
     const char *trace = getenv("PEAK_MPI_GLOBAL_TRACE");
     const char *legacy = getenv("PEAK_GLOBAL_BUDGET_TRACE");
@@ -966,13 +1029,21 @@ int peak_global_budget_start(const char *host, unsigned short port, unsigned ran
 #endif
         return -1;
     }
-    wake_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-    if (wake_fd < 0) { close(fd);
+    if (create_wake_pipe() != 0) { close(fd);
 #ifdef PEAK_GLOBAL_BUDGET_NATIVE
         peak_global_budget_reap(broker_pid);
         broker_pid = -1;
 #endif
         return -1; }
+    ServiceStorage *storage = service_storage_new(!rank && !native_client ? size : 0);
+    if (!storage) {
+        close(fd); close_fd(&wake_write_fd); close_fd(&wake_fd);
+#ifdef PEAK_GLOBAL_BUDGET_NATIVE
+        peak_global_budget_reap(broker_pid);
+        broker_pid = -1;
+#endif
+        return -1;
+    }
     event_count = 0; trace = getenv("PEAK_MPI_GLOBAL_TRACE");
     const char *legacy_trace = getenv("PEAK_GLOBAL_BUDGET_TRACE");
     trace_enabled = (trace && !strcmp(trace, "1")) || (legacy_trace && !strcmp(legacy_trace, "1"));
@@ -989,8 +1060,9 @@ int peak_global_budget_start(const char *host, unsigned short port, unsigned ran
     memset(&local_sample, 0, sizeof(local_sample)); publish_view((PeakGlobalBudgetView){0});
     atomic_store(&running, true);
     if (pthread_listener_mark_next_created_thread_helper) pthread_listener_mark_next_created_thread_helper();
-    if (pthread_create(&worker, NULL, service, NULL)) {
-        atomic_store(&running, false); close_fd(&client); close_fd(&wake_fd);
+    if (pthread_create(&worker, NULL, service, storage)) {
+        service_storage_free(storage);
+        atomic_store(&running, false); close_fd(&client); close_fd(&wake_write_fd); close_fd(&wake_fd);
 #ifdef PEAK_GLOBAL_BUDGET_NATIVE
         peak_global_budget_reap(broker_pid);
         broker_pid = -1;
@@ -1219,16 +1291,16 @@ bool peak_global_budget_final_flush(unsigned timeout_ms)
 }
 void peak_global_budget_stop(void)
 {
-    if (getpid() != atomic_load(&owner)) { close_fd(&client); close_fd(&listener); close_fd(&wake_fd); return; }
+    if (getpid() != atomic_load(&owner)) { close_fd(&client); close_fd(&listener); close_fd(&wake_write_fd); close_fd(&wake_fd); return; }
     if (atomic_exchange_explicit(&running, false, memory_order_acq_rel)) {
         /* Stop must be visible before the wake. Otherwise a same-CPU helper
          * can consume the wake, reenter poll while running is still true,
          * and leave join waiting for the entire 100ms normal poll timeout.
          * poke() cannot be used here because it deliberately ignores stopped
          * sessions. The nonblocking stop wake bypasses that running guard. */
-        if (wake_fd >= 0) {
+        if (wake_write_fd >= 0) {
             uint64_t value = 1;
-            (void)write(wake_fd, &value, sizeof(value));
+            (void)write(wake_write_fd, &value, sizeof(value));
         }
         pthread_join(worker, NULL);
         unsigned capacity = sizeof(events) / sizeof(events[0]);
@@ -1239,7 +1311,7 @@ void peak_global_budget_stop(void)
                 (unsigned long long)e->generation, (unsigned long long)e->wave, e->amount);
         }
     }
-    close_fd(&client); close_fd(&listener); close_fd(&wake_fd);
+    close_fd(&client); close_fd(&listener); close_fd(&wake_write_fd); close_fd(&wake_fd);
 #ifdef PEAK_GLOBAL_BUDGET_NATIVE
     if (broker_pid > 0) {
         PeakGlobalBudgetView final = peak_global_budget_view();
@@ -1257,7 +1329,7 @@ int peak_global_budget_broker_main(int argc, char **argv)
     /* This trusted, non-preloaded helper closes application descriptors before
      * readiness or protocol processing. Do not run application atfork handlers
      * after MPI has initialized a transport such as libfabric/EFA. */
-#ifdef SYS_close_range
+#if defined(__linux__) && defined(SYS_close_range)
     if (peak_exec_raw_syscall6(SYS_close_range, 5u, ~0u, 0, 0, 0, 0) < 0)
 #endif
     {
@@ -1265,7 +1337,7 @@ int peak_global_budget_broker_main(int argc, char **argv)
         if (maxfd < 5 || maxfd > 1048576)
             maxfd = 1048576;
         for (int fd = 5; fd < maxfd; fd++)
-            peak_exec_raw_syscall6(SYS_close, fd, 0, 0, 0, 0, 0);
+            close(fd);
     }
     if (argc != 9)
         return 2;
@@ -1282,7 +1354,7 @@ int peak_global_budget_broker_main(int argc, char **argv)
     uint64_t bits = strtoull(argv[5], &end, 10);
     double target;
     memcpy(&target, &bits, sizeof target);
-    if (errno || !end || *end || !number(target) || !values[2] || values[2] > LIMIT || !values[3] ||
+    if (errno || !end || *end || !number(target) || !values[2] || values[2] > INT_MAX || !values[3] ||
         values[0] != 3 || values[1] != 4 || values[4] != (unsigned long long)getppid())
         return 2;
     broker_owner_pid = (pid_t)values[4];
@@ -1293,13 +1365,17 @@ int peak_global_budget_broker_main(int argc, char **argv)
     rank_id = 0;
     broker_only = true;
     atomic_store(&owner, getpid());
+    ServiceStorage *storage = service_storage_new(world);
+    if (!storage) return 2;
     atomic_store(&running, true);
     trace_enabled = !strcmp(argv[8], "1");
     unsigned char ready = 0xa7;
-    if (write(4, &ready, 1) != 1)
+    if (write(4, &ready, 1) != 1) {
+        service_storage_free(storage);
         return 2;
+    }
     close(4);
-    service(NULL);
+    service(storage);
     atomic_store(&running, false);
     close_fd(&listener);
     for (unsigned i = event_count > 256 ? event_count - 256 : 0; i < event_count; i++) {
@@ -1311,5 +1387,3 @@ int peak_global_budget_broker_main(int argc, char **argv)
     }
     return 0;
 }
-
-#endif

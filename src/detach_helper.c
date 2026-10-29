@@ -1,9 +1,6 @@
 #define _GNU_SOURCE
 
 #include "detach_helper_protocol.h"
-#ifdef PEAK_GLOBAL_BUDGET_HELPER
-#include "internal/global_budget.h"
-#endif
 
 #include <dirent.h>
 #include <errno.h>
@@ -1375,11 +1372,6 @@ main(int argc, char** argv)
         return 1;
     }
 
-#ifdef PEAK_GLOBAL_BUDGET_HELPER
-    if (argc > 1 && strcmp(argv[1], "--global-budget-broker") == 0) {
-        return peak_global_budget_broker_main(argc, argv);
-    }
-#endif
     if (argc == 2 && strcmp(argv[1], "--self-test") == 0) {
         puts("peak_detach_helper_self_test_ok");
         return 0;
