@@ -7,8 +7,12 @@
  *
  * MPI_Init/PMPI_Init and their thread-level variants are interposed with
  * ordinary dynamic symbols rather than Gum patches. By default PEAK is already
- * active when they run. Global prepare mode initializes support eagerly but
- * keeps user targets native until a paid global lease. With
+ * active when they run. Global prepare mode initializes PEAK before MPI and
+ * performs standard initial target installation. Each initial hook gets one
+ * shared 64-call observation window across threads; reattachment does not
+ * reset it. Measured callback cost is included in global accounting; physical
+ * stop wall time is accounted separately. Later loader/JIT installation and
+ * physical recovery require funded leases. With
  * PEAK_MPI_ACTIVATION_POLICY=post-init, PEAK remains
  * configured but inactive while the real initializer loads transport
  * providers, then activates Gum hooks from the outermost return path.

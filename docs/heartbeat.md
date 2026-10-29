@@ -675,12 +675,18 @@ new MPI worlds still need their own cohort-registration integration; they are
 not restrictions of the budget algorithm.
 
 With heartbeat admission available, global mode defaults to
-`PEAK_MPI_ACTIVATION_POLICY=prepare`: PEAK initializes before MPI, while user
-targets remain native until their first installation is funded. This applies to
-static and dynamically discovered targets. Explicit `post-init` defers all
-runtime preparation until MPI initialization returns. Explicit `immediate`
-retains pre-MPI profiling before global coordination starts. Non-MPI and
-heartbeat-disabled configurations keep their existing local behavior.
+`PEAK_MPI_ACTIVATION_POLICY=prepare`: PEAK initializes before MPI and performs
+the standard initial target installation. Each initial hook gets one shared
+64-call observation window across threads; reattachment does not reset it.
+Measured callback cost is included in global accounting. The call count does not
+bound physical-stop wall time; measured control cost is billed separately.
+Global pressure can selectively close sampled hot hooks. Later loader/JIT
+installations and physical recovery require funded leases. Explicit `post-init`
+defers all runtime preparation until MPI initialization returns and omits
+pre-MPI profiling; `prepare` allows initial observations before MPI.
+Explicit `immediate` retains pre-MPI profiling before global coordination
+starts. Non-MPI and heartbeat-disabled configurations keep their existing local
+behavior.
 
 ### Shared accounting and admission
 
@@ -701,8 +707,9 @@ Root publishes preparation and bootstrap costs before sealing startup. An online
 cohort alone cannot authorize credit. Only original MPI initialization and later
 job runtime earn budget; PEAK startup work does not earn credit for itself.
 
-First installation and restoration require a complete mutation/observation lease,
-with future closing cost reserved separately. Closing estimates account for
+After standard constructor installation, later loader/JIT installation and
+restoration require a complete mutation/observation lease, with future closing
+cost reserved separately. Closing estimates account for
 multiple batches when more than 64 targets are configured. A physical activity
 revision starts the normal idle interval after installation; detached waiting
 time cannot prematurely return the observation lease. Idle returns use a
