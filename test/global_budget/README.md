@@ -18,10 +18,14 @@ The standalone tests cover three runtime contracts:
 
 With MPI profiling and the strict mutation backend available, CTest also runs
 one 80-target application fixture in three runs: singleton and two-rank
-recovery, plus early rank-zero finalization. They check paid installation through
-multiple batches of at most 64 hooks, budget exhaustion and real restoration
-followed by new calls, and rank zero finalizing while another rank continues to use the
-broker. All require correct application arithmetic and final settlement.
+recovery, plus early rank-zero finalization. They check standard initial
+installation before MPI, a real 64-call initial observation with correct enter/leave
+arithmetic, selective exhaustion of the hot hook while all 79 cold hooks remain
+physically installed, and paid recovery followed by new calls. Rank zero may
+finalize while another rank continues using the broker. All require consumed
+profile credit, correct application arithmetic and final settlement. Runtime
+batch-capacity safety remains covered by the existing controller tests; initial
+hooks no longer require artificial paid reattachment batches.
 
 These are functional regressions, not performance thresholds. The MPI launcher
 and profiler/broker binaries come from the current CMake build. Temporary logs

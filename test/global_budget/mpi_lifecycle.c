@@ -101,6 +101,7 @@ TARGET(79)
 
 static int (*coordinator_active)(void);
 static uint32_t (*physical_targets)(void);
+static int (*physical_hook)(unsigned);
 static uint64_t (*target_calls)(void);
 static PeakGlobalBudgetView (*budget_view)(void);
 
@@ -142,13 +143,20 @@ static int work(double duration, int hot)
     return 0;
 }
 
+static int cold_targets_attached(void)
+{
+    for (unsigned hook = 1; hook < 80; ++hook)
+        if (!physical_hook(hook)) return 0;
+    return 1;
+}
+
 static int wait_physical(unsigned count, double timeout)
 {
     uint64_t x = 1;
     double deadline = now() + timeout;
     do {
         x = native_work(x);
-        if (!coordinator_active())
+        if (!coordinator_active() || !cold_targets_attached())
             return 1;
         if ((count ? physical_targets() == count : physical_targets() > 0)) {
             printf("physical=%u checksum=%llu\n", count, (unsigned long long)x);
@@ -165,8 +173,12 @@ static int exhaust_credit(void)
         if (work(.01, 1))
             return 1;
         PeakGlobalBudgetView view = budget_view();
-        if (view.wave && view.root_completed_wave >= view.wave && !physical_targets())
+        if (!cold_targets_attached()) return 1;
+        if (view.wave && view.root_completed_wave >= view.wave &&
+            physical_targets() == 79 && !physical_hook(0)) {
+            puts("selective_exhaustion hot_attached=0 cold_attached=79");
             return 0;
+        }
     } while (now() < deadline);
     return 1;
 }
@@ -174,15 +186,22 @@ static int exhaust_credit(void)
 int main(int argc, char **argv)
 {
     physical_targets = dlsym(RTLD_DEFAULT, "peak_general_listener_test_physical_targets");
+    physical_hook = dlsym(RTLD_DEFAULT, "peak_general_listener_test_hook_physical");
     target_calls = dlsym(RTLD_DEFAULT, "peak_general_listener_test_all_target_calls");
     coordinator_active = dlsym(RTLD_DEFAULT, "peak_general_listener_test_global_active");
     budget_view = dlsym(RTLD_DEFAULT, "peak_general_listener_test_global_view");
-    if (!physical_targets || !target_calls || !coordinator_active || !budget_view || argc != 2)
+    if (!physical_targets || !physical_hook || !target_calls || !coordinator_active || !budget_view || argc != 2)
         return 1;
-    /* Global preparation must not patch or collect targets before MPI_Init. */
-    (void)budget_target_0(1);
-    if (physical_targets() || target_calls())
-        return 2;
+    /* Standard installation precedes MPI worker creation. The finite initial
+     * window records real enter/leave data and obeys the same affine oracle. */
+    if (physical_targets() != 80 || target_calls() != 0 || !cold_targets_attached()) return 2;
+    uint64_t initial = 1, expected_initial = 1;
+    for (unsigned i = 0; i < 64; ++i) {
+        initial = budget_target_0(initial);
+        expected_initial = A * expected_initial + B;
+    }
+    if (initial != expected_initial || target_calls() != 64) return 2;
+    printf("initial_observation calls=64 checksum=%llu\n", (unsigned long long)initial);
     int provided, rank;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
@@ -199,10 +218,9 @@ int main(int argc, char **argv)
         bad = wait_physical(0, 8) || work(.1, 1) || work(.1, 0);
     } else if (!strcmp(argv[1], "recovery")) {
         bad = wait_physical(80, 8);
-        if (target_calls() != 0)
-            bad = 1;
+        if (target_calls() != 64 || !cold_targets_attached()) bad = 1;
         int exhausted = exhaust_credit();
-        int restored = wait_physical(0, 8);
+        int restored = wait_physical(80, 8);
         int sampled = work(.05, 1);
         printf("stages initial=%d exhausted=%d restored=%d sampled=%d\n", bad, exhausted, restored, sampled);
         bad |= exhausted || restored || sampled;

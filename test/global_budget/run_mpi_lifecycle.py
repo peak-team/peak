@@ -82,18 +82,17 @@ with tempfile.TemporaryDirectory(prefix='peak-budget-mpi-') as temporary:
                              - int(member['control_consumed_ns']) - int(member['local_credit_ns']))
             assert profile_spent > 0, member
             events = records('global controller event:')
-            initial = [event for event in events if event['kind'] == '7']
-            assert len(initial) == 80, text
-            batches, count = [], 0
-            for event in events:
-                if event['kind'] in ('4', '5') and count:
-                    batches.append(count)
-                    count = 0
-                elif event['kind'] == '7':
-                    count += 1
-            if count:
-                batches.append(count)
-            assert len(batches) >= 2 and max(batches) <= 64, batches
+            # Initial hooks use the standard constructor installation. Paid
+            # continuation/recovery remains mandatory, but no initial runtime
+            # reattachment transaction is expected or invented.
+            admission = records('MPI initial admission:')[-1]
+            assert admission['initial_installed_targets'] == '80', admission
+            assert admission['initial_observation_limit_calls'] == str(80 * 64), admission
+            assert admission['initial_observation_used_calls'] == '64', admission
+            assert float(admission['initial_observation_profile_seconds']) > 0, admission
+            assert not [event for event in events if event['kind'] == '7'], text
+            assert 'initial_observation calls=64 checksum=' in rank_out[rank], rank_out[rank]
+            assert 'selective_exhaustion hot_attached=0 cold_attached=79' in rank_out[rank], rank_out[rank]
             calls = re.findall(r'\|\s+budget_target_0\**\s*\|\s+(\d+)\|', text)
             restored = [event for event in events if event['kind'] == '6'
                         and event['hook_id'] == '0' and int(event['completed_wave']) > 0]

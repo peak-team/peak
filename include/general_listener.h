@@ -99,6 +99,9 @@ struct _PeakGeneralListener {
      * crossing or publishing against a later ATTACHED generation.
      */
     _Atomic unsigned long long callback_hook_control;
+    /* One initial observation window per hook, shared by every thread and
+     * never replenished by physical reattachment. */
+    _Atomic unsigned initial_observation_remaining;
     _Atomic guint fast_lifetime_closing;
     _Atomic guint fast_lifetime_abandoners;
     GumPeakFastListener fast_listener;
@@ -380,7 +383,6 @@ void peak_general_listener_controller_unlock(void);
  * controller thread process pending Gum lifecycle work outside the callback.
  */
 void peak_general_listener_controller_wake(void);
-PEAK_API void peak_general_listener_enable_funded_initial_attach(void);
 PEAK_API void peak_general_listener_funded_initial_attach_fallback(void);
 PEAK_API void peak_general_listener_global_budget_startup(double seconds, int ready);
 PEAK_API void peak_general_listener_global_physical_snapshot(void);

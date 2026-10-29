@@ -1286,7 +1286,7 @@ peak_mpi_activation_policy_post_init(void)
     const char* value = getenv(PEAK_MPI_ACTIVATION_POLICY_ENV);
 
     if (value == NULL || value[0] == '\0') {
-        return FALSE; /* The global default prepares eagerly; targets stay native. */
+        return FALSE; /* The global default installs the standard initial hooks eagerly. */
     }
     if (g_ascii_strcasecmp(value, "immediate") == 0 ||
         g_ascii_strcasecmp(value, "prepare") == 0) return FALSE;
@@ -1323,7 +1323,8 @@ peak_mpi_activation_policy_prepare(void)
         g_ascii_strcasecmp(policy, "prepare") == 0;
     return (found_MPI || explicit_prepare) && global != NULL && strcmp(global, "1") == 0 &&
         (policy == NULL || policy[0] == '\0' ||
-         g_ascii_strcasecmp(policy, "prepare") == 0) &&
+         g_ascii_strcasecmp(policy, "prepare") == 0 ||
+         g_ascii_strcasecmp(policy, "immediate") == 0) &&
         heartbeat_time != 0 && (enable_per_target_heartbeat || enable_global_heartbeat);
 #else
     return FALSE;
@@ -1609,12 +1610,6 @@ PEAK_API void
 peak_mpi_init_completed(int result)
 {
     if (result == MPI_SUCCESS) {
-        const char* global_mode = getenv("PEAK_MPI_GLOBAL_BUDGET");
-        if (atomic_load_explicit(&peak_runtime_activation_state, memory_order_acquire) ==
-                PEAK_RUNTIME_ACTIVATION_READY && peak_mpi_activation_policy_post_init() &&
-            heartbeat_time != 0 && (enable_per_target_heartbeat || enable_global_heartbeat) &&
-            global_mode != NULL && strcmp(global_mode, "1") == 0)
-            peak_general_listener_enable_funded_initial_attach();
         peak_activate_runtime();
     } else {
         found_MPI = 0;
@@ -1868,8 +1863,7 @@ void peak_init()
         /* ACTIVE can be observed before activation returns. Until publication,
          * concurrent MPI initialization must fail closed rather than charge 0. */
         atomic_store_explicit(&peak_mpi_preparation_seconds, -1.0, memory_order_release);
-        peak_general_listener_enable_funded_initial_attach();
-        peak_log_report("[peak] MPI activation: policy=prepare targets=native-until-paid\n");
+        peak_log_report("[peak] MPI activation: policy=prepare targets=standard-initial-install\n");
     }
 #endif
     peak_activate_runtime();
