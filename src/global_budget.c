@@ -369,6 +369,8 @@ extern bool peak_global_budget_listener_idle_try_guard(void) PEAK_BUDGET_WEAK;
 extern void peak_global_budget_listener_idle_unguard(void) PEAK_BUDGET_WEAK;
 extern void peak_global_budget_listener_credit_ready(void) PEAK_BUDGET_WEAK;
 extern bool peak_global_budget_listener_admission_waiting(void) PEAK_BUDGET_WEAK;
+extern void peak_global_budget_listener_wallet_decreased(uint64_t, uint64_t, bool) PEAK_BUDGET_WEAK;
+extern void peak_global_budget_listener_view_pressure_changed(void) PEAK_BUDGET_WEAK;
 extern void peak_mpi_budget_events_frontier(void) PEAK_BUDGET_WEAK;
 extern PeakMpiRuntimeSpan peak_mpi_budget_runtime_begin(PeakMpiRuntimeComponent) PEAK_BUDGET_WEAK;
 extern void peak_mpi_budget_runtime_end(PeakMpiRuntimeSpan *, uint64_t, uint64_t) PEAK_BUDGET_WEAK;
@@ -490,6 +492,8 @@ static uint64_t idle_return_commit(PhysicalIdleSnapshot physical, int64_t balanc
             returned = (uint64_t)balance - keep;
             atomic_fetch_add(&debit_ns, returned);
             atomic_fetch_add(&returned_ns, returned);
+            if (peak_global_budget_listener_wallet_decreased)
+                peak_global_budget_listener_wallet_decreased((uint64_t)balance, keep, false);
         }
     }
     if (has_guard)
@@ -647,6 +651,8 @@ static void publish_view(PeakGlobalBudgetView v)
     }
     atomic_store_explicit(&public_timestamp, ns_now(CLOCK_MONOTONIC), memory_order_relaxed);
     atomic_fetch_add_explicit(&view_sequence, 1, memory_order_release);
+    if (peak_global_budget_listener_view_pressure_changed)
+        peak_global_budget_listener_view_pressure_changed();
 }
 bool peak_global_budget_active(void)
 {
@@ -944,6 +950,9 @@ int peak_global_budget_mpi_trace_begin(void)
                     atomic_store(&metadata_block_start, atomic_load(&frontend_cpu_ns));
                     atomic_store(&metadata_block_credit, quote);
                     tokens = 64;
+                    if (peak_global_budget_listener_wallet_decreased)
+                        peak_global_budget_listener_wallet_decreased((uint64_t)before,
+                            (uint64_t)before - quote, false);
                 } else atomic_fetch_add(&available_ns, (int64_t)quote);
             }
         }
@@ -2463,7 +2472,10 @@ void peak_global_budget_return_idle(void)
         if (atomic_compare_exchange_weak_explicit(&available_ns, &balance, 0,
                 memory_order_acq_rel, memory_order_acquire)) {
             atomic_fetch_add(&debit_ns, (uint64_t)balance);
-            atomic_fetch_add(&returned_ns, (uint64_t)balance); break;
+            atomic_fetch_add(&returned_ns, (uint64_t)balance);
+            if (peak_global_budget_listener_wallet_decreased)
+                peak_global_budget_listener_wallet_decreased((uint64_t)balance, 0, false);
+            break;
         }
     atomic_store(&pressure_notice, false); atomic_store(&requested_ns, 0); atomic_store(&minimum_target_ns,0); atomic_store(&admission_target_ns,0); atomic_store(&admission_cash_ns,0); atomic_store(&admission_closing_ns,0);
     atomic_store(&recovery_target_ns, 0); atomic_store(&request_recovery, false); atomic_store(&request_metadata,false);
@@ -2643,6 +2655,8 @@ static bool try_spend(uint64_t amount, bool control)
     atomic_fetch_add_explicit(&debit_ns, amount, memory_order_release);
     atomic_fetch_add_explicit(control ? &consumed_control_ns : &consumed_ns, amount, memory_order_release);
     uint64_t remaining = (uint64_t)before - amount, water = atomic_load(&low_water_ns);
+    if (peak_global_budget_listener_wallet_decreased)
+        peak_global_budget_listener_wallet_decreased((uint64_t)before, remaining, !control);
     if (remaining <= water && !atomic_load(&pressure_notice))
         request_credit_internal(water > UINT64_MAX / 2 ? water : water * 2,false,false);
     else if (atomic_load(&public_demand_ack) >= atomic_load(&demand_generation))
