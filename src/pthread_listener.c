@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include "internal/native_thread_pointer.h"
 #include "pthread_listener.h"
 #include "general_listener.h"
 #include "detach_controller.h"
@@ -1084,3 +1085,7 @@ size_t pthread_listener_snapshot_threads(pthread_t* tids,
     }
     return count;
 }
+
+#if defined(__linux__) && (defined(__x86_64__) || defined(__amd64__) || defined(__aarch64__))
+ptrdiff_t pthread_listener_native_exclusion_offset(void) { return peak_native_tls_offset(&pthread_thread_excluded); }
+#endif

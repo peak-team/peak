@@ -111,6 +111,9 @@ struct _PeakGeneralListener {
     _Atomic guint fast_lifetime_closing;
     _Atomic guint fast_lifetime_abandoners;
     GumPeakFastListener fast_listener;
+#if PEAK_HAVE_NATIVE_PAUSED_ENTRY
+    GumPeakNativePause native_pause;
+#endif
     _Atomic guint* fast_active;
     size_t fast_stats_capacity;
     size_t fast_stats_mapping_size;

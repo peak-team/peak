@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 /* Application MPI causal metadata. Native operations and return values are
  * preserved; unsupported/ambiguous semantics explicitly seal a SUM epoch. */
+#include "internal/native_thread_pointer.h"
 #include "internal/mpi_budget_events.h"
 #include <mpi.h>
 #include <pthread.h>
@@ -87,7 +88,7 @@ static int stream_closed;
 static _Atomic int frontend_ready;
 static int uncertifiable_state;
 static int needs_strong_fence;
-static _Thread_local int application_active;
+static _Thread_local int application_active __attribute__((tls_model("initial-exec")));
 int peak_mpi_application_active(void){return application_active;}
 
 static _Thread_local uint64_t wrapper_started, native_elapsed_ns;
@@ -2185,3 +2186,7 @@ PEAK_MPI_IO_APIS_3(PEAK_ALIAS)
 #undef PEAK_MPI_OPTIONAL_STATUS_API
 #undef PEAK_MPI_APIS_3
 #undef PEAK_MPI_APIS_4
+
+#if defined(__linux__) && (defined(__x86_64__) || defined(__amd64__) || defined(__aarch64__))
+ptrdiff_t peak_mpi_application_active_offset(void) { return peak_native_tls_offset(&application_active); }
+#endif

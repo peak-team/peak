@@ -110,7 +110,6 @@ function(_peak_compile_peak_gum_overlay _source_dir _input_dir _output_dir)
     configure_file("${_input_dir}/frida-gum.h"
                    "${_output_dir}/frida-gum.h" COPYONLY)
 
-    _peak_patch_frida_gum_elf_module("${_source_dir}" "${_output_dir}")
 
     file(READ "${_source_dir}/peak-gum/frida-gum-peak-api.h" _peak_gum_api_header)
     file(APPEND "${_output_dir}/frida-gum.h"
@@ -132,6 +131,68 @@ function(_peak_compile_peak_gum_overlay _source_dir _input_dir _output_dir)
         list(APPEND _peak_overlay_toolchain_flags
              "--sysroot=${CMAKE_SYSROOT}")
     endif()
+    # Source-build the pinned backend before the existing archive import routing.
+    string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" _peak_native_processor)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+       _peak_native_processor MATCHES "^(x86_64|amd64|aarch64|arm64)$")
+        set(_peak_native_dir "${_source_dir}/peak-gum/native")
+        if(_peak_native_processor MATCHES "^(x86_64|amd64)$")
+            set(_peak_native_backend x86)
+            set(_peak_native_define HAVE_I386=1)
+        else()
+            set(_peak_native_backend arm64)
+            set(_peak_native_define HAVE_ARM64=1)
+        endif()
+        set(_peak_native_backend_object
+            "${_output_dir}/backend-${_peak_native_backend}_guminterceptor-${_peak_native_backend}.c.o")
+        set(_peak_native_assembly_object "${_output_dir}/gum_peak_native_gate.S.o")
+        execute_process(
+            COMMAND "${CMAKE_C_COMPILER}" ${_peak_overlay_toolchain_flags}
+                -std=c11 -fPIC -O2 ${_peak_overlay_c_flags_list}
+                -D_GNU_SOURCE=1 -DHAVE_LINUX=1 "-D${_peak_native_define}"
+                "-I${_output_dir}" "-I${_peak_native_dir}"
+                -c "${_peak_native_dir}/guminterceptor-${_peak_native_backend}-native.c"
+                -o "${_peak_native_backend_object}"
+            RESULT_VARIABLE _peak_native_result
+            OUTPUT_VARIABLE _peak_native_stdout ERROR_VARIABLE _peak_native_stderr)
+        if(NOT _peak_native_result EQUAL 0)
+            message(FATAL_ERROR "Failed to compile pinned Gum backend:\n${_peak_native_stdout}\n${_peak_native_stderr}")
+        endif()
+        execute_process(
+            COMMAND "${CMAKE_C_COMPILER}" ${_peak_overlay_toolchain_flags}
+                -fPIC "-I${_peak_native_dir}"
+                -c "${_peak_native_dir}/gum_peak_native_gate.S"
+                -o "${_peak_native_assembly_object}"
+            RESULT_VARIABLE _peak_native_result
+            OUTPUT_VARIABLE _peak_native_stdout ERROR_VARIABLE _peak_native_stderr)
+        if(NOT _peak_native_result EQUAL 0)
+            message(FATAL_ERROR "Failed to compile native paused entry:\n${_peak_native_stdout}\n${_peak_native_stderr}")
+        endif()
+        # This translation unit has only actual-type compile-time assertions.
+        # Cross compilation never executes a target layout generator.
+        execute_process(
+            COMMAND "${CMAKE_C_COMPILER}" ${_peak_overlay_toolchain_flags}
+                -std=c11 -fPIC -O2 ${_peak_overlay_c_flags_list} -D_GNU_SOURCE=1
+                "-I${_output_dir}" "-I${_peak_native_dir}"
+                -c "${_peak_native_dir}/native-layout.c"
+                -o "${_output_dir}/gum_peak_native_layout.c.o"
+            RESULT_VARIABLE _peak_native_result
+            OUTPUT_VARIABLE _peak_native_stdout ERROR_VARIABLE _peak_native_stderr)
+        if(NOT _peak_native_result EQUAL 0)
+            message(FATAL_ERROR "Pinned Gum native layout mismatch:\n${_peak_native_stdout}\n${_peak_native_stderr}")
+        endif()
+        execute_process(
+            COMMAND "${CMAKE_AR}" r "${_output_dir}/libfrida-gum.a"
+                "${_peak_native_backend_object}" "${_peak_native_assembly_object}"
+            RESULT_VARIABLE _peak_native_result
+            OUTPUT_VARIABLE _peak_native_stdout ERROR_VARIABLE _peak_native_stderr)
+        if(NOT _peak_native_result EQUAL 0)
+            message(FATAL_ERROR "Failed to replace pinned Gum backend:\n${_peak_native_stdout}\n${_peak_native_stderr}")
+        endif()
+    endif()
+
+    _peak_patch_frida_gum_elf_module("${_source_dir}" "${_output_dir}")
+
     # Route only the code allocator's near-page call on Linux x86-64.
     string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" _peak_near_processor)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
@@ -316,7 +377,7 @@ function(_peak_validate_frida_gum_peak_api)
 #error Missing PEAK deferred module-sync lifecycle API
 #endif
 #if !defined(GUM_PEAK_FAST_LISTENER_VERSION) || \
-    GUM_PEAK_FAST_LISTENER_VERSION != 8
+    GUM_PEAK_FAST_LISTENER_VERSION != 9
 #error Unsupported PEAK Gum fast-listener ABI
 #endif
 

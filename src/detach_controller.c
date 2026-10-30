@@ -5072,6 +5072,7 @@ gboolean
 peak_detach_controller_test_replace_helper_env(const char* name,
                                                const char* value)
 {
+#ifdef PEAK_HAVE_GUM_PEAK_PC_API
     gboolean replaced = FALSE;
     size_t name_length;
 
@@ -5112,6 +5113,11 @@ peak_detach_controller_test_replace_helper_env(const char* name,
     }
     peak_detach_controller_unlock_mutation_guard();
     return replaced;
+#else
+    (void)name;
+    (void)value;
+    return FALSE;
+#endif
 }
 #endif
 

@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include "internal/native_thread_pointer.h"
 #include <math.h>
 #include "general_listener.h"
 #include "internal/global_budget.h"
@@ -238,17 +239,29 @@ static gboolean peak_global_configured;
 /* Cumulative slot lanes survive thread retirement/reuse. MPI events scan these
  * O(T) lanes, never the hook table. Calibration resets them before publication. */
 typedef struct {
-    _Atomic uint64_t calls[6];
+    _Atomic uint64_t calls[8];
     _Atomic uint64_t inflight;
-    unsigned char padding[8];
+    unsigned char padding[56];
 } PeakBudgetCostLane;
-_Static_assert(sizeof(PeakBudgetCostLane) == 64, "one cost lane per cache line");
+#if PEAK_HAVE_NATIVE_PAUSED_ENTRY
+_Static_assert(sizeof(PeakBudgetCostLane) == (1u << GUM_PEAK_NATIVE_COST_LANE_SHIFT), "native assembly cost stride");
+#endif
+_Static_assert(offsetof(PeakBudgetCostLane, calls[6]) == 48, "native call lane base");
 static PeakBudgetCostLane* peak_budget_cost_lanes;
 static _Atomic size_t peak_budget_lane_highwater;
-static _Thread_local gboolean peak_budget_lane_registered;
+static _Thread_local gboolean peak_budget_lane_registered __attribute__((tls_model("initial-exec")));
 static double peak_general_ignored_overhead;
 static double peak_general_generic_ignored_overhead;
 static uint64_t peak_ignored_rent_fast_ns, peak_ignored_rent_generic_ns;
+static double peak_native_ignored_overhead;
+static uint64_t peak_native_ignored_rent_ns;
+static gboolean peak_native_calibration_valid;
+#if PEAK_HAVE_NATIVE_PAUSED_ENTRY
+extern ptrdiff_t pthread_listener_native_exclusion_offset(void);
+#ifdef HAVE_MPI
+extern ptrdiff_t peak_mpi_application_active_offset(void) __attribute__((weak));
+#endif
+#endif
 static double peak_soft_bootstrap_window_seconds;
 static PeakDetachAccountingSnapshot peak_closing_observation;
 static gboolean peak_soft_calibration_valid;
@@ -1433,6 +1446,10 @@ void pthread_pause_enable(void);
 void pthread_pause_disable(void);
 
 #define PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE 64
+#if PEAK_HAVE_NATIVE_PAUSED_ENTRY
+_Static_assert(PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE == (1u << GUM_PEAK_NATIVE_RENT_LANE_SHIFT), "native assembly rent stride");
+#endif
+_Static_assert(offsetof(PeakBurstBudgetSlot, generation) == 0, "native rent word offset");
 _Static_assert(sizeof(PeakBurstBudgetSlot) <= 24,
                "burst state must fit unused callback cache-line tail");
 
@@ -1470,10 +1487,10 @@ PEAK_API void
 peak_mpi_budget_cost_snapshot(PeakMpiBudgetCostSnapshot* snapshot)
 {
     if (snapshot == NULL) return;
-    uint64_t totals[6] = {0};
+    uint64_t totals[8] = {0};
     if (peak_budget_cost_lanes != NULL) {
         for (size_t t = 0, used = atomic_load_explicit(&peak_budget_lane_highwater, memory_order_acquire); t < used; ++t)
-            for (unsigned k = 0; k < 6; ++k) {
+            for (unsigned k = 0; k < 8; ++k) {
                 uint64_t n = atomic_load_explicit(&peak_budget_cost_lanes[t].calls[k], memory_order_relaxed);
                 totals[k] = UINT64_MAX - totals[k] < n ? UINT64_MAX : totals[k] + n;
             }
@@ -1482,6 +1499,10 @@ peak_mpi_budget_cost_snapshot(PeakMpiBudgetCostSnapshot* snapshot)
     uint64_t fast_in = peak_budget_cost_ns(totals[3], peak_general_ignored_overhead);
     uint64_t generic_out = peak_budget_cost_ns(totals[4], peak_general_generic_ignored_overhead);
     uint64_t generic_in = peak_budget_cost_ns(totals[5], peak_general_generic_ignored_overhead);
+    uint64_t native_out = peak_budget_cost_ns(totals[6], peak_native_ignored_overhead);
+    uint64_t native_in = peak_budget_cost_ns(totals[7], peak_native_ignored_overhead);
+    fast_out = UINT64_MAX - fast_out < native_out ? UINT64_MAX : fast_out + native_out;
+    fast_in = UINT64_MAX - fast_in < native_in ? UINT64_MAX : fast_in + native_in;
     *snapshot = (PeakMpiBudgetCostSnapshot){
         .active_outside_ns = peak_budget_cost_ns(totals[0], peak_general_overhead),
         .active_inside_ns = peak_budget_cost_ns(totals[1], peak_general_overhead),
@@ -1489,6 +1510,22 @@ peak_mpi_budget_cost_snapshot(PeakMpiBudgetCostSnapshot* snapshot)
         .ignored_inside_ns = UINT64_MAX - fast_in < generic_in ? UINT64_MAX : fast_in + generic_in
     };
 }
+
+#if PEAK_HAVE_NATIVE_PAUSED_ENTRY
+static uint64_t
+peak_general_listener_native_ignored_calls(void)
+{
+    uint64_t total = 0;
+    for (size_t t = 0, used = atomic_load_explicit(&peak_budget_lane_highwater, memory_order_acquire);
+         peak_budget_cost_lanes != NULL && t < used; ++t)
+        for (unsigned k = 6; k < 8; ++k) {
+            uint64_t n = atomic_load_explicit(&peak_budget_cost_lanes[t].calls[k], memory_order_relaxed);
+            total = UINT64_MAX - total < n ? UINT64_MAX : total + n;
+        }
+    return total;
+}
+
+#endif
 
 static double
 peak_general_listener_ignored_seconds(void)
@@ -5363,7 +5400,10 @@ peak_general_controller_publish_detach_count_requests_unlocked(void)
                 /* Callback pressure may disable only this observed hook. A
                  * racing funded observation promise wins over the old edge. */
                 PeakGlobalBudgetView current = peak_global_budget_view();
-                gboolean immediate_close = peak_soft_calibration_valid &&
+                gboolean native_paused = peak_native_calibration_valid &&
+                    peak_gum_native_pause_is_eligible(interceptor, hook_address[hook_id],
+                        GUM_INVOCATION_LISTENER(listener));
+                gboolean immediate_close = !native_paused && peak_soft_calibration_valid &&
                     atomic_load_explicit(&listener->soft_paused, memory_order_acquire) &&
                     atomic_load_explicit(&listener->initial_observation_remaining, memory_order_relaxed) == 0 &&
                     peak_hook_pending_observation_ns[hook_id] == 0 &&
@@ -8609,6 +8649,9 @@ peak_general_listener_init(PeakGeneralListener* self)
         .active_close = peak_general_listener_fast_active_close,
         .active_reset = peak_general_listener_fast_active_reset,
         .user_data = self,
+#if PEAK_HAVE_NATIVE_PAUSED_ENTRY
+        .native_pause = &self->native_pause,
+#endif
         .listener_instance = GUM_INVOCATION_LISTENER(self),
 #if defined(__APPLE__)
         .dispatch_start = NULL,
@@ -8662,6 +8705,33 @@ peak_general_listener_init(PeakGeneralListener* self)
         self->checkpoint_shadow_mapping_size = 0;
         return;
     }
+#if PEAK_HAVE_NATIVE_PAUSED_ENTRY
+    self->native_pause = (GumPeakNativePause){
+        .enabled = peak_native_calibration_valid,
+        .paused = (volatile gint *)&self->soft_paused,
+        .initial_remaining = (volatile guint *)&self->initial_observation_remaining,
+        .callbacks_suspended = (volatile gint *)&peak_general_callbacks_suspended,
+        .rent_base = (guint8 *)self->fast_active + 40,
+        .calls_base = peak_budget_cost_lanes ? (guint8 *)peak_budget_cost_lanes + 6 * sizeof(uint64_t) : NULL,
+        .rent_ns = peak_native_ignored_rent_ns,
+        .capacity = self->fast_stats_capacity,
+#define TLS_OFFSET(v) ((gssize)peak_native_tls_offset(&(v)))
+        .tls_initialized = TLS_OFFSET(thread_data.initialized),
+        .tls_mapped_valid = TLS_OFFSET(thread_data.self_mapped_valid),
+        .tls_in_callback = TLS_OFFSET(thread_data.in_callback),
+        .tls_ignore = TLS_OFFSET(thread_data.fast_ignore_level),
+        .tls_slot = TLS_OFFSET(thread_data.self_mapped_id),
+        .tls_excluded = pthread_listener_native_exclusion_offset(),
+#ifdef HAVE_MPI
+        .tls_inside = peak_mpi_application_active_offset != NULL ?
+            peak_mpi_application_active_offset() : -1,
+#else
+        .tls_inside = -1,
+#endif
+        .tls_registered = TLS_OFFSET(peak_budget_lane_registered),
+#undef TLS_OFFSET
+    };
+#endif
     self->checkpoint_shadow = NULL;
     self->checkpoint_shadow_mapping_size = 0;
     if (peak_exec_checkpoint_enabled_at_startup != NULL &&
@@ -8808,8 +8878,13 @@ peak_general_overhead_bootstrapping()
 
     const guint n_tests = 1000;
     const guint calls_per_test = 32;
-    double* time = g_new(double, n_tests * 5);
+    double* time = g_new(double, n_tests * 6);
     gboolean ignored_clock_valid = calibrate_soft;
+    gboolean native_clock_valid = FALSE;
+#if PEAK_HAVE_NATIVE_PAUSED_ENTRY
+    native_clock_valid = calibrate_soft;
+#endif
+    gboolean native_path_observed = FALSE;
     PEAKGENERAL_LISTENER(listener_bootstrapping)->soft_pause_calibration = calibrate_soft;
     for (guint i = 0; i < n_tests; i++) {
         time[n_tests + i] = peak_second();
@@ -8842,6 +8917,22 @@ peak_general_overhead_bootstrapping()
             time[n_tests * 4 + i] = (double)(end - start) / 1e9 / calls_per_test;
         }
         __atomic_store_n(&paused->fast_listener.enabled, fast_enabled, __ATOMIC_RELEASE);
+#if PEAK_HAVE_NATIVE_PAUSED_ENTRY
+        uint64_t native_before = peak_general_listener_native_ignored_calls();
+        __atomic_store_n(&paused->native_pause.enabled, 1, __ATOMIC_RELEASE);
+        for (guint i = 0; i < n_tests; i++) {
+            unsigned long long start = 0, end = 0;
+            native_clock_valid &= peak_general_listener_thread_cpu_ns(&start);
+            for (guint call = 0; call < calls_per_test; call++)
+                peak_general_overhead_dummy_func();
+            native_clock_valid &= peak_general_listener_thread_cpu_ns(&end) && end >= start;
+            time[n_tests * 5 + i] = (double)(end - start) / 1e9 / calls_per_test;
+        }
+        uint64_t native_after = peak_general_listener_native_ignored_calls();
+        native_path_observed = native_after >= native_before &&
+            native_after - native_before == (uint64_t)n_tests * calls_per_test;
+        __atomic_store_n(&paused->native_pause.enabled, 0, __ATOMIC_RELEASE);
+#endif
         paused->soft_pause_calibration = FALSE;
     }
     double closing_probe_started = peak_second();
@@ -8924,6 +9015,14 @@ peak_general_overhead_bootstrapping()
         peak_general_ignored_overhead = MAX(peak_general_overhead, peak_general_overhead_floor);
         peak_general_generic_ignored_overhead = peak_general_ignored_overhead;
     }
+#if PEAK_HAVE_NATIVE_PAUSED_ENTRY
+    if (calibrate_soft) peak_native_ignored_overhead = median_double(&time[n_tests * 5], n_tests) -
+        median_double(&time[n_tests * 3], n_tests);
+#endif
+    peak_native_calibration_valid = peak_soft_calibration_valid && native_clock_valid && native_path_observed &&
+        isfinite(peak_native_ignored_overhead) && peak_native_ignored_overhead > 0;
+    peak_native_ignored_rent_ns = peak_native_calibration_valid ?
+        peak_budget_cost_ns(1, peak_native_ignored_overhead) : 0;
     peak_ignored_rent_fast_ns = peak_budget_cost_ns(1, peak_general_ignored_overhead);
     peak_ignored_rent_generic_ns = peak_budget_cost_ns(1, peak_general_generic_ignored_overhead);
     g_free(time);
@@ -9076,7 +9175,7 @@ peak_general_listener_attach()
             if (posix_memalign(&lanes, 64, sizeof(PeakBudgetCostLane) * peak_max_num_threads) == 0) {
                 peak_budget_cost_lanes = lanes;
                 for (size_t t = 0; t < peak_max_num_threads; ++t)
-                    for (unsigned k = 0; k < 6; ++k)
+                    for (unsigned k = 0; k < 8; ++k)
                         atomic_init(&peak_budget_cost_lanes[t].calls[k], 0);
                 for (size_t t = 0; t < peak_max_num_threads; ++t)
                     atomic_init(&peak_budget_cost_lanes[t].inflight, 0);
@@ -9086,7 +9185,7 @@ peak_general_listener_attach()
     peak_general_listener_configure_detach_threshold();
     if (peak_budget_cost_lanes != NULL)
         for (size_t t = 0; t < peak_max_num_threads; ++t)
-            for (unsigned k = 0; k < 6; ++k)
+            for (unsigned k = 0; k < 8; ++k)
                 atomic_store_explicit(&peak_budget_cost_lanes[t].calls[k], 0, memory_order_relaxed);
     else
         peak_soft_calibration_valid = FALSE;
@@ -10368,7 +10467,7 @@ peak_general_listener_write_global_budget_diagnostics(gboolean settled)
         uint64_t ignored_calls = 0;
         size_t used_slots = atomic_load_explicit(&peak_budget_lane_highwater, memory_order_acquire);
         for (size_t t = 0; peak_budget_cost_lanes != NULL && t < used_slots; ++t)
-            for (unsigned k = 2; k < 6; ++k) {
+            for (unsigned k = 2; k < 8; ++k) {
                 uint64_t n = atomic_load_explicit(&peak_budget_cost_lanes[t].calls[k], memory_order_relaxed);
                 ignored_calls = UINT64_MAX - ignored_calls < n ? UINT64_MAX : ignored_calls + n;
             }
@@ -10377,6 +10476,8 @@ peak_general_listener_write_global_budget_diagnostics(gboolean settled)
             peak_general_listener_ignored_seconds(), peak_general_ignored_overhead,
             peak_general_generic_ignored_overhead,
             (unsigned long long)used_slots, peak_general_listener_inside_seconds());
+        peak_log_report("[peak] native paused admission: calibrated=%d ignored_per_call_seconds=%.17g\n",
+            peak_native_calibration_valid, peak_native_ignored_overhead);
         peak_log_report("[peak] MPI closing forecast: per_window_seconds=%.9g targets=%llu windows=%llu total_seconds=%.9g\n",
             peak_global_closing_window_seconds,
             (unsigned long long)peak_global_closing_target_count,
