@@ -366,6 +366,7 @@ static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 /* An admission quote belongs to the next controller scan, including when
  * a partial initial batch already left physical targets active. */
 static atomic_bool peak_global_admission_waiting;
+static atomic_bool peak_rental_dirty;
 /* Read by the transport helper without taking the controller/listener lock. */
 bool peak_global_budget_listener_admission_waiting(void)
 {
@@ -626,7 +627,7 @@ peak_general_listener_controller_wake(void)
 }
 
 static void
-peak_general_listener_controller_wait(int expected_wake_sequence)
+peak_general_listener_controller_wait(int expected_wake_sequence, gboolean timed)
 {
     const struct timespec timeout = {
         .tv_sec = 0,
@@ -640,12 +641,13 @@ peak_general_listener_controller_wait(int expected_wake_sequence)
         (long)peak_general_listener_controller_wake_futex_word(),
         (long)(FUTEX_WAIT | FUTEX_PRIVATE_FLAG),
         (long)expected_wake_sequence,
-        (long)&timeout,
+        timed ? (long)&timeout : 0L,
         0L,
         0L);
     errno = saved_errno;
 #else
     (void)expected_wake_sequence;
+    (void)timed;
     (void)nanosleep(&timeout, NULL);
 #endif
 }
@@ -1450,6 +1452,7 @@ void pthread_pause_disable(void);
 _Static_assert(PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE == (1u << GUM_PEAK_NATIVE_RENT_LANE_SHIFT), "native assembly rent stride");
 #endif
 _Static_assert(offsetof(PeakBurstBudgetSlot, generation) == 0, "native rent word offset");
+_Static_assert(offsetof(PeakBurstBudgetSlot, calls) == 16, "native ignored stride offset");
 _Static_assert(sizeof(PeakBurstBudgetSlot) <= 24,
                "burst state must fit unused callback cache-line tail");
 
@@ -5420,9 +5423,9 @@ peak_general_controller_publish_detach_count_requests_unlocked(
     uint64_t rental_ns = 0;
     gboolean rental_work = peak_global_configured && peak_soft_calibration_valid &&
         !atomic_load(&peak_global_retiring) && rental_view != NULL &&
-        atomic_load_explicit(&peak_global_admission_waiting, memory_order_acquire);
+        atomic_exchange_explicit(&peak_rental_dirty, false, memory_order_acq_rel);
     unsigned long long rental_cpu_start = 0, rental_cpu_end = 0;
-    gboolean rental_cpu_valid = rental_work && peak_general_controller_is_current_thread() &&
+    gboolean rental_cpu_valid = peak_global_configured && peak_general_controller_is_current_thread() &&
         peak_general_listener_thread_cpu_ns(&rental_cpu_start);
     double rental_now = rental_work ? peak_second() : 0;
     gboolean rental_pressure = rental_work &&
@@ -5708,13 +5711,15 @@ peak_general_controller_thread_main(void* arg)
         gboolean runtime_before_valid=control_span.registered && peak_detach_controller_accounting_snapshot(&runtime_before);
         PeakGlobalBudgetView global_view = {0};
         if (peak_global_configured) global_view = peak_global_budget_view();
+        gboolean control_work = classify_control;
         if (global_view.active && global_view.wave > peak_global_applied_wave) {
+            control_work = TRUE;
             peak_global_controller_event(1, &global_view);
             if (global_view.wave_participant)
                 peak_general_controller_request_global_selective_wave_unlocked();
             peak_global_applied_wave = global_view.wave;
         }
-        (void)peak_general_controller_process_pending_unlocked(controller_tid,
+        if (control_work) (void)peak_general_controller_process_pending_unlocked(controller_tid,
                                                                tid_keys,
                                                                mapped_ids,
                                                                pause_session_ids,
@@ -5738,7 +5743,7 @@ peak_general_controller_thread_main(void* arg)
                     MAX(peak_global_closing_window_seconds, peak_detach_controller_last_stop_window_us() / 1e6));
         }
         gboolean runtime_after_valid=control_span.registered && peak_detach_controller_accounting_snapshot(&runtime_after);
-        pending_retry_hint = peak_general_controller_has_pending_unlocked();
+        if (control_work) pending_retry_hint = peak_general_controller_has_pending_unlocked();
         pthread_mutex_unlock(&lock);
         if (control_span.registered) {
             uint64_t runtime_raw=runtime_after_valid?
@@ -5748,22 +5753,23 @@ peak_general_controller_thread_main(void* arg)
             peak_general_listener_runtime_end(&control_span,
                 runtime_raw>=runtime_base?runtime_raw-runtime_base:UINT64_MAX,runtime_raw);
         }
-        /* This hint gates classification only, never controller work. A request
-         * racing the wake/hint snapshot may still mutate in an unwrapped round;
-         * its full raw C remains in the host sample and is conservatively SUM
-         * charged by runtime_observe, rather than retroactively classified. */
+        /* Producers publish before incrementing wake_sequence. A racing wake
+         * prevents futex sleep and is processed in the next round. Pending
+         * physical retries retain their existing bounded timer. */
         if (return_idle) peak_general_listener_finish_idle_return();
         if (peak_global_configured && !global_view.active && peak_global_budget_active())
             peak_general_listener_controller_wake();
 
         dlopen_interceptor_drain_dynamic_attach_queue();
-        peak_jit_provider_drain_pending();
+        gboolean external_retry = peak_jit_provider_drain_pending() ||
+            peak_jit_provider_is_active() || dlopen_interceptor_dynamic_attach_pending();
 
         pthread_mutex_lock(&general_controller_wake_mutex);
         should_run = general_controller_running;
         pthread_mutex_unlock(&general_controller_wake_mutex);
         if (should_run) {
-            peak_general_listener_controller_wait(expected_wake_sequence);
+            peak_general_listener_controller_wait(expected_wake_sequence, pending_retry_hint || external_retry ||
+                pthread_listener_detached_reclamation_pending());
         }
     }
 
@@ -7705,6 +7711,17 @@ peak_general_listener_pressure_cannot_admit(const PeakGlobalBudgetView* view)
 }
 
 static void
+peak_general_listener_rental_notify(void)
+{
+    unsigned long long start = 0, end = 0;
+    gboolean metered = peak_general_listener_thread_cpu_ns(&start);
+    if (!atomic_exchange_explicit(&peak_rental_dirty, true, memory_order_acq_rel))
+        peak_general_listener_controller_wake();
+    if (metered && peak_general_listener_thread_cpu_ns(&end) && end >= start)
+        peak_general_listener_management_cpu_add_saturating(end - start);
+}
+
+static void
 peak_general_listener_pause_for_pressure(PeakGeneralListener* listener)
 {
     unsigned long long cpu_start = 0, cpu_end = 0;
@@ -7742,8 +7759,11 @@ peak_general_listener_take_initial_observation(PeakGeneralListener* listener)
                 memory_order_relaxed);
             /* The next exposure needs a paid closing/operating admission, even
              * if another hook left spendable credit in the shared wallet. */
-            if (remaining == 1 && peak_soft_calibration_valid)
+            if (remaining == 1 && peak_soft_calibration_valid) {
                 peak_general_listener_pause_for_pressure(listener);
+                if (!listener->soft_pause_calibration && !atomic_load(&peak_global_retiring))
+                    peak_general_listener_rental_notify();
+            }
             return TRUE;
         }
     }
@@ -7760,6 +7780,9 @@ peak_general_listener_record_ignored_call(PeakGeneralListener* listener, size_t 
     uint64_t charge = fast ? peak_ignored_rent_fast_ns : peak_ignored_rent_generic_ns;
     __atomic_store_n(counter, UINT64_MAX - old < charge ? UINT64_MAX : old + charge, __ATOMIC_RELAXED);
     peak_general_listener_record_budget_call(index, TRUE, !fast);
+    if (peak_global_configured && !listener->soft_pause_calibration &&
+        peak_burst_budget_due(peak_general_listener_burst_slot(listener, index)))
+        peak_general_listener_rental_notify();
 }
 
 /* The initial prefix is shared by all threads. Thereafter a thread consumes
@@ -8782,7 +8805,8 @@ peak_general_listener_init(PeakGeneralListener* self)
     }
 #if PEAK_HAVE_NATIVE_PAUSED_ENTRY
     self->native_pause = (GumPeakNativePause){
-        .enabled = peak_native_calibration_valid,
+        .enabled = peak_native_calibration_valid ?
+            (1 | (peak_global_configured ? 2 : 0)) : 0,
         .paused = (volatile gint *)&self->soft_paused,
         .initial_remaining = (volatile guint *)&self->initial_observation_remaining,
         .callbacks_suspended = (volatile gint *)&peak_general_callbacks_suspended,
@@ -9634,6 +9658,7 @@ peak_general_listener_test_cumulative_rental_batch(void)
     gboolean saved_configured = peak_global_configured;
     gboolean saved_calibrated = peak_soft_calibration_valid;
     gboolean saved_waiting = atomic_load(&peak_global_admission_waiting);
+    gboolean saved_dirty = atomic_load(&peak_rental_dirty);
     double saved_window = peak_global_closing_window_seconds;
     double saved_overhead = peak_general_overhead;
     int result = 0;
@@ -9668,16 +9693,34 @@ peak_general_listener_test_cumulative_rental_batch(void)
     pending[81] = 64000;
     PeakGlobalBudgetView view = {.active = TRUE, .local_credit_ns = 1000000000,
         .local_closing_reserved_seconds = .001};
+    atomic_store(&peak_rental_dirty, TRUE);
     peak_general_controller_publish_detach_count_requests_unlocked(&view);
     for (size_t i = 0; i < COUNT; ++i)
         if (states[i] != PEAK_HOOK_ATTACHED) result = 1;
     view.local_credit_ns = 0;
     view.local_closing_reserved_seconds = 0;
+    /* Paid-admission waiting alone cannot schedule another rental walk. */
+    peak_general_controller_publish_detach_count_requests_unlocked(&view);
+    for (size_t i = 0; i < COUNT; ++i)
+        if (states[i] != PEAK_HOOK_ATTACHED) result = 3;
+    PeakGeneralListener* ignored = PEAKGENERAL_LISTENER(listeners[0]);
+    PeakBurstBudgetSlot* stride = peak_general_listener_burst_slot(ignored, 0);
+    stride->calls = 0;
+    for (unsigned i = 0; i < 63; ++i)
+        peak_general_listener_record_ignored_call(ignored, 0, TRUE);
+    if (atomic_load(&peak_rental_dirty)) result = 4;
+    peak_general_listener_record_ignored_call(ignored, 0, TRUE);
+    if (!atomic_load(&peak_rental_dirty) || stride->calls != 0) result = 5;
     peak_general_controller_publish_detach_count_requests_unlocked(&view);
     for (size_t i = 0; i < COUNT; ++i) {
         PeakHookState expected = i >= 64 && i < 80 ? PEAK_HOOK_DETACH_REQUESTED : PEAK_HOOK_ATTACHED;
         if (states[i] != expected) result = 2;
     }
+
+    /* Last initial observation rearms even when already softpaused. */
+    atomic_store(&peak_rental_dirty, FALSE);
+    if (!peak_general_listener_take_initial_observation(PEAKGENERAL_LISTENER(listeners[80])) ||
+        !atomic_load(&peak_rental_dirty)) result = 6;
 
     peak_hook_address_count = saved_count;
     peak_max_num_threads = saved_threads;
@@ -9689,6 +9732,7 @@ peak_general_listener_test_cumulative_rental_batch(void)
     peak_global_configured = saved_configured;
     peak_soft_calibration_valid = saved_calibrated;
     atomic_store(&peak_global_admission_waiting, saved_waiting);
+    atomic_store(&peak_rental_dirty, saved_dirty);
     peak_global_closing_window_seconds = saved_window;
     peak_general_overhead = saved_overhead;
     for (size_t i = 0; i < COUNT; ++i) g_object_unref(listeners[i]);

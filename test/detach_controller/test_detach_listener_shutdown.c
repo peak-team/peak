@@ -69,6 +69,12 @@ clear_mpi_launcher_environment(void)
     }
 }
 
+gboolean
+dlopen_interceptor_dynamic_attach_pending(void)
+{
+    return FALSE;
+}
+
 void
 dlopen_interceptor_drain_dynamic_attach_queue(void)
 {

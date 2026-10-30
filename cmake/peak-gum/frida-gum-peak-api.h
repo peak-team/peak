@@ -105,7 +105,7 @@ typedef struct _GumPeakFastListener {
     GumPeakNativePause * native_pause;
 } GumPeakFastListener;
 
-#define GUM_PEAK_FAST_LISTENER_VERSION 9u
+#define GUM_PEAK_FAST_LISTENER_VERSION 10u
 
 GUM_API gboolean gum_interceptor_peak_invocation_stack_entry_matches(
     guint depth,

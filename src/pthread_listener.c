@@ -612,6 +612,17 @@ pthread_listener_reclaim_interval_elapsed(const struct timespec* now)
 }
 
 gboolean
+pthread_listener_detached_reclamation_pending(void)
+{
+#if defined(__linux__)
+    return tid_mapping_initialized && pthread_task_directory_fd >= 0 &&
+        peak_pthread_slot_registry_exit_pending_count(&pthread_slot_registry, NULL) != 0;
+#else
+    return FALSE;
+#endif
+}
+
+gboolean
 pthread_listener_reclaim_detached_slots(void)
 {
 #if defined(__linux__)

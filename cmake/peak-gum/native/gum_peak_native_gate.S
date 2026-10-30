@@ -31,7 +31,7 @@ jne .Lfallback
 movq CTX_FAST(%r10),%r11
 testq %r11,%r11
 jz .Lfallback
-cmpl $9,FD_VERSION(%r11)
+cmpl $10,FD_VERSION(%r11)
 jne .Lfallback
 cmpl $0,FD_ENABLED(%r11)
 je .Lfallback
@@ -80,8 +80,22 @@ movq N_TLS_SLOT(%r11),%rax
 movq (%r10,%rax),%rcx
 cmpq N_CAPACITY(%r11),%rcx
 jae .Lfallback
-/* One writer owns this slot. The existing callback guard excludes signals. */
+/* The shared ignored stride advances in native and C. On the boundary C
+ * accounts this call at its real tier and emits one coalesced notification. */
+movq %rcx,%rdx
+shlq $N_RENT_SHIFT,%rdx
+addq N_RENT_BASE(%r11),%rdx
+/* Own the callback guard before reading mutable single-writer state. */
 movl $1,(%r8)
+cmpl $63,N_RENT_CALLS(%rdx)
+jne .Lstride_native
+testl $2,N_ENABLED(%r11)
+jnz .Lnotify_fallback
+.Lstride_native:
+movl N_RENT_CALLS(%rdx),%eax
+addl $1,%eax
+andl $63,%eax
+movl %eax,N_RENT_CALLS(%rdx)
 movq %rcx,%rdx
 shlq $N_RENT_SHIFT,%rdx
 addq N_RENT_BASE(%r11),%rdx
@@ -128,6 +142,10 @@ popfq
 leaq 16(%rsp),%rsp
 .cfi_adjust_cfa_offset -16
 notrack jmp *-16(%rsp)
+/* Only this path owns the guard; early fallback may belong to an outer callback. */
+.Lnotify_fallback:
+.cfi_def_cfa_offset 80
+movl $0,(%r8)
 /* Keep original normal-Gum ctx stack word, remove only extra thunk word. */
 .Lfallback:
 .cfi_def_cfa_offset 80
@@ -183,7 +201,7 @@ add x14,x9,#CTX_FAST
 ldar x10,[x14]
 cbz x10,.Lfallback\@
 ldr w14,[x10,#FD_VERSION]
-cmp w14,#9
+cmp w14,#10
 b.ne .Lfallback\@
 add x14,x10,#FD_ENABLED
 ldar w14,[x14]
@@ -235,8 +253,19 @@ ldr x13,[x11,x14]
 ldr x14,[x10,#N_CAPACITY]
 cmp x13,x14
 b.hs .Lfallback\@
+ldr x15,[x10,#N_RENT_BASE]
+add x15,x15,x13,lsl #N_RENT_SHIFT
 mov w14,#1
 str w14,[x12]
+ldr w14,[x15,#N_RENT_CALLS]
+cmp w14,#63
+b.ne .Lstride_native\@
+ldr w9,[x10,#N_ENABLED]
+tbnz w9,#1,.Lnotify_fallback\@
+.Lstride_native\@:
+add w14,w14,#1
+and w14,w14,#63
+str w14,[x15,#N_RENT_CALLS]
 ldr x15,[x10,#N_RENT_BASE]
 add x15,x15,x13,lsl #N_RENT_SHIFT
 ldr x14,[x15]
@@ -261,6 +290,8 @@ str wzr,[x12]
 ldr x9,[sp,#64]
 ldr x\ip,[x9,#CTX_INVOKE]
 b .Lrestore_native\@
+.Lnotify_fallback\@:
+str wzr,[x12]
 .Lfallback\@:
 ldr x\ip,[sp,#72]
 b .Lrestore_fallback\@

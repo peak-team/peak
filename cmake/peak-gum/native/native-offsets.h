@@ -28,5 +28,6 @@
 #define N_TLS_REGISTERED 120
 #define N_COST_SHIFT 7
 #define N_RENT_SHIFT 6
+#define N_RENT_CALLS 16
 
 #endif /* PEAK_NATIVE_OFFSETS_H */

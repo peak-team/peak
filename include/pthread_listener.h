@@ -113,6 +113,7 @@ gboolean pthread_listener_current_thread_excluded(void);
 
 /** Runs one bounded Linux detached-thread reclamation pass on a slow path. */
 gboolean pthread_listener_reclaim_detached_slots(void);
+gboolean pthread_listener_detached_reclamation_pending(void);
 
 /** Copies detached-thread reclamation counters and configured scan bounds. */
 PEAK_PTHREAD_LISTENER_API void pthread_listener_get_reclamation_diagnostics(

@@ -100,6 +100,7 @@ void dlopen_interceptor_enable_dynamic_attach(void);
  * module-owned queue entries.
  */
 void dlopen_interceptor_drain_dynamic_attach_queue(void);
+gboolean dlopen_interceptor_dynamic_attach_pending(void);
 
 /**
  * @brief Closes callback admission and releases dynamic attach work.
