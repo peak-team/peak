@@ -138,6 +138,49 @@ static void check_coalesced_partial_write(void)
     read_frame_done(&receiver);close(sockets[0]);close(sockets[1]);
 }
 
+static void check_broker_readiness(void)
+{
+#if defined(__linux__)
+    ServiceStorage *storage = service_storage_new(1);
+    assert(storage);
+    service_waiter_init(storage, true);
+    assert(storage->epoll_fd >= 0);
+    for (unsigned i = 0; i < 4; ++i) storage->ready[i].fd = -1;
+    int sockets[2]; assert(!socketpair(AF_UNIX, SOCK_STREAM, 0, sockets));
+    int original = sockets[0];
+    storage->ready[3] = (struct pollfd){original, POLLIN, 0};
+    assert(!service_wait(storage, 0));
+    assert(write(sockets[1], "a", 1) == 1);
+    assert(service_wait(storage, 100) == 1 && (storage->ready[3].revents & POLLIN));
+    char byte; assert(read(original, &byte, 1) == 1 && byte == 'a');
+    storage->ready[3].events |= POLLOUT;
+    assert(service_wait(storage, 0) == 1 && (storage->ready[3].revents & POLLOUT));
+    storage->ready[3].events = POLLIN;
+    assert(!service_wait(storage, 0)); /* No permanently writable busy loop. */
+    assert(!shutdown(sockets[1], SHUT_WR));
+    assert(service_wait(storage, 100) == 1 && (storage->ready[3].revents & POLLHUP));
+    assert(read(original, &byte, 1) == 0);
+    service_waiter_forget(storage, 3);
+    close(sockets[0]); close(sockets[1]);
+    assert(!socketpair(AF_UNIX, SOCK_STREAM, 0, sockets));
+    if (sockets[0] != original) {
+        assert(dup2(sockets[0], original) == original);
+        close(sockets[0]); sockets[0] = original;
+    }
+    storage->ready[3] = (struct pollfd){original, POLLIN, 0};
+    assert(write(sockets[1], "b", 1) == 1);
+    assert(service_wait(storage, 100) == 1 && (storage->ready[3].revents & POLLIN));
+    assert(read(original, &byte, 1) == 1 && byte == 'b');
+    /* Backend failure retains the original poll behavior, including readiness. */
+    close(storage->epoll_fd);
+    assert(write(sockets[1], "c", 1) == 1);
+    assert(service_wait(storage, 100) == 1 && (storage->ready[3].revents & POLLIN));
+    assert(storage->epoll_fd == -1);
+    close(sockets[0]); close(sockets[1]);
+    service_storage_free(storage);
+#endif
+}
+
 static void check_metadata_prefetch(void)
 {
     atomic_store(&owner,getpid());atomic_store(&running,true);
@@ -910,6 +953,7 @@ int main(void)
 {
     check_wire_format();
     check_coalesced_partial_write();
+    check_broker_readiness();
     check_metadata_prefetch();
     check_reply_snapshot_order();
     check_required_vs_desired();

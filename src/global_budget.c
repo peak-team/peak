@@ -22,6 +22,7 @@
 #include <sys/socket.h>
 #include <sys/uio.h>
 #if defined(__linux__)
+#include <sys/epoll.h>
 #include <sys/syscall.h>
 #include "internal/exec_raw_syscall.h"
 #endif
@@ -99,11 +100,108 @@ typedef struct {
     Rank *ranks;
     struct pollfd *ready;
     bool *reply_dirty;
+#if defined(__linux__)
+    int epoll_fd;
+    struct pollfd *registered;
+    struct epoll_event *epoll_events;
+#endif
 } ServiceStorage;
+
+static void service_waiter_clear(ServiceStorage *storage)
+{
+#if defined(__linux__)
+    if (storage->epoll_fd >= 0) close(storage->epoll_fd);
+    storage->epoll_fd = -1;
+    free(storage->registered); storage->registered = NULL;
+    free(storage->epoll_events); storage->epoll_events = NULL;
+#else
+    (void)storage;
+#endif
+}
+
+static void service_waiter_init(ServiceStorage *storage, bool native_broker)
+{
+#if defined(__linux__)
+    if (!native_broker) return;
+    size_t count = (size_t)storage->peers_count + 3;
+    if (count > SIZE_MAX / sizeof(*storage->epoll_events)) return;
+    storage->registered = calloc(count, sizeof(*storage->registered));
+    storage->epoll_events = calloc(count, sizeof(*storage->epoll_events));
+    storage->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+    if (!storage->registered || !storage->epoll_events || storage->epoll_fd < 0) {
+        service_waiter_clear(storage);
+        return;
+    }
+    for (size_t i = 0; i < count; ++i) storage->registered[i].fd = -1;
+#else
+    (void)storage; (void)native_broker;
+#endif
+}
+
+/* Forget before close: a replacement socket can reuse the same integer FD. */
+static void service_waiter_forget(ServiceStorage *storage, size_t slot)
+{
+#if defined(__linux__)
+    if (storage->epoll_fd < 0 || storage->registered[slot].fd < 0) return;
+    if (epoll_ctl(storage->epoll_fd, EPOLL_CTL_DEL,
+                  storage->registered[slot].fd, NULL) && errno != ENOENT && errno != EBADF) {
+        service_waiter_clear(storage);
+        return;
+    }
+    storage->registered[slot] = (struct pollfd){.fd = -1};
+#else
+    (void)storage; (void)slot;
+#endif
+}
+
+static int service_wait(ServiceStorage *storage, int timeout)
+{
+    size_t count = (size_t)storage->peers_count + 3;
+#if defined(__linux__)
+    if (storage->epoll_fd >= 0) {
+        for (size_t i = 0; i < count; ++i) {
+            struct pollfd *wanted = &storage->ready[i], *old = &storage->registered[i];
+            wanted->revents = 0;
+            if (old->fd != wanted->fd) service_waiter_forget(storage, i);
+            if (storage->epoll_fd < 0) break;
+            old = &storage->registered[i];
+            if (wanted->fd < 0 || (old->fd == wanted->fd && old->events == wanted->events)) continue;
+            struct epoll_event event = {.data.u64 = i,
+                .events = EPOLLRDHUP | ((wanted->events & POLLIN) ? EPOLLIN : 0) |
+                    ((wanted->events & POLLOUT) ? EPOLLOUT : 0)};
+            if (epoll_ctl(storage->epoll_fd, old->fd < 0 ? EPOLL_CTL_ADD : EPOLL_CTL_MOD,
+                          wanted->fd, &event)) {
+                service_waiter_clear(storage);
+                break;
+            }
+            *old = *wanted;
+        }
+        if (storage->epoll_fd >= 0) {
+            int maximum = count > INT_MAX ? INT_MAX : (int)count;
+            int result = epoll_wait(storage->epoll_fd, storage->epoll_events, maximum, timeout);
+            if (result >= 0) {
+                for (int i = 0; i < result; ++i) {
+                    struct epoll_event *event = &storage->epoll_events[i];
+                    struct pollfd *ready = &storage->ready[event->data.u64];
+                    ready->revents |= ((event->events & EPOLLIN) ? POLLIN : 0) |
+                        ((event->events & EPOLLOUT) ? POLLOUT : 0) |
+                        ((event->events & (EPOLLHUP | EPOLLRDHUP)) ? POLLHUP : 0) |
+                        ((event->events & EPOLLERR) ? POLLERR : 0);
+                }
+                return result;
+            }
+            if (errno == EINTR) return result;
+            service_waiter_clear(storage);
+        }
+    }
+#endif
+    return poll(storage->ready, (nfds_t)count, timeout);
+}
 
 static void service_storage_free(ServiceStorage *storage)
 {
     if (!storage) return;
+    service_waiter_clear(storage);
     free(storage->peers);
     free(storage->ranks);
     free(storage->ready);
@@ -119,6 +217,9 @@ static ServiceStorage *service_storage_new(unsigned count)
         return NULL;
     ServiceStorage *storage = calloc(1, sizeof(*storage));
     if (!storage) return NULL;
+#if defined(__linux__)
+    storage->epoll_fd = -1;
+#endif
     storage->peers_count = count;
     if (count) {
         storage->peers = calloc(count, sizeof(*storage->peers));
@@ -1091,11 +1192,12 @@ static bool header(const Frame *f)
 {
     return f->magic == MAGIC && f->version == PROTOCOL_VERSION && f->nonce == job_nonce && f->rank < world && f->size == world;
 }
-static bool disconnect(Peer *p, Rank *ranks)
+static bool disconnect(Peer *p, Rank *ranks, ServiceStorage *storage)
 {
     bool clean_final = p->rank >= 0 && p->final_sent && ranks[p->rank].latest.final;
     if (clean_final) record_event('C', (unsigned)p->rank, 0, 0, (double)ranks[p->rank].latest.sequence);
     if (p->rank >= 0) ranks[p->rank].connected = false;
+    service_waiter_forget(storage, (size_t)(p - storage->peers) + 3);
     close_fd(&p->fd);
     read_frame_done(p); free(p->outgoing_payload); p->outgoing_payload = NULL;
     return clean_final;
@@ -1617,6 +1719,7 @@ static void *service(void *data)
     struct pollfd *ready = storage->ready;
     bool *reply_dirty = storage->reply_dirty;
     unsigned peers_count = storage->peers_count;
+    service_waiter_init(storage, broker_only);
     double start = seconds_now(), transport_cpu = 0, span = 0, wave_start = 0;
     uint64_t wave = 0, reply_sequence = 0, received_reply = 0, last_wave = 0, completed_wave = 0, message_sequence = 0;
     bool wave_pending = false, idle_returned = false, final_announced = false, recheck_root = false;
@@ -1662,7 +1765,7 @@ static void *service(void *data)
             ready[i + 3] = (struct pollfd){(rank_id == 0 && !native_client) ? peers[i].fd : -1, POLLIN | (peers[i].pending ? POLLOUT : 0), 0};
         int timeout = broker_only ? (recheck_root ? 0 : (broken ? 10 : deadline_timeout(now_ns, next_round))) : service_poll_timeout(&local, last_request_target, recheck_root, broken, now_ns);
         recheck_root = false;
-        (void)poll(ready, (nfds_t)peers_count + 3, timeout);
+        (void)service_wait(storage, timeout);
         now_ns = ns_now(CLOCK_MONOTONIC);
         PeakMpiRuntimeSpan transport_span={0};
         uint64_t transport_span_cpu=0;
@@ -1686,20 +1789,20 @@ static void *service(void *data)
             for (unsigned i = 0; i < world; ++i) if (peers[i].fd >= 0 && (ready[i + 3].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))) {
                 Peer *p = &peers[i];
                 int result = read_frame(p);
-                if (result < 0) { if (!disconnect(p, ranks)) broken = true; continue; }
+                if (result < 0) { if (!disconnect(p, ranks, storage)) broken = true; continue; }
                 if (result != 1) continue;
                 Frame f = p->incoming;
                 if (!header(&f) || f.sample.completed_wave > wave || (p->rank >= 0 && (unsigned)p->rank != f.rank) ||
                     (p->rank < 0 && ranks[f.rank].seen)) {
-                    (void)disconnect(p, ranks); broken = true; continue;
+                    (void)disconnect(p, ranks, storage); broken = true; continue;
                 }
                 Rank *r = &ranks[f.rank];
                 if (r->seen && f.message_sequence <= r->message_sequence) continue;
                 if (!f.message_sequence || (r->seen && f.sample.sequence < r->latest.sequence)) {
-                    (void)disconnect(p, ranks); broken = true; continue;
+                    (void)disconnect(p, ranks, storage); broken = true; continue;
                 }
                 if (f.minimum_ns>f.requested_ns || !root_metadata_valid(&f)) {
-                    (void)disconnect(p, ranks);
+                    (void)disconnect(p, ranks, storage);
                     broken = true;
                     continue;
                 }
@@ -1721,18 +1824,18 @@ static void *service(void *data)
                     atomic_store(&startup_sealed, f.root_startup_sealed);
                 }
                 r->message_sequence = f.message_sequence;
-                if (f.demand_generation < r->demand_generation) { (void)disconnect(p, ranks); broken = true; continue; }
+                if (f.demand_generation < r->demand_generation) { (void)disconnect(p, ranks, storage); broken = true; continue; }
                 r->wants_credit = f.request_credit && !f.sample.retiring; r->requested_ns = f.requested_ns; r->minimum_ns=f.minimum_ns;
                 if (f.demand_generation != r->demand_generation) record_event('R', f.rank, f.demand_generation, wave, (double)f.requested_ns / 1e9);
                 r->demand_generation = f.demand_generation;
-                if (f.sample.settled_control_credit_ns > f.consumed_control_ns || f.sample.settled_frontend_credit_ns > f.consumed_frontend_ns || !valid_sample(&f.sample, r)) { (void)disconnect(p, ranks); broken = true; continue; }
+                if (f.sample.settled_control_credit_ns > f.consumed_control_ns || f.sample.settled_frontend_credit_ns > f.consumed_frontend_ns || !valid_sample(&f.sample, r)) { (void)disconnect(p, ranks, storage); broken = true; continue; }
                 p->rank = (int)f.rank;
                 if (!f.sample.initial_unexposed) r->grace_exposed = true;
                 if (f.consumed_profile_ns < r->profile_ns || f.consumed_control_ns < r->control_ns || f.consumed_frontend_ns < r->frontend_ns || f.returned_ns < r->returned_ns ||
                     f.consumed_profile_ns > r->credit_total_ns || f.consumed_control_ns > r->credit_total_ns - f.consumed_profile_ns ||
                     f.consumed_frontend_ns > r->credit_total_ns - f.consumed_profile_ns - f.consumed_control_ns ||
                     f.returned_ns > r->credit_total_ns - f.consumed_profile_ns - f.consumed_control_ns - f.consumed_frontend_ns) {
-                    (void)disconnect(p, ranks); broken = true; continue;
+                    (void)disconnect(p, ranks, storage); broken = true; continue;
                 }
                 r->returned_ns = f.returned_ns;
                 if (f.sample.closing_seconds > r->closing_estimate) r->closing_estimate = f.sample.closing_seconds;
@@ -1758,7 +1861,7 @@ static void *service(void *data)
             for (unsigned i = 0; i < world; ++i)
                 if (peers[i].fd >= 0 && now_ns > peers[i].last_activity &&
                     now_ns - peers[i].last_activity > freshness_ns(background) * 2) {
-                    if (!disconnect(&peers[i], ranks)) broken = true;
+                    if (!disconnect(&peers[i], ranks, storage)) broken = true;
                 }
             bool all = !broken, all_final = !broken, unfunded = false, done = wave != 0;
             double broker_cpu=(double)broker_cpu_last/1e9;
@@ -1950,7 +2053,7 @@ static void *service(void *data)
             }
             for (unsigned i = 0; i < world; ++i) if (peers[i].fd >= 0) {
                 bool pending = peers[i].pending;
-                if (write_frame(&peers[i]) && !disconnect(&peers[i], ranks)) broken = true;
+                if (write_frame(&peers[i]) && !disconnect(&peers[i], ranks, storage)) broken = true;
                 if (pending && !peers[i].pending && reply_dirty[i]) recheck_root = true;
             }
             bool sent_all = root_all_final;

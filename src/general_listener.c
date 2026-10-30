@@ -5543,6 +5543,9 @@ peak_general_controller_thread_main(void* arg)
     peak_general_listener_fast_ignore_current_thread();
     gum_interceptor_ignore_current_thread(interceptor);
 
+    gboolean first_control_round = TRUE;
+    gboolean pending_retry_hint = FALSE;
+    int last_handled_wake_sequence = 0;
     for (;;) {
         gboolean should_run;
         int expected_wake_sequence;
@@ -5567,9 +5570,15 @@ peak_general_controller_thread_main(void* arg)
         expected_wake_sequence =
             atomic_load_explicit(&general_controller_wake_sequence,
                                  memory_order_acquire);
+        gboolean classify_control = first_control_round || pending_retry_hint ||
+            expected_wake_sequence != last_handled_wake_sequence;
+        first_control_round = FALSE;
+        last_handled_wake_sequence = expected_wake_sequence;
 
         (void)pthread_listener_reclaim_detached_slots();
-        PeakMpiRuntimeSpan control_span=peak_general_listener_runtime_begin(PEAK_RUNTIME_CONTROL);
+        PeakMpiRuntimeSpan control_span = {0};
+        if (classify_control)
+            control_span = peak_general_listener_runtime_begin(PEAK_RUNTIME_CONTROL);
         pthread_mutex_lock(&lock);
         PeakDetachAccountingSnapshot runtime_before={0},runtime_after={0};
         gboolean runtime_before_valid=control_span.registered && peak_detach_controller_accounting_snapshot(&runtime_before);
@@ -5605,13 +5614,20 @@ peak_general_controller_thread_main(void* arg)
                     MAX(peak_global_closing_window_seconds, peak_detach_controller_last_stop_window_us() / 1e6));
         }
         gboolean runtime_after_valid=control_span.registered && peak_detach_controller_accounting_snapshot(&runtime_after);
+        pending_retry_hint = peak_general_controller_has_pending_unlocked();
         pthread_mutex_unlock(&lock);
-        uint64_t runtime_raw=runtime_after_valid?
-            peak_general_listener_control_wall_ns_since_heartbeat(&runtime_after):UINT64_MAX;
-        uint64_t runtime_base=runtime_before_valid?
-            peak_general_listener_control_wall_ns_since_heartbeat(&runtime_before):UINT64_MAX;
-        peak_general_listener_runtime_end(&control_span,
-            runtime_raw>=runtime_base?runtime_raw-runtime_base:UINT64_MAX,runtime_raw);
+        if (control_span.registered) {
+            uint64_t runtime_raw=runtime_after_valid?
+                peak_general_listener_control_wall_ns_since_heartbeat(&runtime_after):UINT64_MAX;
+            uint64_t runtime_base=runtime_before_valid?
+                peak_general_listener_control_wall_ns_since_heartbeat(&runtime_before):UINT64_MAX;
+            peak_general_listener_runtime_end(&control_span,
+                runtime_raw>=runtime_base?runtime_raw-runtime_base:UINT64_MAX,runtime_raw);
+        }
+        /* This hint gates classification only, never controller work. A request
+         * racing the wake/hint snapshot may still mutate in an unwrapped round;
+         * its full raw C remains in the host sample and is conservatively SUM
+         * charged by runtime_observe, rather than retroactively classified. */
         if (return_idle) peak_general_listener_finish_idle_return();
         if (peak_global_configured && !global_view.active && peak_global_budget_active())
             peak_general_listener_controller_wake();
