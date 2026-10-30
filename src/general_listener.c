@@ -3216,6 +3216,7 @@ peak_general_listener_soft_heartbeat_unlocked(const PeakGlobalBudgetSample* samp
     uint64_t headroom = view.local_credit_ns;
     uint64_t operating = peak_global_admission_seconds_ns(MAX(
         PEAK_BURST_BUDGET_STRIDE * peak_general_overhead, operating_seconds));
+    uint64_t lease = peak_budget_cost_ns(PEAK_BURST_BUDGET_STRIDE, peak_general_overhead);
     gboolean wake = FALSE, waiting = physical_admission_ns != 0;
     gboolean promised_observation = FALSE;
     for (size_t i = 0; i < peak_hook_address_count; ++i) {
@@ -3236,16 +3237,22 @@ peak_general_listener_soft_heartbeat_unlocked(const PeakGlobalBudgetSample* samp
         }
         gboolean cost_acknowledged = view.acknowledged_sequence >= required_sample &&
             peak_global_settled_control_credit_ns == peak_global_budget_control_consumed_ns();
-        gboolean nominal_funded = view.budget_seconds >= view.global_spent_seconds +
-            view.reserved_seconds + view.control_reserve_seconds;
+        unsigned long long callback_control = atomic_load_explicit(
+            &listener->callback_hook_control, memory_order_acquire);
+        gboolean no_close_pending =
+            peak_general_listener_callback_hook_state(callback_control) == PEAK_HOOK_ATTACHED &&
+            !(callback_control & (PEAK_CALLBACK_BURST_REQUEST_BIT |
+                                  PEAK_CALLBACK_DETACH_COUNT_REQUEST_BIT));
+        gboolean reserved_lease = view.active && view.root_completed_wave >= view.wave &&
+            no_close_pending && view.local_closing_reserved_seconds >= closing_required &&
+            lease != UINT64_MAX && headroom >= lease;
         /* A complete accepted cost/closing snapshot follows every mutation.
          * The callback gate still debits each real lease atomically after this
          * admission check, so simultaneous resumed hooks cannot overspend. */
-        if (view.active && view.root_completed_wave >= view.wave &&
-            cost_acknowledged && view.local_closing_reserved_seconds >= closing_required &&
-            nominal_funded &&
-            operating != UINT64_MAX && headroom >= operating) {
-            headroom -= operating;
+        if (cost_acknowledged && reserved_lease) {
+            /* Existing operating cash moves R to S at the callback's atomic
+             * lease debit; nominal debt cannot increase that commitment. */
+            headroom -= lease;
             peak_hook_pending_observation_ns[i] = 0;
             peak_global_idle_returned = FALSE;
             atomic_store(&listener->ignored_rent_base_ns, peak_general_listener_ignored_rent_ns(listener));
@@ -3253,10 +3260,9 @@ peak_general_listener_soft_heartbeat_unlocked(const PeakGlobalBudgetSample* samp
             continue;
         }
         waiting = TRUE;
-        /* Preserve the paid first observation while its specific completed
-         * mutation sample is awaiting ACK. Actual debt removes this protection;
-         * newly accumulated rent can then finance a real close instead. */
-        if (peak_hook_pending_observation_ns[i] > 0 && !cost_acknowledged && nominal_funded)
+        /* Preserve an already reserved first observation while its specific
+         * mutation sample awaits ACK; no new commitment is created by debt. */
+        if (peak_hook_pending_observation_ns[i] > 0 && !cost_acknowledged && reserved_lease)
             continue;
         uint64_t ignored = peak_general_listener_ignored_rent_ns(listener);
         uint64_t base = atomic_load(&listener->ignored_rent_base_ns);
@@ -7671,7 +7677,10 @@ peak_general_listener_profile_gate(PeakGeneralListener* listener, size_t index,
             return TRUE;
         }
         uint64_t cost = peak_budget_cost_ns(PEAK_BURST_BUDGET_STRIDE, peak_general_overhead);
-        if (cost != UINT64_MAX && cost > 0 && peak_global_budget_try_spend(cost)) {
+        unsigned long long control = atomic_load_explicit(&listener->callback_hook_control, memory_order_acquire);
+        if (peak_general_listener_callback_hook_state(control) == PEAK_HOOK_ATTACHED &&
+            !(control & (PEAK_CALLBACK_BURST_REQUEST_BIT | PEAK_CALLBACK_DETACH_COUNT_REQUEST_BIT)) &&
+            cost != UINT64_MAX && cost > 0 && peak_global_budget_try_spend(cost)) {
             lease->cpu_ns = PEAK_BURST_BUDGET_STRIDE - 1;
             peak_general_listener_record_budget_call(index, FALSE, FALSE);
             return TRUE;
