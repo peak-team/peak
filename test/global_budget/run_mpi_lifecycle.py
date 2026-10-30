@@ -33,7 +33,7 @@ p.add_argument('--mpiexec', required=True)
 p.add_argument('--np-flag', default='-n')
 p.add_argument('--preflags', default='')
 p.add_argument('--ranks', type=int, default=2)
-p.add_argument('--mode', choices=('recovery', 'early-finalize'), required=True)
+p.add_argument('--mode', choices=('recovery', 'early-finalize', 'startup-delay'), required=True)
 a = p.parse_args()
 with artifact_directory() as root:
     targets = root / 'targets.txt'
@@ -85,6 +85,18 @@ with artifact_directory() as root:
         assert settlement['invalid_accounting_samples'] == '0', text
         service = records('MPI global service:')[-1]
         assert service['startup_sealed'] == '1', text
+        if a.mode == 'startup-delay':
+            bill = records('MPI global local bill:')[-1]
+            admission = records('MPI initial admission:')[-1]
+            assert bill['written'] == '1' and bill['final'] == '1', bill
+            assert bill['acknowledged_sample_sequence'] == bill['sample_sequence'], bill
+            # The old 10 ms pre-init poll produced about 120 full rounds during
+            # this 1.2 s delay. Allow startup/teardown events, but no such polling.
+            assert 0 < int(bill['sample_sequence']) <= 16, bill
+            assert int(bill['profile_debit_ns']) == 0, bill
+            assert admission['initial_installed_targets'] == '80', admission
+            assert admission['initial_observation_used_calls'] == '0', admission
+            assert 'startup_delay_ready=1 calls=0 physical=80' in rank_out[rank], rank_out[rank]
         if rank == 0:
             assert service['broker_process_id'] != service['parent_process_id'], text
             assert service['broker_final_written'] == '1', text

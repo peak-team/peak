@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include <mpi.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -204,20 +205,35 @@ int main(int argc, char **argv)
     /* Standard installation precedes MPI worker creation. The finite initial
      * window records real enter/leave data and obeys the same affine oracle. */
     if (physical_targets() != 80 || target_calls() != 0 || !cold_targets_attached()) return 2;
-    uint64_t initial = 1, expected_initial = 1;
-    for (unsigned i = 0; i < 64; ++i) {
-        initial = budget_target_0(initial);
-        expected_initial = A * expected_initial + B;
+    int startup_delay = !strcmp(argv[1], "startup-delay");
+    if (startup_delay) {
+        /* No selected calls: ordinary pre-init polling has no work to do. */
+        struct timespec delay = {1, 200000000};
+        while (nanosleep(&delay, &delay) != 0) {
+            if (errno != EINTR) return 2;
+        }
+        puts("startup_delay_before_mpi calls=0");
+    } else {
+        uint64_t initial = 1, expected_initial = 1;
+        for (unsigned i = 0; i < 64; ++i) {
+            initial = budget_target_0(initial);
+            expected_initial = A * expected_initial + B;
+        }
+        if (initial != expected_initial || target_calls() != 64) return 2;
+        printf("initial_observation calls=64 checksum=%llu\n", (unsigned long long)initial);
     }
-    if (initial != expected_initial || target_calls() != 64) return 2;
-    printf("initial_observation calls=64 checksum=%llu\n", (unsigned long long)initial);
     int provided, rank;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     if (provided < MPI_THREAD_FUNNELED || !coordinator_active())
         MPI_Abort(MPI_COMM_WORLD, 3);
     int bad = 0;
-    if (!strcmp(argv[1], "early-finalize")) {
+    if (startup_delay) {
+        MPI_Barrier(MPI_COMM_WORLD);
+        bad = physical_targets() != 80 || target_calls() != 0 || !cold_targets_attached();
+        printf("startup_delay_ready=1 calls=%llu physical=%u\n",
+               (unsigned long long)target_calls(), physical_targets());
+    } else if (!strcmp(argv[1], "early-finalize")) {
         MPI_Barrier(MPI_COMM_WORLD);
         if (!rank) {
             puts("root_enter_finalize=1");

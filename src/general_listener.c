@@ -324,6 +324,7 @@ void peak_general_listener_begin_teardown_cpu(clockid_t clock, uint64_t start_ns
 }
 
 static void peak_general_listener_write_global_budget_diagnostics(gboolean settled);
+void peak_global_budget_listener_credit_ready(void);
 static gboolean peak_global_text_reported;
 static _Atomic uint64_t peak_global_degraded_samples;
 static _Atomic uint64_t peak_global_invalid_accounting;
@@ -341,6 +342,7 @@ PEAK_API void peak_general_listener_global_budget_startup(double seconds, int re
     atomic_store(&peak_global_startup_ready, ready);
     if (ready) atomic_store(&peak_global_ever_active, TRUE);
     atomic_store_explicit(&peak_global_bootstrap_finished, TRUE, memory_order_release);
+    peak_global_budget_listener_credit_ready();
 }
 
 static gboolean peak_mpi_burst_wave_active;
@@ -3411,6 +3413,7 @@ peak_general_listener_funded_initial_attach_fallback(void)
     if (!peak_global_funded_runtime_attach) return;
     atomic_store(&peak_global_initial_unexposed, FALSE);
     atomic_store(&peak_global_bootstrap_finished, TRUE);
+    peak_global_budget_listener_credit_ready();
     pthread_mutex_lock(&lock);
     for (size_t i = 0; i < peak_hook_address_count; i++)
         if (peak_hook_never_attached != NULL && peak_hook_never_attached[i])
@@ -6208,6 +6211,28 @@ peak_general_listener_heartbeat_sample_can_reuse_cache_unlocked(
     }
 }
 
+/* Before completion, a sticky service wake must publish the first sample.
+ * Park ordinary polling; callback accounting/controller work stay active. */
+static gboolean
+peak_heartbeat_wait_bootstrap(void)
+{
+    if (!peak_global_configured || atomic_load_explicit(&peak_global_bootstrap_finished,
+                                                       memory_order_acquire))
+        return atomic_load(&heartbeat_running);
+    unsigned long long cpu_start = 0, cpu_end = 0;
+    gboolean metered = peak_general_listener_thread_cpu_ns(&cpu_start);
+    pthread_mutex_lock(&heartbeat_mutex);
+    while (atomic_load(&heartbeat_running) &&
+           !atomic_load_explicit(&peak_global_bootstrap_finished, memory_order_acquire) &&
+           !atomic_load_explicit(&peak_global_heartbeat_credit_ready, memory_order_acquire))
+        pthread_cond_wait(&heartbeat_cond, &heartbeat_mutex);
+    gboolean keep_running = atomic_load(&heartbeat_running);
+    pthread_mutex_unlock(&heartbeat_mutex);
+    if (metered && peak_general_listener_thread_cpu_ns(&cpu_end) && cpu_end >= cpu_start)
+        peak_general_listener_management_cpu_add_saturating(cpu_end - cpu_start);
+    return keep_running;
+}
+
 static gboolean
 peak_heartbeat_wait_us(uint64_t sleep_us)
 {
@@ -6299,6 +6324,9 @@ void* peak_heartbeat_monitor(void* arg) {
     }
 
     while (atomic_load(&heartbeat_running)) {
+        /* A service-start sticky wake must publish the first sample before
+         * bootstrap can report ready. Consume it in the unchanged round. */
+        if (!peak_heartbeat_wait_bootstrap()) break;
         unsigned long long management_cpu_checkpoint_ns = 0;
         gboolean management_cpu_checkpoint_valid =
             peak_general_listener_thread_cpu_ns(

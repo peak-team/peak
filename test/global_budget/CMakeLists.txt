@@ -34,7 +34,7 @@ if(PEAK_ENABLE_MPI AND MPI_C_FOUND AND MPIEXEC_EXECUTABLE AND
     target_link_libraries(test_global_budget_mpi PRIVATE MPI::MPI_C ${CMAKE_DL_LIBS})
     set_target_properties(test_global_budget_mpi PROPERTIES ENABLE_EXPORTS ON)
     string(JOIN " " _budget_mpiexec_preflags ${MPIEXEC_PREFLAGS})
-    foreach(scenario IN ITEMS recovery early-finalize)
+    foreach(scenario IN ITEMS recovery early-finalize startup-delay)
         add_test(NAME test_global_budget_mpi_${scenario}
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/run_mpi_lifecycle.py
                 --exe $<TARGET_FILE:test_global_budget_mpi> --libpeak $<TARGET_FILE:peak>
