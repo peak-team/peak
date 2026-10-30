@@ -59,18 +59,28 @@ static void check_wire_format(void)
     source.consumed_frontend_ns = UINT64_C(0x0102030405060708);
     source.payload_words = 2;
     source.minimum_ns=UINT64_C(0x0102030405060708);
+    source.sample.runtime_supported=true;
+    source.sample.runtime_raw_ns=UINT64_C(0x3132333435363738);
+    source.sample.runtime_outside_ns=UINT64_C(0x0102030405060708);
+    source.sample.runtime_sum_ns=UINT64_C(0x1112131415161718);
     source.view.causal_confirmed_seconds = 1.0;
     source.view.causal_pending_seconds = 2.0;
     unsigned char wire[PEAK_GLOBAL_BUDGET_WIRE_SIZE], again[PEAK_GLOBAL_BUDGET_WIRE_SIZE];
     peak_global_budget_frame_encode(wire, &source);
     static const unsigned char prefix[] = {
-        0x50, 0x47, 0x42, 0x31, 0, 0, 0, 7,
+        0x50, 0x47, 0x42, 0x31, 0, 0, 0, 8,
         1, 2, 3, 4, 1, 2, 3, 5
     };
     static const unsigned char nonce[] = {1, 2, 3, 4, 5, 6, 7, 8};
     static const unsigned char one[] = {0x3f, 0xf0, 0, 0, 0, 0, 0, 0};
     static const unsigned char targets[] = {0x11, 0x22, 0x33, 0x44};
-    assert(sizeof wire == 538);
+    assert(sizeof wire == 563);
+    assert(wire[538] == 1);
+    static const unsigned char runtime_raw[]={0x31,0x32,0x33,0x34,0x35,0x36,0x37,0x38};
+    static const unsigned char runtime_sum[]={0x11,0x12,0x13,0x14,0x15,0x16,0x17,0x18};
+    assert(!memcmp(wire + 539, runtime_raw, sizeof runtime_raw));
+    assert(!memcmp(wire + 547, nonce, sizeof nonce));
+    assert(!memcmp(wire + 555, runtime_sum, sizeof runtime_sum));
     assert(!memcmp(wire, prefix, sizeof prefix));
     assert(!memcmp(wire + 40, nonce, sizeof nonce));
     assert(!memcmp(wire + 530, nonce, sizeof nonce));
@@ -526,16 +536,98 @@ static void prefix_record(BrokerMetadata *metadata, unsigned rank,
     uint64_t seq[2], uint64_t last[2], PeakGlobalBudgetCausalKind kind,
     uint64_t round, uint64_t outside, uint64_t inside, unsigned certification)
 {
-    uint64_t record[18]={18,2,0,1,kind,PEAK_CAUSAL_COLLECTIVE,
+    uint64_t record[21]={21,2,0,1,kind,PEAK_CAUSAL_COLLECTIVE,
         ++seq[rank],last[rank],round,0,0,rank,0,outside,inside,outside+inside,0,
         certification};
     if(kind!=PEAK_CAUSAL_FRONTIER)last[rank]=seq[rank];
-    unsigned char payload[18*8],*output=payload;
-    for(size_t i=0;i<18;++i)peak_budget_wire_put(&output,record[i],8);
+    unsigned char payload[21*8],*output=payload;
+    for(size_t i=0;i<21;++i)peak_budget_wire_put(&output,record[i],8);
     if(certification==(PEAK_MPI_CLOSED_WORLD_PREFIX|PEAK_MPI_ENTRY_FENCE))
         assert(payload[17*8+7]==3); /* Canonical flags word, independent byte value. */
-    Frame frame={.rank=rank,.payload_words=18};
+    Frame frame={.rank=rank,.payload_words=21};
     assert(consume_metadata(metadata,&frame,payload));
+}
+static void runtime_record(BrokerMetadata *metadata, unsigned rank,
+    uint64_t seq[2], uint64_t last[2], PeakGlobalBudgetCausalKind kind,
+    PeakGlobalBudgetCausalOperation op, uint64_t raw, uint64_t outside, uint64_t sum)
+{
+    uint64_t count=(kind==PEAK_CAUSAL_WAIT || kind==PEAK_CAUSAL_COMPLETE)?1:0;
+    uint64_t record[22]={21+count,2,0,1,kind,op,++seq[rank],last[rank],
+        1,7,1,rank,1-rank,0,0,0,count,0};
+    if(count)record[18]=1;
+    record[18+count]=raw;record[19+count]=outside;record[20+count]=sum;
+    if(kind!=PEAK_CAUSAL_FRONTIER)last[rank]=seq[rank];
+    unsigned char payload[22*8],*output=payload;
+    for(size_t i=0;i<record[0];i++)peak_budget_wire_put(&output,record[i],8);
+    Frame frame={.rank=rank,.payload_words=record[0]};
+    assert(consume_metadata(metadata,&frame,payload));
+}
+static uint64_t runtime_bill(PeakGlobalBudgetCausal *model, Rank ranks[2])
+{
+    PeakGlobalBudgetCausalView v=peak_global_budget_causal_view(model);
+    uint64_t bill=ns_add(v.confirmed_ns,v.unresolved_ns);
+    for(unsigned i=0;i<2;i++) {
+        bill=ns_add(bill,ranks[i].runtime_sum);
+        uint64_t represented=ns_add(ranks[i].runtime_outside,ranks[i].runtime_sum);
+        if(ranks[i].runtime_raw>represented)bill=ns_add(bill,ranks[i].runtime_raw-represented);
+    }
+    return bill;
+}
+static void check_runtime_causal_cost(void)
+{
+    PeakGlobalBudgetCausal *model=peak_global_budget_causal_new(2);assert(model);
+    Rank ranks[2]={0};BrokerMetadata metadata;uint64_t seq[2]={0},last[2]={0};
+    assert(broker_metadata_init(&metadata,model,ranks,2));
+    size_t members[]={0,1};assert(peak_global_budget_causal_context(model,0,1,members,2));
+    /* Parallel MPI-free runtime: full raw20, causal10, no cash mutation. */
+    for(unsigned r=0;r<2;r++)runtime_record(&metadata,r,seq,last,PEAK_CAUSAL_FRONTIER,PEAK_CAUSAL_SEND,10,10,0);
+    assert(runtime_bill(model,ranks)==10 && ranks[0].runtime_raw+ranks[1].runtime_raw==20);
+    assert(!ranks[0].credit_total_ns && !ranks[1].credit_total_ns);
+    broker_metadata_clear(&metadata);peak_global_budget_causal_free(model);
+    model=peak_global_budget_causal_new(2);memset(ranks,0,sizeof ranks);memset(seq,0,sizeof seq);memset(last,0,sizeof last);
+    assert(model && broker_metadata_init(&metadata,model,ranks,2));
+    assert(peak_global_budget_causal_context(model,0,1,members,2));
+    /* Serial SEND -> RECV carries runtime cost across the real dependency. */
+    runtime_record(&metadata,0,seq,last,PEAK_CAUSAL_POST,PEAK_CAUSAL_SEND,10,10,0);
+    runtime_record(&metadata,0,seq,last,PEAK_CAUSAL_COMPLETE,PEAK_CAUSAL_SEND,10,10,0);
+    runtime_record(&metadata,1,seq,last,PEAK_CAUSAL_POST,PEAK_CAUSAL_RECV,0,0,0);
+    runtime_record(&metadata,1,seq,last,PEAK_CAUSAL_WAIT,PEAK_CAUSAL_RECV,0,0,0);
+    runtime_record(&metadata,1,seq,last,PEAK_CAUSAL_COMPLETE,PEAK_CAUSAL_RECV,0,0,0);
+    runtime_record(&metadata,1,seq,last,PEAK_CAUSAL_FRONTIER,PEAK_CAUSAL_RECV,10,10,0);
+    assert(runtime_bill(model,ranks)==20);
+    /* Raw-first unknown gap remains fully reserved; class-first supplies raw25
+     * including a separate writer's5, even when the HB sample still says15. */
+    ranks[0].runtime_raw=15;assert(runtime_bill(model,ranks)==25);
+    runtime_record(&metadata,0,seq,last,PEAK_CAUSAL_FRONTIER,PEAK_CAUSAL_SEND,25,20,5);
+    assert(ranks[0].runtime_raw==25 && ranks[0].runtime_sum==5);
+    uint64_t before=runtime_bill(model,ranks);
+    receive(&ranks[0],(PeakGlobalBudgetSample){.sequence=1,.runtime_supported=true,
+        .runtime_raw_ns=15,.runtime_outside_ns=10,.runtime_sum_ns=5});
+    assert(ranks[0].runtime_raw==25 && runtime_bill(model,ranks)==before);
+    PeakGlobalBudgetSample raw_bill={.runtime_supported=true,.runtime_raw_ns=25,
+        .management_seconds=15e-9};
+    assert(fabs(ledger_cost(&raw_bill,0)-25e-9)<1e-20);
+    raw_bill.runtime_supported=false;
+    assert(fabs(ledger_cost(&raw_bill,0)-15e-9)<1e-20);
+    /* An existing rejected-sequence fallback must reserve runtime as well as
+     * profile: representation already advanced before submit rejects it. */
+    --seq[0];
+    runtime_record(&metadata,0,seq,last,PEAK_CAUSAL_FRONTIER,PEAK_CAUSAL_SEND,35,30,5);
+    assert(metadata.invalid && runtime_bill(model,ranks)==before+10);
+    broker_metadata_clear(&metadata);peak_global_budget_causal_free(model);
+    model=peak_global_budget_causal_new(2);memset(ranks,0,sizeof ranks);memset(seq,0,sizeof seq);memset(last,0,sizeof last);
+    assert(model && broker_metadata_init(&metadata,model,ranks,2));
+    assert(peak_global_budget_causal_context(model,0,1,members,2));
+    for(unsigned r=0;r<2;r++)prefix_record(&metadata,r,seq,last,PEAK_CAUSAL_MPI_ENTER,1,0,0,0);
+    prefix_record(&metadata,0,seq,last,PEAK_CAUSAL_MPI_EXIT,1,0,0,1);
+    runtime_record(&metadata,0,seq,last,PEAK_CAUSAL_FRONTIER,PEAK_CAUSAL_SEND,25,20,5);
+    assert(metadata.lanes[0].head && ranks[0].runtime_raw==25 && !ranks[0].runtime_outside);
+    assert(runtime_bill(model,ranks)==25); /* Held OUTSIDE remains U, SUM stays SUM. */
+    prefix_record(&metadata,1,seq,last,PEAK_CAUSAL_MPI_EXIT,1,0,0,1);
+    assert(!metadata.lanes[0].head && runtime_bill(model,ranks)==25);
+    runtime_record(&metadata,1,seq,last,PEAK_CAUSAL_FRONTIER,PEAK_CAUSAL_SEND,20,20,0);
+    assert(runtime_bill(model,ranks)==25 && ranks[0].runtime_raw+ranks[1].runtime_raw==45);
+    broker_metadata_clear(&metadata);peak_global_budget_causal_free(model);
 }
 static void check_closed_cost_prefix(void)
 {
@@ -591,11 +683,11 @@ static void prefix_point(BrokerMetadata *metadata, unsigned rank,
     uint64_t seq[2],uint64_t last[2],PeakGlobalBudgetCausalKind kind,
     PeakGlobalBudgetCausalOperation operation,uint64_t cost)
 {
-    uint64_t record[19]={18,2,0,1,kind,operation,++seq[rank],last[rank],
-        1,7,1,rank,1-rank,cost,0,cost,0,0,1};
-    if(kind==PEAK_CAUSAL_WAIT||kind==PEAK_CAUSAL_COMPLETE){record[0]=19;record[16]=1;}
+    uint64_t record[22]={21,2,0,1,kind,operation,++seq[rank],last[rank],
+        1,7,1,rank,1-rank,cost,0,cost,0,0,0,0,0,0};
+    if(kind==PEAK_CAUSAL_WAIT||kind==PEAK_CAUSAL_COMPLETE){record[0]=22;record[16]=1;record[18]=1;}
     last[rank]=seq[rank];
-    unsigned char payload[19*8],*output=payload;
+    unsigned char payload[22*8],*output=payload;
     for(size_t i=0;i<record[0];++i)peak_budget_wire_put(&output,record[i],8);
     Frame frame={.rank=rank,.payload_words=record[0]};
     assert(consume_metadata(metadata,&frame,payload));
@@ -739,13 +831,13 @@ static void check_settled_operation_prefix(void)
     event=(PeakMpiBudgetEvent){.kind=PEAK_MPI_EVENT_EXIT,.rank=0,.seq=3,.last_mpi_seq=1};
     peak_global_budget_mpi_event_submit(&event,&cost);peak_global_budget_mpi_frontend_charge(1000);
     assert(atomic_load(&metadata_ready));
-    unsigned char *payload=metadata_batch(&count);assert(payload&&count==54);
+    unsigned char *payload=metadata_batch(&count);assert(payload&&count==63);
     static const unsigned char identity[]={1,2,3,4,5,6,7,8};
     assert(!memcmp(payload+10*8,identity,sizeof identity)); /* Independent dynamic-payload endian golden. */
-    uint64_t words[54];const unsigned char *cursor=payload;
-    for(unsigned i=0;i<54;i++)words[i]=peak_budget_wire_get(&cursor,8);
-    assert(words[13]>0&&words[18+13]==words[13]);
-    assert(words[36+13]==words[18+13]&&words[36+13]==atomic_load(&frontend_cpu_ns));
+    uint64_t words[63];const unsigned char *cursor=payload;
+    for(unsigned i=0;i<63;i++)words[i]=peak_budget_wire_get(&cursor,8);
+    assert(words[13]>0&&words[21+13]==words[13]);
+    assert(words[42+13]==words[21+13]&&words[42+13]==atomic_load(&frontend_cpu_ns));
     /* Force partial fixed header AND partial dynamic payload, no ABI casts. */
     int sockets[2];assert(!socketpair(AF_UNIX,SOCK_STREAM,0,sockets));
     Frame frame={.magic=MAGIC,.version=PROTOCOL_VERSION,.payload_words=count};
@@ -795,6 +887,7 @@ int main(void)
     check_required_vs_desired();
     check_admission_revision();
     check_causal_wire_integration();
+    check_runtime_causal_cost();
     check_closed_cost_prefix();
     check_asymmetric_closed_prefix();
     check_reverse_and_entry_fence();

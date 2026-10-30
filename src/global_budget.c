@@ -85,6 +85,7 @@ typedef struct {
     bool seen, connected, wants_credit, registered, participant, grace_exposed, reply_requested;
     double reservation, previous_cost, granted_total, closing_estimate;
     uint64_t represented_outside, represented_inside, raw_profile, sum_profile_checkpoint;
+    uint64_t runtime_raw, runtime_outside, runtime_sum;
     uint64_t registration_sample_sequence, registration_returned_ns;
     bool registration_exposed;
     double serialized_cost;
@@ -251,7 +252,7 @@ static _Atomic double public_causal_confirmed, public_causal_pending, public_cau
 static atomic_bool public_active, public_participant, public_finalized, public_accounting_invalid, root_final_sent;
 static atomic_uint finalizer_state;
 static _Atomic clockid_t finalizer_clock;
-static atomic_uint_fast64_t finalizer_start;
+static atomic_uint_fast64_t finalizer_start, finalizer_baseline_ns;
 static _Atomic double finalizer_baseline;
 static atomic_uint_fast64_t local_completed_wave, public_wave, public_decision, public_completed, public_ack, public_timestamp, granted_ns, consumed_ns, requested_ns, demand_generation, debit_ns, returned_ns, public_demand_ack, request_started_ns, public_deadline, low_water_ns;
 static _Atomic double public_spent, public_remaining, public_allowance, public_span, public_granted, public_budget, public_reserved, public_control_reserve, startup_charge, local_transport_cpu, earned_origin, refill_rtt, consumption_rate;
@@ -267,6 +268,10 @@ extern void peak_global_budget_listener_idle_unguard(void) PEAK_BUDGET_WEAK;
 extern void peak_global_budget_listener_credit_ready(void) PEAK_BUDGET_WEAK;
 extern bool peak_global_budget_listener_admission_waiting(void) PEAK_BUDGET_WEAK;
 extern void peak_mpi_budget_events_frontier(void) PEAK_BUDGET_WEAK;
+extern PeakMpiRuntimeSpan peak_mpi_budget_runtime_begin(PeakMpiRuntimeComponent) PEAK_BUDGET_WEAK;
+extern void peak_mpi_budget_runtime_end(PeakMpiRuntimeSpan *, uint64_t, uint64_t) PEAK_BUDGET_WEAK;
+extern void peak_mpi_budget_runtime_observe(PeakMpiRuntimeComponent, uint64_t) PEAK_BUDGET_WEAK;
+extern void peak_mpi_budget_runtime_snapshot(PeakMpiBudgetCostSnapshot *) PEAK_BUDGET_WEAK;
 static void frame_credit_demand(Frame *frame, uint64_t debit)
 {
     uint64_t profile=atomic_load_explicit(&minimum_target_ns,memory_order_acquire);
@@ -404,8 +409,8 @@ static double cost(const PeakGlobalBudgetSample *s)
 static double ledger_cost(const PeakGlobalBudgetSample *s, uint64_t profile)
 {
     return fmax(s->profile_seconds, (double)profile / 1e9) + s->ignored_seconds + s->frontend_seconds +
-        s->control_seconds +
-        s->management_seconds + s->transport_seconds;
+        (s->runtime_supported ? (double)s->runtime_raw_ns/1e9 :
+         s->control_seconds + s->management_seconds + s->transport_seconds);
 }
 static PeakGlobalBudgetLocalBill local_bill_from_frame(const Frame *frame,
     double management_input, double finalizer_cpu, double finalizer_baseline,
@@ -415,6 +420,10 @@ static PeakGlobalBudgetLocalBill local_bill_from_frame(const Frame *frame,
     return (PeakGlobalBudgetLocalBill){
         .written = true, .retiring = frame->sample.retiring, .final = frame->sample.final,
         .finalizer_registered = finalizer_registered,
+        .runtime_supported = frame->sample.runtime_supported,
+        .runtime_raw_ns = frame->sample.runtime_raw_ns,
+        .runtime_outside_ns = frame->sample.runtime_outside_ns,
+        .runtime_sum_ns = frame->sample.runtime_sum_ns,
         .sample_sequence = frame->sample.sequence, .message_sequence = frame->message_sequence,
         .profile_debit_ns = frame->consumed_profile_ns,
         .frontend_debit_ns = frame->consumed_frontend_ns,
@@ -471,11 +480,15 @@ static bool root_metadata_valid(const Frame *frame)
 }
 static bool valid_sample(const PeakGlobalBudgetSample *s, const Rank *r)
 {
+    if (s->runtime_outside_ns>s->runtime_raw_ns ||
+        s->runtime_sum_ns>s->runtime_raw_ns-s->runtime_outside_ns) return false;
     if (s->background_period_ns > MAX_BACKGROUND_NS || !s->sequence || s->finalizer_invalid || (s->final && !s->retiring) || !number(s->profile_seconds) || !number(s->control_seconds) ||
         !number(s->ignored_seconds) || !number(s->profile_inside_seconds) || !number(s->frontend_seconds) || !number(s->management_seconds) || !number(s->transport_seconds) || !number(s->elapsed_seconds) ||
         !number(s->closing_seconds) || !number(s->pressure) || !number(s->unfunded_seconds) || s->unfunded_seconds > .000500001 || !number(cost(s))) return false;
     if (!r->seen) return true;
     return s->ignored_seconds >= r->latest.ignored_seconds && s->profile_inside_seconds >= r->latest.profile_inside_seconds && s->frontend_seconds >= r->latest.frontend_seconds &&
+        s->runtime_raw_ns>=r->latest.runtime_raw_ns && s->runtime_outside_ns>=r->latest.runtime_outside_ns &&
+        s->runtime_sum_ns>=r->latest.runtime_sum_ns && (!r->latest.runtime_supported || s->runtime_supported) &&
         s->settled_frontend_credit_ns >= r->latest.settled_frontend_credit_ns &&
         s->profile_seconds >= r->latest.profile_seconds &&
         s->control_seconds >= r->latest.control_seconds &&
@@ -976,9 +989,9 @@ void peak_global_budget_mpi_event_submit(const PeakMpiBudgetEvent *event,
     /* In-flight admitted records and the terminal UNKNOWN remain admissible
      * after OFF. No sequence is invented by this adapter. */
     if (!event || !snapshot || getpid() != atomic_load(&owner) || !atomic_load(&running)) return;
-    if ((event->count && !event->requests) || event->count > SIZE_MAX - 18 ||
+    if ((event->count && !event->requests) || event->count > SIZE_MAX - 21 ||
         event->rank < 0 || (unsigned)event->rank != rank_id) { metadata_fail(); return; }
-    MetadataRecord *record = metadata_alloc(event->count + 18);
+    MetadataRecord *record = metadata_alloc(event->count + 21);
     if (!record) return;
     uint64_t outside = ns_add(snapshot->active_outside_ns, snapshot->ignored_outside_ns);
     uint64_t inside = ns_add(snapshot->active_inside_ns, snapshot->ignored_inside_ns);
@@ -988,6 +1001,9 @@ void peak_global_budget_mpi_event_submit(const PeakMpiBudgetEvent *event,
         outside, inside, ns_add(outside, inside), event->count, event->closure_flags};
     memcpy(record->words, fixed, sizeof fixed);
     if (event->count) memcpy(record->words+18, event->requests, event->count*sizeof(uint64_t));
+    record->words[18+event->count]=snapshot->runtime_raw_ns;
+    record->words[19+event->count]=snapshot->runtime_outside_ns;
+    record->words[20+event->count]=snapshot->runtime_sum_ns;
     if (metadata_operation) {
         record->operation=metadata_operation;metadata_operation->has_record=true;
         atomic_fetch_add(&metadata_operation->references,1);
@@ -1399,19 +1415,21 @@ static bool broker_process_event(BrokerMetadata *metadata, unsigned member,
     const uint64_t *record)
 {
     Rank *rank = &metadata->ranks[member];
+    size_t runtime=(size_t)record[16]+18;
+    if(record[runtime+1]>rank->runtime_outside)rank->runtime_outside=record[runtime+1];
     if (record[13] > rank->represented_outside) rank->represented_outside = record[13];
     PeakGlobalBudgetCausalEvent event = {.rank=member, .sequence=record[6],
         .last_mpi_sequence=record[7], .context_owner=(uint32_t)record[2],
         .context=record[3], .round=record[8], .tag=record[9], .request=record[10],
         .kind=(PeakGlobalBudgetCausalKind)record[4],
         .operation=(PeakGlobalBudgetCausalOperation)record[5], .peer=(size_t)record[12],
-        .cumulative_cost_ns=record[13], .requests=record+18, .request_count=record[0]-18};
+        .cumulative_cost_ns=ns_add(record[13],record[runtime+1]), .requests=record+18, .request_count=record[16]};
     if (trace_enabled && (event.kind==PEAK_CAUSAL_UNKNOWN ||
         event.operation==PEAK_CAUSAL_AMBIGUOUS_SEND))
         record_event('u',member,event.sequence,event.round,(double)event.cumulative_cost_ns/1e9);
     if (!peak_global_budget_causal_submit(metadata->model, &event)) {
         peak_global_budget_causal_fallback(metadata->model);
-        peak_global_budget_causal_reserve_outside(metadata->model, member, record[13]);
+        peak_global_budget_causal_reserve_outside(metadata->model, member, event.cumulative_cost_ns);
         metadata->invalid = true;
         broker_cut_release(metadata);
     }
@@ -1509,6 +1527,9 @@ static bool broker_accept_event(BrokerMetadata *metadata, unsigned member,
     const uint64_t *record)
 {
     Rank *rank = &metadata->ranks[member];
+    size_t runtime=(size_t)record[16]+18;
+    if(record[runtime]>rank->runtime_raw)rank->runtime_raw=record[runtime];
+    if(record[runtime+2]>rank->runtime_sum)rank->runtime_sum=record[runtime+2];
     /* These highwaters retain the complete raw bill immediately, including
      * future records held behind a prefix. Inside work is always SUM. */
     if (record[14] > rank->represented_inside) rank->represented_inside = record[14];
@@ -1557,11 +1578,15 @@ static bool consume_metadata(BrokerMetadata *metadata,
             }
             free(members);
         } else if (record[1] == 2) {
-            if (length < 18 || record[16] != length-18 || record[11] != frame->rank ||
+            if (length < 21 || record[16] != length-21 || record[11] != frame->rank ||
                 frame->rank >= metadata->count || record[4] > PEAK_CAUSAL_MPI_EXIT ||
                 record[5] > PEAK_CAUSAL_AMBIGUOUS_SEND || (record[17] & ~(PEAK_MPI_CLOSED_WORLD_PREFIX|PEAK_MPI_ENTRY_FENCE|PEAK_MPI_OPAQUE_LIVE)) ||
                 ((record[17]&PEAK_MPI_OPAQUE_LIVE) && record[4]!=PEAK_CAUSAL_UNKNOWN)) {
                 valid = false; break;
+            }
+            size_t runtime=18+(size_t)record[16];
+            if(record[runtime+1]>record[runtime] || record[runtime+2]>record[runtime]-record[runtime+1]) {
+                valid=false;break;
             }
             valid = broker_accept_event(metadata, frame->rank, record);
         } else valid = false;
@@ -1627,6 +1652,12 @@ static void *service(void *data)
         recheck_root = false;
         (void)poll(ready, (nfds_t)peers_count + 3, timeout);
         now_ns = ns_now(CLOCK_MONOTONIC);
+        PeakMpiRuntimeSpan transport_span={0};
+        uint64_t transport_span_cpu=0;
+        if(!broker_only && peak_mpi_budget_runtime_begin && peak_mpi_budget_runtime_end) {
+            transport_span=peak_mpi_budget_runtime_begin(PEAK_RUNTIME_TRANSPORT);
+            transport_span_cpu=ns_now(CLOCK_THREAD_CPUTIME_ID);
+        }
         if (ready[2].revents & POLLIN) { unsigned char wakes[256]; (void)read(wake_fd, wakes, sizeof(wakes)); }
         if (rank_id == 0 && !native_client) {
             int s = ready[0].revents & POLLIN
@@ -1728,9 +1759,15 @@ static void *service(void *data)
             double spent = startup + broker_cpu, reserved = 0;
             double rank_bills = 0, rank_profile = 0, rank_control = 0, rank_management = 0, rank_transport = 0, rank_frontend = 0;
             unsigned final_ranks = 0;
-            double profile_raw = 0, inside_sum = 0, profile_tail = 0, serialized_sum = startup + broker_cpu;
+            double profile_raw = 0, runtime_raw = 0, runtime_sum = 0, inside_sum = 0, profile_tail = 0, serialized_sum = startup + broker_cpu;
             for (unsigned i = 0; i < world; ++i) {
                 Rank *r = &ranks[i];
+                if(r->latest.runtime_supported) {
+                    PeakGlobalBudgetSample raw_bill=r->latest;
+                    if(r->runtime_raw>raw_bill.runtime_raw_ns)raw_bill.runtime_raw_ns=r->runtime_raw;
+                    double resource=ledger_cost(&raw_bill,r->profile_ns);
+                    if(resource>r->previous_cost)r->previous_cost=resource;
+                }
                 bool final_closed = r->latest.final && !r->connected;
                 if (r->seen && !final_closed && now_ns - r->last_update > freshness_ns(background > r->latest.background_period_ns ? background : r->latest.background_period_ns)) broken = true;
                 all = all && r->seen && (final_closed || (r->connected && now_ns - r->last_update <= freshness_ns(background > r->latest.background_period_ns ? background : r->latest.background_period_ns)));
@@ -1752,7 +1789,15 @@ static void *service(void *data)
                 if (inside > r->represented_inside) r->represented_inside = inside;
                 double serial = r->latest.control_seconds + r->latest.management_seconds + r->latest.transport_seconds;
                 if (serial > r->serialized_cost) r->serialized_cost = serial;
-                serialized_sum += r->serialized_cost;
+                if(r->latest.runtime_supported) {
+                    if(r->latest.runtime_raw_ns>r->runtime_raw)r->runtime_raw=r->latest.runtime_raw_ns;
+                    if(r->latest.runtime_sum_ns>r->runtime_sum)r->runtime_sum=r->latest.runtime_sum_ns;
+                    runtime_raw+=(double)r->runtime_raw/1e9;
+                    runtime_sum+=(double)r->runtime_sum/1e9;
+                    uint64_t represented_runtime=ns_add(r->runtime_outside,r->runtime_sum);
+                    if(r->runtime_raw>represented_runtime)
+                        profile_tail+=(double)(r->runtime_raw-represented_runtime)/1e9;
+                } else serialized_sum += r->serialized_cost;
                 profile_raw += (double)r->raw_profile / 1e9;
                 inside_sum += (double)r->represented_inside / 1e9;
                 uint64_t represented = ns_add(r->represented_inside,r->represented_outside);
@@ -1763,8 +1808,8 @@ static void *service(void *data)
             if ((causal_forced_sum || causal_view.resource_failed || causal_view.saturated || !causal) && !causal_sum) {
                 if (causal) peak_global_budget_causal_fallback(causal);
                 causal_view = causal ? peak_global_budget_causal_view(causal) : (PeakGlobalBudgetCausalView){0};
-                sum_profile_base = (double)ns_add(ns_add(causal_view.confirmed_ns,causal_view.unresolved_ns),causal_view.serialized_ns)/1e9 + inside_sum + profile_tail;
-                for (unsigned i=0;i<world;++i) ranks[i].sum_profile_checkpoint=ranks[i].raw_profile;
+                sum_profile_base = (double)ns_add(ns_add(causal_view.confirmed_ns,causal_view.unresolved_ns),causal_view.serialized_ns)/1e9 + inside_sum + runtime_sum + profile_tail;
+                for (unsigned i=0;i<world;++i) ranks[i].sum_profile_checkpoint=ns_add(ranks[i].raw_profile,ranks[i].latest.runtime_supported?ranks[i].runtime_raw:0);
                 causal_sum = true;
             }
             if (causal_forced_sum || causal_view.resource_failed || causal_view.saturated)
@@ -1774,9 +1819,9 @@ static void *service(void *data)
             if (causal_sum) {
                 causal_confirmed += sum_profile_base;
                 for (unsigned i=0;i<world;++i)
-                    causal_confirmed += (double)(ranks[i].raw_profile-ranks[i].sum_profile_checkpoint)/1e9;
+                    causal_confirmed += (double)(ns_add(ranks[i].raw_profile,ranks[i].latest.runtime_supported?ranks[i].runtime_raw:0)-ranks[i].sum_profile_checkpoint)/1e9;
             } else {
-                causal_confirmed += (double)ns_add(causal_view.confirmed_ns,causal_view.serialized_ns)/1e9 + inside_sum;
+                causal_confirmed += (double)ns_add(causal_view.confirmed_ns,causal_view.serialized_ns)/1e9 + inside_sum + runtime_sum;
                 causal_pending = (double)causal_view.unresolved_ns/1e9 + profile_tail;
             }
             spent = causal_confirmed + causal_pending;
@@ -1871,7 +1916,7 @@ static void *service(void *data)
                 uint64_t decision = ++reply_sequence;
                 p->outgoing = (Frame){.magic = MAGIC, .version = PROTOCOL_VERSION, .nonce = job_nonce, .rank = id,
                     .size = world, .reply_sequence = decision,
-                    .view = {.metadata_closed=atomic_load(&causal_fallback), .local_closing_reserved_seconds=ranks[id].registered?(double)closing_reserve_ns(&ranks[id])/1e9:0, .causal_confirmed_seconds=causal_confirmed, .causal_pending_seconds=causal_pending, .causal_raw_seconds=profile_raw+serialized_sum, .causal_unrepresented_seconds=causal_sum?0:profile_tail, .background_period_ns = background, .freshness_ns = freshness_ns(background), .startup_sealed = atomic_load(&startup_sealed), .broker_process_id = broker_only ? (uint64_t)getpid() : 0, .accounting_invalid = broker_clock_invalid, .broker_final_written = atomic_load(&root_final_sent), .broker_cpu_seconds = broker_cpu, .granted_total_ns = ranks[id].credit_total_ns, .active = all, .cohort_finalized = all_final, .returned_total_ns = ranks[id].returned_ns, .wave_participant = ranks[id].participant, .acknowledged_demand_generation = ranks[id].fulfilled_generation, .wave = wave, .decision_sequence = decision, .view_epoch = decision, .root_completed_wave = completed_wave,
+                    .view = {.metadata_closed=atomic_load(&causal_fallback), .local_closing_reserved_seconds=ranks[id].registered?(double)closing_reserve_ns(&ranks[id])/1e9:0, .causal_confirmed_seconds=causal_confirmed, .causal_pending_seconds=causal_pending, .causal_raw_seconds=profile_raw+runtime_raw+serialized_sum, .causal_unrepresented_seconds=causal_sum?0:profile_tail, .background_period_ns = background, .freshness_ns = freshness_ns(background), .startup_sealed = atomic_load(&startup_sealed), .broker_process_id = broker_only ? (uint64_t)getpid() : 0, .accounting_invalid = broker_clock_invalid, .broker_final_written = atomic_load(&root_final_sent), .broker_cpu_seconds = broker_cpu, .granted_total_ns = ranks[id].credit_total_ns, .active = all, .cohort_finalized = all_final, .returned_total_ns = ranks[id].returned_ns, .wave_participant = ranks[id].participant, .acknowledged_demand_generation = ranks[id].fulfilled_generation, .wave = wave, .decision_sequence = decision, .view_epoch = decision, .root_completed_wave = completed_wave,
                         .acknowledged_sequence = ranks[id].latest.sequence,
                         .budget_seconds = budget, .reserved_seconds = reserved, .control_reserve_seconds = grace_reserve + closing_reserve, .global_spent_seconds = spent,
                         .remaining_seconds = remaining,
@@ -1884,7 +1929,7 @@ static void *service(void *data)
             receipt.transport = rank_transport; receipt.startup = startup;
             receipt.broker = broker_cpu; receipt.spent = spent;
             receipt.confirmed=causal_confirmed; receipt.pending=causal_pending;
-            receipt.raw=profile_raw+serialized_sum; receipt.tail=causal_sum?0:profile_tail;
+            receipt.raw=profile_raw+runtime_raw+serialized_sum; receipt.tail=causal_sum?0:profile_tail;
             receipt.frontend=rank_frontend;
             receipt.final_ranks = final_ranks;
             root_all_final = all_final;
@@ -1961,6 +2006,8 @@ static void *service(void *data)
                 uint64_t retired_wave = atomic_load(&public_wave);
                 if (retired_wave > next.sample.completed_wave) next.sample.completed_wave = retired_wave;
             }
+            uint64_t current_transport=ns_now(CLOCK_THREAD_CPUTIME_ID);
+            if(current_transport>=cpu_origin)transport_cpu=(double)(current_transport-cpu_origin)/1e9;
             next.sample.transport_seconds = transport_cpu;
             double management_input = next.sample.management_seconds;
             double finalizer_cpu = 0, frozen_management = 0;
@@ -1973,10 +2020,23 @@ static void *service(void *data)
                 } else {
                     finalizer_cpu = (double)(cpu_now - cpu_start) / 1e9;
                     frozen_management = atomic_load(&finalizer_baseline);
+                    uint64_t live_ns=ns_add(atomic_load(&finalizer_baseline_ns),cpu_now-cpu_start);
+                    if(live_ns>next.sample.raw_management_ns)next.sample.raw_management_ns=live_ns;
                     double live = frozen_management + finalizer_cpu;
                     next.sample.management_seconds = fmax(next.sample.management_seconds, live);
                 }
             } else if (clock_state == 3) next.sample.finalizer_invalid = true;
+            if(peak_mpi_budget_runtime_observe && peak_mpi_budget_runtime_snapshot) {
+                peak_mpi_budget_runtime_observe(PEAK_RUNTIME_CONTROL,next.sample.raw_control_ns);
+                peak_mpi_budget_runtime_observe(PEAK_RUNTIME_MANAGEMENT,next.sample.raw_management_ns);
+                peak_mpi_budget_runtime_observe(PEAK_RUNTIME_TRANSPORT,current_transport>=cpu_origin?current_transport-cpu_origin:UINT64_MAX);
+                PeakMpiBudgetCostSnapshot runtime={0};
+                peak_mpi_budget_runtime_snapshot(&runtime);
+                next.sample.runtime_supported=true;
+                next.sample.runtime_raw_ns=runtime.runtime_raw_ns;
+                next.sample.runtime_outside_ns=runtime.runtime_outside_ns;
+                next.sample.runtime_sum_ns=runtime.runtime_sum_ns;
+            }
             /* Describe demand against this frame's settlement, not a later local
              * debit: otherwise concurrent callbacks can make the broker
              * count already-consumed reservations as available credit. */
@@ -2097,6 +2157,12 @@ static void *service(void *data)
         }
         uint64_t cpu_end = ns_now(CLOCK_THREAD_CPUTIME_ID);
         if (cpu_end >= cpu_origin) transport_cpu = (double)(cpu_end - cpu_origin) / 1e9;
+        if(transport_span.registered) {
+            uint64_t end=ns_now(CLOCK_THREAD_CPUTIME_ID);
+            peak_mpi_budget_runtime_end(&transport_span,
+                end>=transport_span_cpu?end-transport_span_cpu:UINT64_MAX,
+                end>=cpu_origin?end-cpu_origin:UINT64_MAX);
+        }
         atomic_store_explicit(&local_transport_cpu, transport_cpu, memory_order_relaxed);
         if (cpu_end >= loop_cpu) transport_round_cpu += cpu_end - loop_cpu;
         if (ordinary_due && !client_urgent) {
@@ -2180,7 +2246,7 @@ int peak_global_budget_start(const char *host, unsigned short port, unsigned ran
     atomic_store(&control_proof_sequence, 0); atomic_store(&reply_goal_sequence,0); atomic_store(&minimum_target_ns,0); atomic_store(&admission_target_ns,0); atomic_store(&admission_cash_ns,0); atomic_store(&admission_closing_ns,0);
     atomic_store(&physical_targets, 0); atomic_store(&earned_origin, 0); atomic_store(&local_retiring, false);
     atomic_store(&rejected_spend_count, 0); atomic_store(&available_ns, 0); atomic_store(&local_attached, 0); atomic_store(&recovery_target_ns, 0); atomic_store(&request_recovery, false); atomic_store(&request_metadata,false);
-    atomic_store(&finalizer_state, 0); atomic_store(&public_finalized, false);
+    atomic_store(&finalizer_state, 0); atomic_store(&finalizer_baseline_ns,0); atomic_store(&public_finalized, false);
     atomic_store(&public_accounting_invalid, false); atomic_store(&root_final_sent, false);
     atomic_store(&debit_ns, 0); atomic_store(&returned_ns, 0); atomic_store(&public_demand_ack, 0); atomic_store(&request_started_ns, 0); atomic_store(&public_deadline, 0); atomic_store(&low_water_ns, 100000); atomic_store(&refill_rtt, .005); atomic_store(&consumption_rate, 0);
     atomic_store(&flush_requested, false); atomic_store(&local_transport_cpu, 0); atomic_store(&startup_charge, 0); atomic_store(&local_completed_wave, 0); atomic_store(&granted_ns, 0); atomic_store(&consumed_ns, 0); atomic_store(&consumed_control_ns, 0); atomic_store(&pressure_notice, false); atomic_store(&requested_ns, 0); atomic_store(&minimum_target_ns,0); atomic_store(&admission_target_ns,0); atomic_store(&admission_cash_ns,0); atomic_store(&admission_closing_ns,0); atomic_store(&demand_generation, 0);
@@ -2311,6 +2377,9 @@ void peak_global_budget_finalizer(clockid_t clock, uint64_t start, double baseli
     if (!number(baseline)) { atomic_store(&public_accounting_invalid, true); atomic_store(&finalizer_state, 3); poke(); return; }
     atomic_store(&finalizer_clock, clock); atomic_store(&finalizer_start, start);
     atomic_store(&finalizer_baseline, baseline);
+    pthread_mutex_lock(&sample_mutex);
+    atomic_store(&finalizer_baseline_ns,local_sample.raw_management_ns);
+    pthread_mutex_unlock(&sample_mutex);
     atomic_store_explicit(&finalizer_state, 2, memory_order_release); poke();
 }
 void peak_global_budget_complete(uint64_t wave)

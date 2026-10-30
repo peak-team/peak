@@ -78,6 +78,11 @@ static size_t retired_contexts;
 static uint64_t sequence, last_mpi, next_request;
 static int world_rank;
 static unsigned active_calls;
+static uint64_t runtime_epoch, runtime_raw[PEAK_RUNTIME_COMPONENTS];
+static uint64_t runtime_outside[PEAK_RUNTIME_COMPONENTS], runtime_sum[PEAK_RUNTIME_COMPONENTS];
+static unsigned runtime_active[PEAK_RUNTIME_COMPONENTS];
+static bool runtime_closed;
+static void runtime_snapshot_locked(PeakMpiBudgetCostSnapshot *snapshot);
 static int stream_closed;
 static _Atomic int frontend_ready;
 static int uncertifiable_state;
@@ -540,11 +545,92 @@ static void emit(PeakMpiBudgetEvent e)
         last_mpi = e.seq;
     PeakMpiBudgetCostSnapshot cost={0};
     peak_mpi_budget_cost_snapshot(&cost);
+    runtime_snapshot_locked(&cost);
     uint64_t parts[]={cost.active_outside_ns,cost.active_inside_ns,
                       cost.ignored_outside_ns,cost.ignored_inside_ns};
     e.cumulative_cost_ns=0;
     for(size_t i=0;i<4;i++)e.cumulative_cost_ns=UINT64_MAX-e.cumulative_cost_ns<parts[i]?UINT64_MAX:e.cumulative_cost_ns+parts[i];
     peak_global_budget_mpi_event_submit(&e,&cost);
+}
+static uint64_t runtime_add(uint64_t a, uint64_t b)
+{
+    return b > UINT64_MAX-a ? UINT64_MAX : a+b;
+}
+static void runtime_snapshot_locked(PeakMpiBudgetCostSnapshot *snapshot)
+{
+    snapshot->runtime_raw_ns=0;
+    snapshot->runtime_outside_ns=0;
+    snapshot->runtime_sum_ns=0;
+    for(unsigned i=0;i<PEAK_RUNTIME_COMPONENTS;i++) {
+        snapshot->runtime_raw_ns=runtime_add(snapshot->runtime_raw_ns,runtime_raw[i]);
+        snapshot->runtime_outside_ns=runtime_add(snapshot->runtime_outside_ns,runtime_outside[i]);
+        snapshot->runtime_sum_ns=runtime_add(snapshot->runtime_sum_ns,runtime_sum[i]);
+    }
+}
+static void runtime_observe_locked(unsigned component, uint64_t raw)
+{
+    if(raw>runtime_raw[component])runtime_raw[component]=raw;
+    uint64_t classified=runtime_add(runtime_outside[component],runtime_sum[component]);
+    if(!runtime_active[component] && runtime_raw[component]>classified)
+        runtime_sum[component]=runtime_add(runtime_sum[component],runtime_raw[component]-classified);
+}
+PeakMpiRuntimeSpan peak_mpi_budget_runtime_begin(PeakMpiRuntimeComponent component)
+{
+    PeakMpiRuntimeSpan span={0};
+    if(component>=PEAK_RUNTIME_COMPONENTS)return span;
+    pthread_mutex_lock(&lock);
+    span=(PeakMpiRuntimeSpan){.mpi_sequence=last_mpi,.lifecycle_epoch=runtime_epoch,
+        .component=(unsigned)component,.registered=true,
+        .eligible=atomic_load_explicit(&frontend_ready,memory_order_acquire) &&
+            peak_global_budget_mpi_events_enabled() && !active_calls &&
+            !stream_closed && !uncertifiable_state && !runtime_closed};
+    ++runtime_active[component];
+    pthread_mutex_unlock(&lock);
+    return span;
+}
+void peak_mpi_budget_runtime_end(PeakMpiRuntimeSpan *span, uint64_t own_ns,
+    uint64_t raw_after)
+{
+    if(!span || !span->registered)return;
+    pthread_mutex_lock(&lock);
+    unsigned component=span->component;
+    bool outside=span->eligible && span->mpi_sequence==last_mpi &&
+        span->lifecycle_epoch==runtime_epoch && !active_calls && !runtime_closed &&
+        !stream_closed && !uncertifiable_state && peak_global_budget_mpi_events_enabled();
+    if(raw_after>runtime_raw[component])runtime_raw[component]=raw_after;
+    uint64_t *classified=outside?runtime_outside:runtime_sum;
+    classified[component]=runtime_add(classified[component],own_ns);
+    --runtime_active[component];
+    span->registered=false;
+    runtime_observe_locked(component,raw_after);
+    /* Transport must never create send -> classification -> send feedback.
+     * Its prefix is captured by the next genuine ordered event instead. */
+    if(own_ns && own_ns!=UINT64_MAX && component!=PEAK_RUNTIME_TRANSPORT &&
+       atomic_load_explicit(&frontend_ready,memory_order_acquire) &&
+       !runtime_closed && !stream_closed && !uncertifiable_state &&
+       peak_global_budget_mpi_events_enabled())
+        emit((PeakMpiBudgetEvent){.kind=PEAK_MPI_EVENT_FRONTIER});
+    pthread_mutex_unlock(&lock);
+}
+void peak_mpi_budget_runtime_observe(PeakMpiRuntimeComponent component, uint64_t raw)
+{
+    if(component>=PEAK_RUNTIME_COMPONENTS)return;
+    pthread_mutex_lock(&lock);
+    runtime_observe_locked((unsigned)component,raw);
+    pthread_mutex_unlock(&lock);
+}
+void peak_mpi_budget_runtime_snapshot(PeakMpiBudgetCostSnapshot *snapshot)
+{
+    if(!snapshot)return;
+    pthread_mutex_lock(&lock);
+    runtime_snapshot_locked(snapshot);
+    pthread_mutex_unlock(&lock);
+}
+void peak_mpi_budget_runtime_classification_close(void)
+{
+    pthread_mutex_lock(&lock);
+    if(!runtime_closed){runtime_closed=true;++runtime_epoch;}
+    pthread_mutex_unlock(&lock);
 }
 static void unknown_plain(void) { emit((PeakMpiBudgetEvent){.kind=PEAK_MPI_EVENT_UNKNOWN}); }
 /* Unmodeled synchronous dependencies require an actual WORLD entry fence. */

@@ -6,7 +6,7 @@
 #include <string.h>
 
 #define PEAK_GLOBAL_BUDGET_PROTOCOL_MAGIC UINT32_C(0x50474231)
-#define PEAK_GLOBAL_BUDGET_PROTOCOL_VERSION 7
+#define PEAK_GLOBAL_BUDGET_PROTOCOL_VERSION 8
 
 typedef struct {
     uint32_t magic, version, rank, size;
@@ -52,7 +52,9 @@ typedef struct {
     F64(view.transport_seconds) F64(view.refill_rtt_seconds) \
     F64(view.consumption_rate) \
     U64(sample.background_period_ns) U64(view.background_period_ns) \
-    U64(view.freshness_ns) BOOL(request_reply) U64(minimum_ns)
+    U64(view.freshness_ns) BOOL(request_reply) U64(minimum_ns) \
+    BOOL(sample.runtime_supported) U64(sample.runtime_raw_ns) \
+    U64(sample.runtime_outside_ns) U64(sample.runtime_sum_ns)
 
 #define PEAK_WIRE_SIZE_U32(field) + 4
 #define PEAK_WIRE_SIZE_U64(field) + 8

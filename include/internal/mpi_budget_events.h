@@ -2,6 +2,7 @@
 #define PEAK_MPI_BUDGET_EVENTS_H
 #include <stddef.h>
 #include <stdint.h>
+#include <stdbool.h>
 /* Sink copies all pointed-to arrays before returning. No MPI calls, waits for
  * broker credit, or callbacks into this frontend are permitted in the sink. */
 typedef enum {
@@ -39,7 +40,23 @@ typedef struct {
 typedef struct {
     uint64_t active_outside_ns, active_inside_ns;
     uint64_t ignored_outside_ns, ignored_inside_ns;
+    uint64_t runtime_raw_ns, runtime_outside_ns, runtime_sum_ns;
 } PeakMpiBudgetCostSnapshot;
+typedef enum { PEAK_RUNTIME_CONTROL, PEAK_RUNTIME_MANAGEMENT,
+               PEAK_RUNTIME_TRANSPORT, PEAK_RUNTIME_COMPONENTS } PeakMpiRuntimeComponent;
+typedef struct {
+    uint64_t mpi_sequence, lifecycle_epoch;
+    unsigned component;
+    bool registered, eligible;
+} PeakMpiRuntimeSpan;
+/* Own measured delta only. raw_after is the authoritative cumulative raw
+ * component after publishing that delta; no stream lock spans the activity. */
+PeakMpiRuntimeSpan peak_mpi_budget_runtime_begin(PeakMpiRuntimeComponent component);
+void peak_mpi_budget_runtime_end(PeakMpiRuntimeSpan *span, uint64_t own_ns,
+                                uint64_t raw_after);
+void peak_mpi_budget_runtime_observe(PeakMpiRuntimeComponent component, uint64_t raw);
+void peak_mpi_budget_runtime_snapshot(PeakMpiBudgetCostSnapshot *snapshot);
+void peak_mpi_budget_runtime_classification_close(void);
 int peak_global_budget_mpi_events_enabled(void);
 /* One shared funded foreground metadata operation (outer wrapper). Failure
  * permanently closes this run's metadata gate; application MPI still runs. */

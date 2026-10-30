@@ -7,9 +7,15 @@
 #if defined(__APPLE__)
 extern int peak_mpi_application_active(void) __attribute__((weak_import));
 extern void peak_mpi_budget_events_frontier(void) __attribute__((weak_import));
+extern PeakMpiRuntimeSpan peak_mpi_budget_runtime_begin(PeakMpiRuntimeComponent) __attribute__((weak_import));
+extern void peak_mpi_budget_runtime_end(PeakMpiRuntimeSpan *, uint64_t, uint64_t) __attribute__((weak_import));
+extern void peak_mpi_budget_runtime_classification_close(void) __attribute__((weak_import));
 #elif defined(__GNUC__) || defined(__clang__)
 extern int peak_mpi_application_active(void) __attribute__((weak));
 extern void peak_mpi_budget_events_frontier(void) __attribute__((weak));
+extern PeakMpiRuntimeSpan peak_mpi_budget_runtime_begin(PeakMpiRuntimeComponent) __attribute__((weak));
+extern void peak_mpi_budget_runtime_end(PeakMpiRuntimeSpan *, uint64_t, uint64_t) __attribute__((weak));
+extern void peak_mpi_budget_runtime_classification_close(void) __attribute__((weak));
 #endif
 #endif
 #include "dlopen_interceptor.h"
@@ -308,11 +314,13 @@ static clockid_t peak_global_finalizer_clock;
 static uint64_t peak_global_finalizer_cpu_start;
 static gboolean peak_global_finalizer_clock_registered;
 
+static void peak_general_listener_runtime_close(void);
 void peak_general_listener_begin_teardown_cpu(clockid_t clock, uint64_t start_ns)
 {
     peak_global_finalizer_clock = clock;
     peak_global_finalizer_cpu_start = start_ns;
     peak_global_finalizer_clock_registered = TRUE;
+    peak_general_listener_runtime_close();
 }
 
 static void peak_general_listener_write_global_budget_diagnostics(gboolean settled);
@@ -861,6 +869,50 @@ void peak_general_listener_account_teardown_cpu(unsigned long long delta_ns)
     peak_general_listener_management_cpu_add_saturating(delta_ns);
 }
 
+static PeakMpiRuntimeSpan
+peak_general_listener_runtime_begin(PeakMpiRuntimeComponent component)
+{
+    PeakMpiRuntimeSpan span={0};
+#ifdef HAVE_MPI
+    unsigned long long before=0,after=0;
+    gboolean meter=peak_global_configured && component==PEAK_RUNTIME_CONTROL && peak_general_listener_thread_cpu_ns(&before);
+    if(peak_global_configured && peak_mpi_budget_runtime_begin)
+        span=peak_mpi_budget_runtime_begin(component);
+    if(meter && peak_general_listener_thread_cpu_ns(&after) && after>=before)
+        peak_general_listener_management_cpu_add_saturating(after-before);
+#else
+    (void)component;
+#endif
+    return span;
+}
+static void
+peak_general_listener_runtime_end(PeakMpiRuntimeSpan *span, uint64_t own, uint64_t raw)
+{
+#ifdef HAVE_MPI
+    unsigned long long before=0,after=0;
+    gboolean meter=span->registered && span->component==PEAK_RUNTIME_CONTROL &&
+        peak_general_listener_thread_cpu_ns(&before);
+    if(span->registered && peak_mpi_budget_runtime_end)
+        peak_mpi_budget_runtime_end(span,own,raw);
+    if(meter && peak_general_listener_thread_cpu_ns(&after) && after>=before)
+        peak_general_listener_management_cpu_add_saturating(after-before);
+#else
+    (void)span;(void)own;(void)raw;
+#endif
+}
+static void
+peak_general_listener_runtime_close(void)
+{
+#ifdef HAVE_MPI
+    unsigned long long before=0,after=0;
+    gboolean meter=peak_global_configured && !peak_global_finalizer_clock_registered &&
+        peak_general_listener_thread_cpu_ns(&before);
+    if(peak_global_configured && peak_mpi_budget_runtime_classification_close)
+        peak_mpi_budget_runtime_classification_close();
+    if(meter && peak_general_listener_thread_cpu_ns(&after) && after>=before)
+        peak_general_listener_management_cpu_add_saturating(after-before);
+#endif
+}
 static double
 peak_general_listener_management_cpu_seconds(void)
 {
@@ -5517,7 +5569,10 @@ peak_general_controller_thread_main(void* arg)
                                  memory_order_acquire);
 
         (void)pthread_listener_reclaim_detached_slots();
+        PeakMpiRuntimeSpan control_span=peak_general_listener_runtime_begin(PEAK_RUNTIME_CONTROL);
         pthread_mutex_lock(&lock);
+        PeakDetachAccountingSnapshot runtime_before={0},runtime_after={0};
+        gboolean runtime_before_valid=control_span.registered && peak_detach_controller_accounting_snapshot(&runtime_before);
         PeakGlobalBudgetView global_view = {0};
         if (peak_global_configured) global_view = peak_global_budget_view();
         if (global_view.active && global_view.wave > peak_global_applied_wave) {
@@ -5549,7 +5604,14 @@ peak_general_controller_thread_main(void* arg)
                 peak_global_events[before].control_fee_ns = peak_global_admission_seconds_ns(
                     MAX(peak_global_closing_window_seconds, peak_detach_controller_last_stop_window_us() / 1e6));
         }
+        gboolean runtime_after_valid=control_span.registered && peak_detach_controller_accounting_snapshot(&runtime_after);
         pthread_mutex_unlock(&lock);
+        uint64_t runtime_raw=runtime_after_valid?
+            peak_general_listener_control_wall_ns_since_heartbeat(&runtime_after):UINT64_MAX;
+        uint64_t runtime_base=runtime_before_valid?
+            peak_general_listener_control_wall_ns_since_heartbeat(&runtime_before):UINT64_MAX;
+        peak_general_listener_runtime_end(&control_span,
+            runtime_raw>=runtime_base?runtime_raw-runtime_base:UINT64_MAX,runtime_raw);
         if (return_idle) peak_general_listener_finish_idle_return();
         if (peak_global_configured && !global_view.active && peak_global_budget_active())
             peak_general_listener_controller_wake();
@@ -5674,7 +5736,9 @@ peak_general_listener_controller_stop(void)
                 .profile_inside_seconds = (double)sample_cost.active_inside_ns / 1e9 +
                     (double)sample_cost.ignored_inside_ns / 1e9,
                 .control_seconds = (double)peak_general_listener_control_wall_ns_since_heartbeat(&accounting) / 1e9,
+                .raw_control_ns = peak_general_listener_control_wall_ns_since_heartbeat(&accounting),
                 .management_seconds = peak_general_listener_management_cpu_seconds(),
+                .raw_management_ns = atomic_load_explicit(&peak_general_listener_heartbeat_management_cpu_ns,memory_order_acquire),
                 .unfunded_seconds = (double)MIN(atomic_load(&peak_global_grace_claimed_ns), PEAK_GLOBAL_GRACE_NS) / 1e9,
                 .elapsed_seconds = peak_second() - peak_main_time,
                 .closing_seconds = peak_global_closing_seconds,
@@ -5715,10 +5779,12 @@ peak_general_listener_global_budget_shutdown(int all_ranks_retired_proven)
         final_sample.sequence = atomic_fetch_add(&peak_global_sample_sequence, 1) + 1;
         final_sample.initial_unexposed = atomic_load(&peak_global_initial_unexposed);
         final_sample.management_seconds = peak_general_listener_management_cpu_seconds();
+        final_sample.raw_management_ns = atomic_load_explicit(&peak_general_listener_heartbeat_management_cpu_ns,memory_order_acquire);
         final_sample.settled_control_credit_ns = peak_global_settled_control_credit_ns;
         PeakDetachAccountingSnapshot final_accounting;
         if (peak_general_listener_runtime_accounting_snapshot(&final_accounting)) {
             final_sample.control_seconds = (double)peak_general_listener_control_wall_ns_since_heartbeat(&final_accounting) / 1e9;
+            final_sample.raw_control_ns = peak_general_listener_control_wall_ns_since_heartbeat(&final_accounting);
         } else {
             peak_general_listener_global_accounting_invalid();
         }
@@ -6215,6 +6281,10 @@ void* peak_heartbeat_monitor(void* arg) {
             peak_general_listener_thread_cpu_ns(
                 &management_cpu_checkpoint_ns);
         uint64_t heartbeat_cpu_start_ns = management_cpu_checkpoint_ns;
+        PeakMpiRuntimeSpan management_span=peak_general_listener_runtime_begin(PEAK_RUNTIME_MANAGEMENT);
+        unsigned long long management_span_cpu=management_cpu_checkpoint_ns;
+        if(management_span.registered)
+            (void)peak_general_listener_thread_cpu_ns(&management_span_cpu);
         gboolean force_admission = atomic_exchange(&peak_global_heartbeat_credit_ready, false);
         gboolean wake_controller = FALSE;
         heartbeat_counter++;
@@ -6404,7 +6474,9 @@ void* peak_heartbeat_monitor(void* arg) {
             .profile_inside_seconds = (double)sample_cost.active_inside_ns / 1e9 +
                 (double)sample_cost.ignored_inside_ns / 1e9,
             .control_seconds = control_spent_seconds,
+            .raw_control_ns = control_pause_wall_ns,
             .management_seconds = peak_general_listener_management_cpu_seconds(),
+            .raw_management_ns = atomic_load_explicit(&peak_general_listener_heartbeat_management_cpu_ns,memory_order_acquire),
             .elapsed_seconds = total_execution_time,
             .closing_seconds = peak_global_closing_seconds,
             .pressure = MAX(attached_recent_sum, attached_lifetime_sum),
@@ -6419,7 +6491,7 @@ void* peak_heartbeat_monitor(void* arg) {
                 /* A real local cost frontier, not an MPI synchronization edge.
                  * This runs outside all listener/sample locks. Its entire CPU
                  * cost belongs to the existing HB management clock and cadence. */
-                if (peak_mpi_budget_events_frontier != NULL)
+                if (!peak_mpi_budget_runtime_end && peak_mpi_budget_events_frontier != NULL)
                     peak_mpi_budget_events_frontier();
 #endif
                 pthread_mutex_lock(&lock);
@@ -7135,6 +7207,19 @@ void* peak_heartbeat_monitor(void* arg) {
         peak_general_listener_management_cpu_checkpoint(
             &management_cpu_checkpoint_ns,
             &management_cpu_checkpoint_valid);
+        if(management_span.registered) {
+            unsigned long long management_span_end=0;
+            if(peak_general_listener_thread_cpu_ns(&management_span_end) && management_span_end>=management_span_cpu) {
+                peak_general_listener_management_cpu_checkpoint(&management_cpu_checkpoint_ns,
+                                                                &management_cpu_checkpoint_valid);
+                peak_general_listener_runtime_end(&management_span,management_span_end-management_span_cpu,
+                    atomic_load_explicit(&peak_general_listener_heartbeat_management_cpu_ns,memory_order_acquire));
+            } else peak_general_listener_runtime_end(&management_span,UINT64_MAX,UINT64_MAX);
+            /* Classification/publication footer is real management CPU but is
+             * not recursively wrapped in another classification operation. */
+            peak_general_listener_management_cpu_checkpoint(&management_cpu_checkpoint_ns,
+                                                            &management_cpu_checkpoint_valid);
+        }
         if (!peak_heartbeat_wait_us(background_sleep_us)) {
             break;
         }
@@ -7171,6 +7256,7 @@ peak_general_listener_suspend_callbacks(void)
 void
 peak_general_listener_note_mpi_finalize_requested(void)
 {
+    peak_general_listener_runtime_close();
     atomic_store_explicit(&peak_general_mpi_finalize_requested,
                           TRUE,
                           memory_order_release);
@@ -10196,7 +10282,7 @@ peak_general_listener_write_global_budget_diagnostics(gboolean settled)
             (unsigned long long)global.freshness_ns, global.transport_seconds);
         if (settled) {
             PeakGlobalBudgetLocalBill bill = peak_global_budget_local_bill();
-            peak_log_report("[peak] MPI global local bill: written=%d retiring=%d final=%d sample_sequence=%llu message_sequence=%llu acknowledged_sample_sequence=%llu profile_sample_seconds=%.17g profile_debit_ns=%llu frontend_debit_ns=%llu profile_billed_seconds=%.17g ignored_seconds=%.17g profile_inside_seconds=%.17g frontend_seconds=%.17g control_seconds=%.17g management_input_seconds=%.17g management_sent_seconds=%.17g transport_seconds=%.17g finalizer_registered=%d finalizer_baseline_seconds=%.17g finalizer_cpu_seconds=%.17g finalizer_override_seconds=%.17g management_increment_seconds=%.17g total_seconds=%.17g\n",
+            peak_log_report("[peak] MPI global local bill: written=%d retiring=%d final=%d sample_sequence=%llu message_sequence=%llu acknowledged_sample_sequence=%llu profile_sample_seconds=%.17g profile_debit_ns=%llu frontend_debit_ns=%llu profile_billed_seconds=%.17g ignored_seconds=%.17g profile_inside_seconds=%.17g frontend_seconds=%.17g control_seconds=%.17g management_input_seconds=%.17g management_sent_seconds=%.17g transport_seconds=%.17g finalizer_registered=%d finalizer_baseline_seconds=%.17g finalizer_cpu_seconds=%.17g finalizer_override_seconds=%.17g management_increment_seconds=%.17g total_seconds=%.17g runtime_supported=%d runtime_raw_ns=%llu runtime_outside_ns=%llu runtime_sum_ns=%llu\n",
                 bill.written, bill.retiring, bill.final,
                 (unsigned long long)bill.sample_sequence,
                 (unsigned long long)bill.message_sequence,
@@ -10208,7 +10294,9 @@ peak_general_listener_write_global_budget_diagnostics(gboolean settled)
                 bill.management_input_seconds, bill.management_sent_seconds, bill.transport_seconds,
                 bill.finalizer_registered, bill.finalizer_baseline_seconds,
                 bill.finalizer_cpu_seconds, bill.finalizer_override_seconds,
-                bill.management_increment_seconds, bill.total_seconds);
+                bill.management_increment_seconds, bill.total_seconds, bill.runtime_supported,
+                (unsigned long long)bill.runtime_raw_ns, (unsigned long long)bill.runtime_outside_ns,
+                (unsigned long long)bill.runtime_sum_ns);
         }
         uint64_t ignored_calls = 0;
         size_t used_slots = atomic_load_explicit(&peak_budget_lane_highwater, memory_order_acquire);
@@ -10562,6 +10650,8 @@ peak_general_listener_print_with_mpi_job_policy(
     gboolean active_mpi_job,
     gboolean* report_write_succeeded)
 {
+    if(aggregation_mode == PEAK_OUTPUT_AGGREGATION_MPI)
+        peak_general_listener_runtime_close();
     gboolean used_mpi_aggregation = FALSE;
     gboolean write_succeeded = FALSE;
     gboolean report_capture_ready;

@@ -9,7 +9,7 @@
 #include <spawn.h>
 #include <sys/wait.h>
 
-/* Exercise the v7 metadata payload from a capable application through the
+/* Exercise the v8 metadata payload from a capable application through the
  * MPI-free native broker, not just a local encoder/decoder round trip. */
 void peak_mpi_budget_events_frontier(void) {}
 
