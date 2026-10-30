@@ -249,7 +249,8 @@ static gboolean peak_soft_calibration_valid;
 static gboolean peak_soft_rental_scan; /* listener lock */
 static double peak_general_listener_ignored_seconds(void);
 static double peak_general_listener_inside_seconds(void);
-static void peak_general_listener_soft_pause(PeakGeneralListener* listener);
+static gboolean peak_general_listener_soft_pause(PeakGeneralListener* listener);
+static gboolean peak_general_listener_pressure_cannot_admit(const PeakGlobalBudgetView* view);
 
 static _Atomic uint64_t peak_global_grace_claimed_ns;
 #define PEAK_GLOBAL_GRACE_NS UINT64_C(500000)
@@ -1476,7 +1477,7 @@ peak_general_listener_record_budget_call(size_t slot, gboolean ignored, gboolean
     }
 }
 
-static void
+static gboolean
 peak_general_listener_soft_pause(PeakGeneralListener* listener)
 {
     if (!atomic_exchange_explicit(&listener->soft_paused, TRUE, memory_order_acq_rel)) {
@@ -1489,7 +1490,9 @@ peak_general_listener_soft_pause(PeakGeneralListener* listener)
             atomic_store_explicit(&peak_global_admission_waiting, true, memory_order_release);
             peak_global_budget_listener_credit_ready();
         }
+        return TRUE;
     }
+    return FALSE;
 }
 
 static inline gulong*
@@ -5296,9 +5299,19 @@ peak_general_controller_publish_detach_count_requests_unlocked(void)
                 double seconds = 0;
                 (void)peak_general_listener_refresh_hook_sample_cache_unlocked(hook_id, &calls, &seconds);
                 double elapsed = peak_second() - peak_main_time;
+                /* Callback pressure may disable only this observed hook. A
+                 * racing funded observation promise wins over the old edge. */
+                PeakGlobalBudgetView current = peak_global_budget_view();
+                gboolean immediate_close = peak_soft_calibration_valid &&
+                    atomic_load_explicit(&listener->soft_paused, memory_order_acquire) &&
+                    atomic_load_explicit(&listener->initial_observation_remaining, memory_order_relaxed) == 0 &&
+                    peak_hook_pending_observation_ns[hook_id] == 0 &&
+                    peak_general_listener_pressure_cannot_admit(&current);
+                peak_soft_rental_scan = immediate_close;
                 (void)peak_general_listener_request_detach_with_context_unlocked(hook_id,
                     source, calls, elapsed > 0 ? seconds / elapsed : 0,
                     0, elapsed, 0);
+                peak_soft_rental_scan = FALSE;
                 continue;
             }
             peak_general_controller_request_mpi_burst_wave_unlocked();
@@ -7412,6 +7425,45 @@ peak_general_listener_monotonic_ns(void)
            (guint64)now.tv_nsec;
 }
 
+static gboolean
+peak_general_listener_pressure_cannot_admit(const PeakGlobalBudgetView* view)
+{
+    uint64_t lease = peak_budget_cost_ns(PEAK_BURST_BUDGET_STRIDE, peak_general_overhead);
+    /* Issued operating cash plus a real closing reservation can be waiting
+     * for its completed-cost ACK. Shared debt alone cannot cancel that wait. */
+    gboolean funded_wait = lease != UINT64_MAX && view->local_credit_ns >= lease &&
+        view->local_closing_reserved_seconds > 0;
+    return view->active && !funded_wait &&
+        (lease == UINT64_MAX || view->local_credit_ns < lease ||
+         view->budget_seconds < view->global_spent_seconds +
+             view->reserved_seconds + view->control_reserve_seconds);
+}
+
+static void
+peak_general_listener_pause_for_pressure(PeakGeneralListener* listener)
+{
+    unsigned long long cpu_start = 0, cpu_end = 0;
+    gboolean metered = peak_general_listener_thread_cpu_ns(&cpu_start);
+    gboolean changed = peak_general_listener_soft_pause(listener);
+    if (changed && peak_global_configured && peak_soft_calibration_valid &&
+        !listener->soft_pause_calibration && !atomic_load(&peak_global_retiring)) {
+        PeakGlobalBudgetView view = peak_global_budget_view();
+        if (peak_general_listener_pressure_cannot_admit(&view)) {
+            unsigned long long control = atomic_load_explicit(
+                &listener->callback_hook_control, memory_order_acquire);
+            if (peak_general_listener_callback_hook_state(control) == PEAK_HOOK_ATTACHED &&
+                !(control & (PEAK_CALLBACK_BURST_REQUEST_BIT | PEAK_CALLBACK_DETACH_COUNT_REQUEST_BIT))) {
+                unsigned long long request = control | PEAK_CALLBACK_BURST_REQUEST_BIT;
+                if (atomic_compare_exchange_strong_explicit(&listener->callback_hook_control,
+                        &control, request, memory_order_acq_rel, memory_order_relaxed))
+                    peak_general_listener_controller_wake();
+            }
+        }
+    }
+    if (metered && peak_general_listener_thread_cpu_ns(&cpu_end) && cpu_end >= cpu_start)
+        peak_general_listener_management_cpu_add_saturating(cpu_end - cpu_start);
+}
+
 static inline __attribute__((always_inline)) gboolean
 peak_general_listener_take_initial_observation(PeakGeneralListener* listener)
 {
@@ -7426,7 +7478,7 @@ peak_general_listener_take_initial_observation(PeakGeneralListener* listener)
             /* The next exposure needs a paid closing/operating admission, even
              * if another hook left spendable credit in the shared wallet. */
             if (remaining == 1 && peak_soft_calibration_valid)
-                peak_general_listener_soft_pause(listener);
+                peak_general_listener_pause_for_pressure(listener);
             return TRUE;
         }
     }
@@ -7480,7 +7532,7 @@ peak_general_listener_profile_gate(PeakGeneralListener* listener, size_t index,
             peak_general_listener_record_budget_call(index, FALSE, FALSE);
             return TRUE;
         }
-        peak_general_listener_soft_pause(listener);
+        peak_general_listener_pause_for_pressure(listener);
         peak_global_budget_pressure(); /* One edge, never one wake per ignored call. */
     }
     peak_general_listener_soft_pause(listener);

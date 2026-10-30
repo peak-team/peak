@@ -1276,12 +1276,16 @@ typedef struct BrokerExit {
 typedef struct {
     BrokerRecord *head, *tail;
     BrokerExit *exits;
-    bool at_cut, entry_fence;
+    bool at_cut, entry_fence, queued;
+    uint64_t ready_pass;
 } BrokerLane;
 typedef struct {
     PeakGlobalBudgetCausal *model;
     Rank *ranks;
     BrokerLane *lanes;
+    unsigned *ready;
+    unsigned ready_count, reached, fenced, drain_cursor;
+    uint64_t drain_pass;
     unsigned count;
     bool cut_active, draining, invalid, closed;
     uint32_t owner;
@@ -1293,7 +1297,11 @@ static bool broker_metadata_init(BrokerMetadata *metadata,
 {
     *metadata = (BrokerMetadata){.model=model, .ranks=ranks, .count=count};
     metadata->lanes = calloc(count, sizeof(*metadata->lanes));
-    return metadata->lanes != NULL;
+    metadata->ready = calloc(count, sizeof(*metadata->ready));
+    if (metadata->lanes && metadata->ready) return true;
+    free(metadata->lanes); free(metadata->ready);
+    metadata->lanes=NULL; metadata->ready=NULL;
+    return false;
 }
 static void broker_metadata_clear(BrokerMetadata *metadata)
 {
@@ -1309,6 +1317,41 @@ static void broker_metadata_clear(BrokerMetadata *metadata)
         }
     }
     free(metadata->lanes);
+    free(metadata->ready);
+}
+static bool broker_ready_before(const BrokerMetadata *metadata, unsigned a, unsigned b)
+{
+    return metadata->lanes[a].ready_pass < metadata->lanes[b].ready_pass ||
+        (metadata->lanes[a].ready_pass == metadata->lanes[b].ready_pass && a < b);
+}
+static void broker_ready_push(BrokerMetadata *metadata, unsigned member)
+{
+    BrokerLane *lane=&metadata->lanes[member];
+    if (lane->queued || lane->at_cut || !lane->head) return;
+    lane->queued=true;
+    lane->ready_pass=metadata->draining ? metadata->drain_pass + (member<metadata->drain_cursor) : 0;
+    unsigned position=metadata->ready_count++;
+    while (position) {
+        unsigned parent=(position-1)/2;
+        if (!broker_ready_before(metadata,member,metadata->ready[parent])) break;
+        metadata->ready[position]=metadata->ready[parent]; position=parent;
+    }
+    metadata->ready[position]=member;
+}
+static unsigned broker_ready_pop(BrokerMetadata *metadata)
+{
+    unsigned member=metadata->ready[0], last=metadata->ready[--metadata->ready_count];
+    unsigned position=0;
+    while (position*2+1<metadata->ready_count) {
+        unsigned child=position*2+1;
+        if (child+1<metadata->ready_count &&
+            broker_ready_before(metadata,metadata->ready[child+1],metadata->ready[child])) ++child;
+        if (!broker_ready_before(metadata,metadata->ready[child],last)) break;
+        metadata->ready[position]=metadata->ready[child]; position=child;
+    }
+    if (metadata->ready_count) metadata->ready[position]=last;
+    metadata->lanes[member].queued=false;
+    return member;
 }
 static BrokerExit *broker_exit(BrokerLane *lane, uint32_t owner_id,
     uint64_t context, bool create)
@@ -1326,8 +1369,10 @@ static BrokerExit *broker_exit(BrokerLane *lane, uint32_t owner_id,
 static void broker_cut_release(BrokerMetadata *metadata)
 {
     metadata->cut_active = false;
+    metadata->reached=metadata->fenced=0;
     for (unsigned i = 0; i < metadata->count; ++i) {
         metadata->lanes[i].at_cut = false; metadata->lanes[i].entry_fence = false;
+        broker_ready_push(metadata,i);
     }
 }
 /* A valid opaque live operation cannot be recertified. Retain its raw bill,
@@ -1339,6 +1384,7 @@ static void broker_metadata_close(BrokerMetadata *metadata)
     metadata->closed=true;
     peak_global_budget_causal_fallback(metadata->model);
     broker_cut_release(metadata);
+    metadata->ready_count=0;
     for(unsigned i=0;i<metadata->count;++i) {
         BrokerLane *lane=&metadata->lanes[i];
         while(lane->head) {
@@ -1346,6 +1392,7 @@ static void broker_metadata_close(BrokerMetadata *metadata)
             free(lane->head);lane->head=next;
         }
         lane->tail=NULL;
+        lane->queued=false;
     }
 }
 static bool broker_process_event(BrokerMetadata *metadata, unsigned member,
@@ -1396,24 +1443,28 @@ static bool broker_process_event(BrokerMetadata *metadata, unsigned member,
         if (possible) {
             metadata->cut_active = true; metadata->owner = event.context_owner;
             metadata->context = event.context; metadata->round = event.round;
+            metadata->reached=metadata->fenced=0;
             for (unsigned i = 0; i < metadata->count; ++i) {
                 BrokerExit *seen = broker_exit(&metadata->lanes[i], metadata->owner,
                     metadata->context, false);
                 metadata->lanes[i].at_cut = seen && seen->round == metadata->round && seen->certified;
                 metadata->lanes[i].entry_fence = metadata->lanes[i].at_cut && seen->entry_fence;
+                metadata->reached+=metadata->lanes[i].at_cut;
+                metadata->fenced+=metadata->lanes[i].entry_fence;
             }
         }
     }
     if (metadata->cut_active && event.context_owner == metadata->owner &&
         event.context == metadata->context) {
         if (event.round == metadata->round) {
-            metadata->lanes[member].at_cut = true;
-            metadata->lanes[member].entry_fence = exit->entry_fence;
-            bool complete = true, entry_fence = true;
-            for (unsigned i = 0; i < metadata->count; ++i) {
-                complete = complete && metadata->lanes[i].at_cut;
-                entry_fence = entry_fence && metadata->lanes[i].entry_fence;
+            BrokerLane *lane=&metadata->lanes[member];
+            if (!lane->at_cut) { lane->at_cut=true; ++metadata->reached; }
+            if (lane->entry_fence!=exit->entry_fence) {
+                if (exit->entry_fence) ++metadata->fenced; else --metadata->fenced;
+                lane->entry_fence=exit->entry_fence;
             }
+            bool complete=metadata->reached==metadata->count;
+            bool entry_fence=metadata->fenced==metadata->count;
             if (complete) {
                 /* Only the certified prefix has entered the core. Held
                  * future outside costs remain the outer reversible U tail. */
@@ -1435,20 +1486,21 @@ static bool broker_process_event(BrokerMetadata *metadata, unsigned member,
 }
 static bool broker_drain_held(BrokerMetadata *metadata)
 {
-    if (metadata->draining) return true;
+    if (metadata->draining || !metadata->ready_count) return true;
     metadata->draining = true;
-    bool progress = true, valid = true;
-    while (progress && valid) {
-        progress = false;
-        for (unsigned i = 0; i < metadata->count && valid; ++i) {
-            BrokerLane *lane = &metadata->lanes[i];
-            if (lane->at_cut || !lane->head) continue;
-            BrokerRecord *record = lane->head;
-            lane->head = record->next;
-            if (!lane->head) lane->tail = NULL;
-            valid = broker_process_event(metadata, i, record->words);
-            free(record); progress = true;
-        }
+    metadata->drain_pass=0; metadata->drain_cursor=0;
+    bool valid=true;
+    while (metadata->ready_count && valid) {
+        unsigned member=broker_ready_pop(metadata);
+        BrokerLane *lane=&metadata->lanes[member];
+        if (lane->at_cut || !lane->head) continue;
+        metadata->drain_pass=lane->ready_pass; metadata->drain_cursor=member+1;
+        BrokerRecord *record=lane->head;
+        lane->head=record->next;
+        if (!lane->head) lane->tail=NULL;
+        valid=broker_process_event(metadata,member,record->words);
+        free(record);
+        broker_ready_push(metadata,member);
     }
     metadata->draining = false;
     return valid;
@@ -1473,6 +1525,7 @@ static bool broker_accept_event(BrokerMetadata *metadata, unsigned member,
         memcpy(copy->words, record, length*sizeof(uint64_t));
         if (lane->tail) lane->tail->next = copy; else lane->head = copy;
         lane->tail = copy;
+        broker_ready_push(metadata,member);
     } else if (!broker_process_event(metadata, member, record)) return false;
     return broker_drain_held(metadata);
 }
