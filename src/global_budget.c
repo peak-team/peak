@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #if defined(__linux__)
 #include <sys/syscall.h>
 #include "internal/exec_raw_syscall.h"
@@ -1049,22 +1050,33 @@ static int write_frame(Peer *p)
     if (!p->sent) peak_global_budget_frame_encode(p->outgoing_wire, &p->outgoing);
     size_t bytes = PEAK_GLOBAL_BUDGET_WIRE_SIZE + (size_t)p->outgoing.payload_words * 8;
     if (bytes < PEAK_GLOBAL_BUDGET_WIRE_SIZE) return -1;
-    const unsigned char *source;
-    size_t count;
+    struct iovec parts[2];
+    size_t count, budget=IO_CHUNK;
+    size_t part_count=1;
     if (p->sent < PEAK_GLOBAL_BUDGET_WIRE_SIZE) {
-        source = p->outgoing_wire + p->sent;
         count = PEAK_GLOBAL_BUDGET_WIRE_SIZE - p->sent;
+        if(count>budget)count=budget;
+        parts[0]=(struct iovec){p->outgoing_wire+p->sent,count};
+        budget-=count;
+        if(p->sent+count==PEAK_GLOBAL_BUDGET_WIRE_SIZE &&
+           bytes>PEAK_GLOBAL_BUDGET_WIRE_SIZE && budget) {
+            size_t payload=bytes-PEAK_GLOBAL_BUDGET_WIRE_SIZE;
+            if(payload>budget)payload=budget;
+            parts[1]=(struct iovec){p->outgoing_payload,payload};
+            part_count=2;
+        }
     } else {
-        source = p->outgoing_payload + p->sent - PEAK_GLOBAL_BUDGET_WIRE_SIZE;
         count = bytes - p->sent;
+        if(count>budget)count=budget;
+        parts[0]=(struct iovec){p->outgoing_payload+p->sent-PEAK_GLOBAL_BUDGET_WIRE_SIZE,count};
     }
-    if (count > IO_CHUNK) count = IO_CHUNK;
 #ifdef MSG_NOSIGNAL
     const int send_flags = MSG_NOSIGNAL;
 #else
     const int send_flags = 0;
 #endif
-    ssize_t n = send(p->fd, source, count, send_flags);
+    struct msghdr message={.msg_iov=parts,.msg_iovlen=part_count};
+    ssize_t n = sendmsg(p->fd, &message, send_flags);
     if (n > 0) p->sent += (size_t)n;
     else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) return -1;
     if (p->sent == bytes) {
@@ -2156,13 +2168,15 @@ static void *service(void *data)
             }
         }
         uint64_t cpu_end = ns_now(CLOCK_THREAD_CPUTIME_ID);
-        if (cpu_end >= cpu_origin) transport_cpu = (double)(cpu_end - cpu_origin) / 1e9;
         if(transport_span.registered) {
-            uint64_t end=ns_now(CLOCK_THREAD_CPUTIME_ID);
             peak_mpi_budget_runtime_end(&transport_span,
-                end>=transport_span_cpu?end-transport_span_cpu:UINT64_MAX,
-                end>=cpu_origin?end-cpu_origin:UINT64_MAX);
+                cpu_end>=transport_span_cpu?cpu_end-transport_span_cpu:UINT64_MAX,
+                cpu_end>=cpu_origin?cpu_end-cpu_origin:UINT64_MAX);
         }
+        /* The classifier is counter-only, but its actual CPU is still part
+         * of transport cost and the ordinary cadence's measured forecast. */
+        cpu_end = ns_now(CLOCK_THREAD_CPUTIME_ID);
+        if (cpu_end >= cpu_origin) transport_cpu = (double)(cpu_end - cpu_origin) / 1e9;
         atomic_store_explicit(&local_transport_cpu, transport_cpu, memory_order_relaxed);
         if (cpu_end >= loop_cpu) transport_round_cpu += cpu_end - loop_cpu;
         if (ordinary_due && !client_urgent) {

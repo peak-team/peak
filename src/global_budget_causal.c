@@ -42,7 +42,7 @@ struct CausalCollective {
 typedef struct {
     uint64_t height, observed, ordered_cost, covered_floor;
     uint64_t ordered_sequence, processed_sequence, last_mpi_sequence;
-    size_t mpi_depth;
+    size_t mpi_depth, blocked_previous, blocked_next;
     CausalEvent *queue;
     bool ready, blocked;
 } CausalRank;
@@ -57,6 +57,8 @@ struct PeakGlobalBudgetCausal {
     CausalContext **context_index;
     size_t context_index_size, context_count;
     unsigned char *walk_state;
+    uint64_t *walk_generation, walk_epoch;
+    size_t blocked_head;
     CausalWalk *walk;
     size_t *ready_ranks, ready_head, ready_count, blocked_count;
     bool cycle_dirty;
@@ -104,11 +106,13 @@ PeakGlobalBudgetCausal *peak_global_budget_causal_new(size_t world_size) {
     m->match_index = calloc(m->index_size, sizeof(*m->match_index));
     m->ranks = calloc(world_size, sizeof(*m->ranks));
     m->walk_state = calloc(world_size, 1);
+    m->walk_generation=calloc(world_size,sizeof(*m->walk_generation));
+    m->blocked_head=SIZE_MAX;
     m->walk = calloc(world_size, sizeof(*m->walk));
     m->ready_ranks = calloc(world_size, sizeof(*m->ready_ranks));
-    if (!m->ranks || !m->walk_state || !m->walk || !m->ready_ranks ||
+    if (!m->ranks || !m->walk_state || !m->walk_generation || !m->walk || !m->ready_ranks ||
         !m->request_index || !m->match_index || !m->context_index) {
-        free(m->ranks); free(m->walk_state); free(m->walk); free(m->ready_ranks);
+        free(m->ranks); free(m->walk_state); free(m->walk_generation); free(m->walk); free(m->ready_ranks);
         free(m->request_index); free(m->match_index); free(m->context_index); free(m); return NULL;
     }
     return m;
@@ -140,7 +144,7 @@ void peak_global_budget_causal_free(PeakGlobalBudgetCausal *m) {
         free_rounds(m->contexts);
         free(m->contexts->members); free(m->contexts->slots); free(m->contexts); m->contexts = next;
     }
-    free(m->ranks); free(m->walk_state); free(m->walk); free(m->ready_ranks);
+    free(m->ranks); free(m->walk_state); free(m->walk_generation); free(m->walk); free(m->ready_ranks);
         free(m->request_index); free(m->match_index); free(m->context_index); free(m);
 }
 static uint64_t mix(uint64_t x);
@@ -502,13 +506,32 @@ static bool future_wait(CausalRank *r, uint64_t id) {
                 if (p->requests[i] == id) return true;
     return false;
 }
+static void blocked(PeakGlobalBudgetCausal *m, size_t rank, bool value)
+{
+    CausalRank *r=&m->ranks[rank];
+    if(r->blocked==value)return;
+    if(value) {
+        r->blocked_previous=SIZE_MAX;r->blocked_next=m->blocked_head;
+        if(m->blocked_head!=SIZE_MAX)m->ranks[m->blocked_head].blocked_previous=rank;
+        m->blocked_head=rank;++m->blocked_count;m->cycle_dirty=true;
+    } else {
+        if(r->blocked_previous==SIZE_MAX)m->blocked_head=r->blocked_next;
+        else m->ranks[r->blocked_previous].blocked_next=r->blocked_next;
+        if(r->blocked_next!=SIZE_MAX)m->ranks[r->blocked_next].blocked_previous=r->blocked_previous;
+        --m->blocked_count;
+    }
+    r->blocked=value;
+}
 static bool cycle(PeakGlobalBudgetCausal *m) {
-    memset(m->walk_state, 0, m->world_size);
-    for (size_t start = 0; start < m->world_size; ++start) {
-        if (m->walk_state[start]) continue;
+    if(!++m->walk_epoch) {
+        memset(m->walk_generation,0,m->world_size*sizeof(*m->walk_generation));
+        ++m->walk_epoch;
+    }
+    for (size_t start=m->blocked_head; start!=SIZE_MAX; start=m->ranks[start].blocked_next) {
+        if (m->walk_generation[start]==m->walk_epoch && m->walk_state[start]) continue;
         size_t depth = 1;
         m->walk[0] = (CausalWalk){ .rank = start };
-        m->walk_state[start] = 1;
+        m->walk_state[start] = 1; m->walk_generation[start]=m->walk_epoch;
         while (depth) {
             CausalWalk *frame = &m->walk[depth - 1];
             CausalEvent *p = m->ranks[frame->rank].queue;
@@ -520,9 +543,10 @@ static bool cycle(PeakGlobalBudgetCausal *m) {
                     CausalRequest *b = a ? partner(m, a) : NULL;
                     if (m->sum_mode) return true;
                     if (!b || b->waited || !future_wait(&m->ranks[b->rank], b->id)) continue;
-                    if (m->walk_state[b->rank] == 1) return true;
-                    if (m->walk_state[b->rank] == 2) continue;
-                    m->walk_state[b->rank] = 1;
+                    unsigned state=m->walk_generation[b->rank]==m->walk_epoch?m->walk_state[b->rank]:0;
+                    if (state == 1) return true;
+                    if (state == 2) continue;
+                    m->walk_state[b->rank] = 1;m->walk_generation[b->rank]=m->walk_epoch;
                     m->walk[depth++] = (CausalWalk){ .rank = b->rank };
                     descended = true;
                     break;
@@ -548,12 +572,10 @@ static void drain(PeakGlobalBudgetCausal *m) {
             CausalEvent *p;
             while ((p = r->queue) && p->ordered) {
                 if (!process(m, p)) {
-                    if (!r->blocked) {
-                        r->blocked = true; ++m->blocked_count; m->cycle_dirty = true;
-                    }
+                    blocked(m,rank,true);
                     break;
                 }
-                if (r->blocked) { r->blocked = false; --m->blocked_count; }
+                blocked(m,rank,false);
                 r->queue = p->next;
                 r->processed_sequence = p->event.sequence;
                 free(p->requests); free(p);

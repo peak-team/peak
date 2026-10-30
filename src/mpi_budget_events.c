@@ -603,9 +603,10 @@ void peak_mpi_budget_runtime_end(PeakMpiRuntimeSpan *span, uint64_t own_ns,
     --runtime_active[component];
     span->registered=false;
     runtime_observe_locked(component,raw_after);
-    /* Transport must never create send -> classification -> send feedback.
-     * Its prefix is captured by the next genuine ordered event instead. */
-    if(own_ns && own_ns!=UINT64_MAX && component!=PEAK_RUNTIME_TRANSPORT &&
+    /* Control and transport only update counters. Their prefixes are captured
+     * before the next MPI edge or by the genuine management frontier; this
+     * avoids extra per-window traffic and send/classification feedback. */
+    if(own_ns && own_ns!=UINT64_MAX && component==PEAK_RUNTIME_MANAGEMENT &&
        atomic_load_explicit(&frontend_ready,memory_order_acquire) &&
        !runtime_closed && !stream_closed && !uncertifiable_state &&
        peak_global_budget_mpi_events_enabled())

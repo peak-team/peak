@@ -5970,7 +5970,14 @@ peak_general_listener_total_calls(PeakGeneralListener* listener)
     if (listener != NULL) {
         g_mutex_lock(&listener->retired_mutex);
         calls = listener->retired_num_calls;
-        for (size_t index = 0; index < listener->fast_stats_capacity; index++) {
+        size_t used = listener->fast_stats_capacity;
+        if (peak_global_configured && peak_budget_cost_lanes != NULL) {
+            /* Global callbacks publish their slot before their first count.
+             * The prefix never shrinks across retirement or slot reuse. */
+            used = MIN(used, atomic_load_explicit(&peak_budget_lane_highwater,
+                                                 memory_order_acquire));
+        }
+        for (size_t index = 0; index < used; index++) {
             calls += peak_general_listener_num_calls_load(
                 peak_general_listener_num_calls_slot(listener, index));
         }
@@ -7186,6 +7193,24 @@ void* peak_heartbeat_monitor(void* arg) {
                                        (double)hb_min_us,
                                        (double)hb_max_us) + 0.5);
 
+        /* Learn the complete ordinary round, including its real classification
+         * and publication footer. The footer remains outside its own span. */
+        peak_general_listener_management_cpu_checkpoint(
+            &management_cpu_checkpoint_ns,
+            &management_cpu_checkpoint_valid);
+        if(management_span.registered) {
+            unsigned long long management_span_end=0;
+            if(peak_general_listener_thread_cpu_ns(&management_span_end) && management_span_end>=management_span_cpu) {
+                peak_general_listener_management_cpu_checkpoint(&management_cpu_checkpoint_ns,
+                                                                &management_cpu_checkpoint_valid);
+                peak_general_listener_runtime_end(&management_span,management_span_end-management_span_cpu,
+                    atomic_load_explicit(&peak_general_listener_heartbeat_management_cpu_ns,memory_order_acquire));
+            } else peak_general_listener_runtime_end(&management_span,UINT64_MAX,UINT64_MAX);
+            /* Classification/publication footer is real management CPU but is
+             * not recursively wrapped in another classification operation. */
+            peak_general_listener_management_cpu_checkpoint(&management_cpu_checkpoint_ns,
+                                                            &management_cpu_checkpoint_valid);
+        }
         uint64_t background_sleep_us = (uint64_t)sleep_us;
         if (peak_global_configured) {
             unsigned long long heartbeat_cpu_end_ns = 0;
@@ -7204,22 +7229,11 @@ void* peak_heartbeat_monitor(void* arg) {
                 ? (uint64_t)ceil(remaining * 1e6) : 0;
             if (cooldown_sleep_us < background_sleep_us) background_sleep_us = cooldown_sleep_us;
         }
+        /* Period/cooldown calculation follows the classified span. Retain its
+         * actual CPU in the raw ledger before the next iteration resets it. */
         peak_general_listener_management_cpu_checkpoint(
             &management_cpu_checkpoint_ns,
             &management_cpu_checkpoint_valid);
-        if(management_span.registered) {
-            unsigned long long management_span_end=0;
-            if(peak_general_listener_thread_cpu_ns(&management_span_end) && management_span_end>=management_span_cpu) {
-                peak_general_listener_management_cpu_checkpoint(&management_cpu_checkpoint_ns,
-                                                                &management_cpu_checkpoint_valid);
-                peak_general_listener_runtime_end(&management_span,management_span_end-management_span_cpu,
-                    atomic_load_explicit(&peak_general_listener_heartbeat_management_cpu_ns,memory_order_acquire));
-            } else peak_general_listener_runtime_end(&management_span,UINT64_MAX,UINT64_MAX);
-            /* Classification/publication footer is real management CPU but is
-             * not recursively wrapped in another classification operation. */
-            peak_general_listener_management_cpu_checkpoint(&management_cpu_checkpoint_ns,
-                                                            &management_cpu_checkpoint_valid);
-        }
         if (!peak_heartbeat_wait_us(background_sleep_us)) {
             break;
         }

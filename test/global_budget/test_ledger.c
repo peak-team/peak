@@ -111,6 +111,33 @@ static void check_wire_format(void)
     assert(restored.port == endpoint.port && restored.nonce == endpoint.nonce);
 }
 
+static void check_coalesced_partial_write(void)
+{
+    int sockets[2];assert(!socketpair(AF_UNIX,SOCK_STREAM,0,sockets));
+    int capacity=4096;
+    assert(!setsockopt(sockets[0],SOL_SOCKET,SO_SNDBUF,&capacity,sizeof capacity));
+    for(unsigned i=0;i<2;i++)assert(!fcntl(sockets[i],F_SETFL,fcntl(sockets[i],F_GETFL,0)|O_NONBLOCK));
+    unsigned char expected[32768];
+    for(size_t i=0;i<sizeof expected;i++)expected[i]=(unsigned char)(i*37);
+    Peer sender={.fd=sockets[0],.pending=true,.outgoing={.magic=MAGIC,.version=PROTOCOL_VERSION,
+        .payload_words=sizeof expected/8,.view={.cohort_finalized=true,.broker_final_written=true}}};
+    sender.outgoing_payload=malloc(sizeof expected);assert(sender.outgoing_payload);
+    memcpy(sender.outgoing_payload,expected,sizeof expected);
+    Peer receiver={.fd=sockets[1]};
+    assert(!write_frame(&sender));
+    if(IO_CHUNK>PEAK_GLOBAL_BUDGET_WIRE_SIZE)assert(sender.sent>PEAK_GLOBAL_BUDGET_WIRE_SIZE);
+    assert(sender.pending && !sender.final_sent && !sender.proof_sent);
+    bool complete=false;
+    for(unsigned attempt=0;attempt<100000 && (sender.pending || !complete);attempt++) {
+        assert(!write_frame(&sender));
+        int result=read_frame(&receiver);assert(result>=0);
+        complete|=result==1;
+    }
+    assert(!sender.pending && complete && sender.final_sent && sender.proof_sent);
+    assert(!memcmp(receiver.incoming_payload,expected,sizeof expected));
+    read_frame_done(&receiver);close(sockets[0]);close(sockets[1]);
+}
+
 static void check_metadata_prefetch(void)
 {
     atomic_store(&owner,getpid());atomic_store(&running,true);
@@ -882,6 +909,7 @@ static void check_settled_operation_prefix(void)
 int main(void)
 {
     check_wire_format();
+    check_coalesced_partial_write();
     check_metadata_prefetch();
     check_reply_snapshot_order();
     check_required_vs_desired();
