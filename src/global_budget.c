@@ -1372,7 +1372,7 @@ static CreditGrant grant_rank_credit(Rank *r, uint64_t free_ns)
     CreditGrant grant = {0};
     if (!r->wants_credit) return grant;
     uint64_t desired = r->requested_ns > 100000 ? r->requested_ns : 100000;
-    bool recovery = !r->latest.attached_targets;
+    bool recovery = !r->latest.attached_targets || credit_exposure_closed(r);
     if (!recovery) {
         double predicted = fmin((double)MAX_TOTAL_NS, ceil(r->latest.pressure * .02 * 1e9));
         if (predicted > (double)desired) desired = (uint64_t)predicted;

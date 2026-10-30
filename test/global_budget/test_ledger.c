@@ -397,6 +397,9 @@ static void check_closing_quote_epoch(void)
     assert(closing_reserve_ns(&rank) == 2000000);
     assert(rank.credit_total_ns == 1000 && rank.consumed_ns == 1000);
     rank.wants_credit = true; rank.requested_ns = 100000;
+    rank.latest.attached_targets = 79; /* Protected cold hooks are not paid exposure. */
+    CreditGrant fragment = grant_rank_credit(&rank, 2050000);
+    assert(fragment.credit == 0 && !rank.registered && rank.credit_total_ns == 1000);
     CreditGrant grant = grant_rank_credit(&rank, 2100000);
     assert(grant.closing == 2000000 && grant.credit == 100000);
     assert(rank.credit_total_ns - rank.consumed_ns - rank.returned_ns == 100000);
