@@ -317,7 +317,7 @@ def main():
         "peak_general_controller_process_pending_unlocked"
     )
     wait_for_wake = controller_main.find(
-        "peak_general_listener_controller_wait(expected_wake_sequence)"
+        "peak_general_listener_controller_wait(expected_wake_sequence,"
     )
     require(
         sequence_snapshot != -1
