@@ -3297,10 +3297,6 @@ peak_general_listener_soft_heartbeat_unlocked(const PeakGlobalBudgetSample* samp
             continue;
         }
         waiting = TRUE;
-        /* Preserve an already reserved first observation while its specific
-         * mutation sample awaits ACK; no new commitment is created by debt. */
-        if (peak_hook_pending_observation_ns[i] > 0 && !cost_acknowledged && reserved_lease)
-            continue;
         /* The existing controller boundary evaluates shared-window rental
          * economics; paid admission remains tied to this accepted HB sample. */
     }
