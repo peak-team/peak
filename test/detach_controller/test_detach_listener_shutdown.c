@@ -868,6 +868,17 @@ run_uint64_saturation(void)
 }
 
 static int
+run_cumulative_rental_batch(void)
+{
+    gum_init_embedded();
+    check_true("actual rental walk progresses beyond idle64 and preserves observations",
+               peak_general_listener_test_cumulative_rental_batch() == 0);
+    gum_deinit_embedded();
+    fprintf(stderr, "general-listener-cumulative-rental-batch-ok\n");
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+static int
 run_detach_count_latch_state_gate(void)
 {
     check_true("detach-count latch obeys callback hook state",
@@ -1031,6 +1042,9 @@ main(int argc, char** argv)
     /* Match PEAK's production initialization contract before any mutation. */
     peak_detach_controller_configure_mpi_process(FALSE);
 
+    if (strcmp(argv[1], "general-listener-cumulative-rental-batch") == 0) {
+        return run_cumulative_rental_batch();
+    }
     if (strcmp(argv[1], "general-listener-shutdown-prepare-fail-closed") == 0) {
         return run_shutdown_prepare_fail_closed();
     }

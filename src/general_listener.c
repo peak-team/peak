@@ -3301,16 +3301,8 @@ peak_general_listener_soft_heartbeat_unlocked(const PeakGlobalBudgetSample* samp
          * mutation sample awaits ACK; no new commitment is created by debt. */
         if (peak_hook_pending_observation_ns[i] > 0 && !cost_acknowledged && reserved_lease)
             continue;
-        uint64_t ignored = peak_general_listener_ignored_rent_ns(listener);
-        uint64_t base = atomic_load(&listener->ignored_rent_base_ns);
-        double rent = (double)(ignored >= base ? ignored - base : 0) / 1e9;
-        if (rent >= peak_global_closing_window_seconds && peak_global_closing_window_seconds > 0) {
-            peak_soft_rental_scan = TRUE;
-            wake |= peak_general_listener_request_detach_with_context_unlocked(i,
-                PEAK_HOOK_REQUEST_SOURCE_MPI_BURST,
-                peak_general_listener_total_calls(listener), 0, 0, sample->elapsed_seconds, 0);
-            peak_soft_rental_scan = FALSE;
-        }
+        /* The existing controller boundary evaluates shared-window rental
+         * economics; paid admission remains tied to this accepted HB sample. */
     }
     if (waiting) {
         /* Set before requesting: a racing paid grant must wake admission. */
@@ -5367,13 +5359,78 @@ peak_general_controller_request_global_selective_wave_unlocked(void)
         peak_general_listener_management_cpu_add_saturating(cpu_end - cpu_start);
 }
 
+static gboolean
+peak_general_listener_rental_exposure_eligible(const PeakGeneralListener* listener,
+    PeakHookState state, gboolean physical, uint64_t pending_observation)
+{
+    unsigned long long control = atomic_load_explicit(
+        &listener->callback_hook_control, memory_order_acquire);
+    return state == PEAK_HOOK_ATTACHED && physical && pending_observation == 0 &&
+        atomic_load_explicit(&listener->soft_paused, memory_order_acquire) &&
+        atomic_load_explicit(&listener->initial_observation_remaining, memory_order_relaxed) == 0 &&
+        peak_general_listener_callback_hook_state(control) == PEAK_HOOK_ATTACHED &&
+        !(control & (PEAK_CALLBACK_BURST_REQUEST_BIT | PEAK_CALLBACK_DETACH_COUNT_REQUEST_BIT));
+}
+
+static gboolean
+peak_general_listener_rental_candidate_unlocked(size_t hook_id)
+{
+    return peak_general_hook_is_published_unlocked(hook_id) &&
+        peak_hook_physical_attached != NULL &&
+        peak_general_listener_rental_exposure_eligible(
+            PEAKGENERAL_LISTENER(array_listener[hook_id]), peak_hook_states[hook_id],
+            peak_hook_physical_attached[hook_id], peak_hook_pending_observation_ns[hook_id]);
+}
+
+static gboolean
+peak_general_listener_rental_batch_economical(double window_seconds,
+    size_t count, uint64_t rent_ns)
+{
+    uint64_t quote = peak_global_admission_seconds_ns(
+        peak_global_admission_closing_forecast(window_seconds, count));
+    return count > 0 && quote > 0 && quote != UINT64_MAX && rent_ns >= quote;
+}
+
 static void
-peak_general_controller_publish_detach_count_requests_unlocked(void)
+peak_general_controller_close_rental_batch_unlocked(const size_t* hooks,
+    size_t count, uint64_t rent_ns, double now, const PeakGlobalBudgetView* current)
+{
+    if (!peak_general_listener_rental_batch_economical(peak_global_closing_window_seconds,
+            count, rent_ns)) return;
+    if (!peak_general_listener_pressure_cannot_admit(current))
+        return;
+    peak_soft_rental_scan = TRUE;
+    for (size_t k = 0; k < count; ++k) {
+        size_t hook_id = hooks[k];
+        if (!peak_general_listener_rental_candidate_unlocked(hook_id)) continue;
+        PeakGeneralListener* listener = PEAKGENERAL_LISTENER(array_listener[hook_id]);
+        (void)peak_general_listener_request_detach_with_context_unlocked(hook_id,
+            PEAK_HOOK_REQUEST_SOURCE_MPI_BURST,
+            peak_general_listener_total_calls(listener), 0, 0, now - peak_main_time, 0);
+    }
+    peak_soft_rental_scan = FALSE;
+}
+
+static void
+peak_general_controller_publish_detach_count_requests_unlocked(
+    const PeakGlobalBudgetView* rental_view)
 {
     if (array_listener == NULL) {
         return;
     }
 
+    size_t rental_hooks[PEAK_GENERAL_CONTROLLER_MAX_BATCH_CANDIDATES];
+    size_t rental_count = 0;
+    uint64_t rental_ns = 0;
+    gboolean rental_work = peak_global_configured && peak_soft_calibration_valid &&
+        !atomic_load(&peak_global_retiring) && rental_view != NULL &&
+        atomic_load_explicit(&peak_global_admission_waiting, memory_order_acquire);
+    unsigned long long rental_cpu_start = 0, rental_cpu_end = 0;
+    gboolean rental_cpu_valid = rental_work && peak_general_controller_is_current_thread() &&
+        peak_general_listener_thread_cpu_ns(&rental_cpu_start);
+    double rental_now = rental_work ? peak_second() : 0;
+    gboolean rental_pressure = rental_work &&
+        peak_general_listener_pressure_cannot_admit(rental_view);
     for (size_t hook_id = 0; hook_id < peak_hook_address_count; hook_id++) {
         if (array_listener[hook_id] == NULL) {
             continue;
@@ -5381,6 +5438,19 @@ peak_general_controller_publish_detach_count_requests_unlocked(void)
 
         PeakGeneralListener* listener =
             PEAKGENERAL_LISTENER(array_listener[hook_id]);
+        if (rental_pressure && peak_general_listener_rental_candidate_unlocked(hook_id)) {
+            uint64_t ignored = peak_general_listener_ignored_rent_ns(listener);
+            uint64_t base = atomic_load(&listener->ignored_rent_base_ns);
+            uint64_t rent = ignored >= base ? ignored - base : 0;
+            rental_ns = UINT64_MAX - rental_ns < rent ? UINT64_MAX : rental_ns + rent;
+            rental_hooks[rental_count++] = hook_id;
+            if (rental_count == PEAK_GENERAL_CONTROLLER_MAX_BATCH_CANDIDATES) {
+                peak_general_controller_close_rental_batch_unlocked(rental_hooks,
+                    rental_count, rental_ns, rental_now, rental_view);
+                rental_count = 0;
+                rental_ns = 0;
+            }
+        }
         PeakHookRequestSource source;
         if (!peak_general_listener_take_callback_request(listener, &source)) {
             continue;
@@ -5439,6 +5509,14 @@ peak_general_controller_publish_detach_count_requests_unlocked(void)
             peak_second() - peak_main_time,
             0.0);
     }
+    if (rental_count > 0)
+        peak_general_controller_close_rental_batch_unlocked(rental_hooks,
+            rental_count, rental_ns, rental_now, rental_view);
+    /* Reuse the controller selector accounting convention; the finalizer has
+     * its owning clock, and idle/no-rental walks take no extra CPU clocks. */
+    if (rental_cpu_valid && peak_general_listener_thread_cpu_ns(&rental_cpu_end) &&
+        rental_cpu_end >= rental_cpu_start)
+        peak_general_listener_management_cpu_add_saturating(rental_cpu_end - rental_cpu_start);
 }
 
 static gboolean
@@ -5446,7 +5524,8 @@ peak_general_controller_process_pending_unlocked(pthread_t controller_tid,
                                                  pthread_t* tid_keys,
                                                  size_t* mapped_ids,
                                                  int* pause_session_ids,
-                                                 int* pause_status)
+                                                 int* pause_status,
+                                                 const PeakGlobalBudgetView* rental_view)
 {
     gboolean did_work = FALSE;
     double now = peak_second();
@@ -5455,7 +5534,7 @@ peak_general_controller_process_pending_unlocked(pthread_t controller_tid,
         return FALSE;
     }
 
-    peak_general_controller_publish_detach_count_requests_unlocked();
+    peak_general_controller_publish_detach_count_requests_unlocked(rental_view);
 
     if (peak_detach_controller_strict_batch_supported()) {
         (void)controller_tid;
@@ -5547,7 +5626,7 @@ peak_general_listener_controller_drain(unsigned int timeout_ms)
                                                                tid_keys,
                                                                mapped_ids,
                                                                pause_session_ids,
-                                                               pause_status);
+                                                               pause_status, NULL);
         pending = peak_general_controller_has_pending_unlocked();
         pthread_mutex_unlock(&lock);
 
@@ -5643,7 +5722,7 @@ peak_general_controller_thread_main(void* arg)
                                                                tid_keys,
                                                                mapped_ids,
                                                                pause_session_ids,
-                                                               pause_status);
+                                                               pause_status, &global_view);
         if (peak_global_applied_wave &&
             !peak_general_listener_mpi_burst_wave_pending_unlocked())
         {
@@ -9538,6 +9617,86 @@ PEAK_API int peak_general_listener_test_global_active(void)
 PEAK_API PeakGlobalBudgetView peak_general_listener_test_global_view(void)
 {
     return peak_global_budget_view();
+}
+
+PEAK_API int
+peak_general_listener_test_cumulative_rental_batch(void)
+{
+    enum { COUNT = 82 };
+    GumInvocationListener* listeners[COUNT];
+    gpointer addresses[COUNT];
+    PeakHookState states[COUNT];
+    gboolean physical[COUNT];
+    uint64_t pending[COUNT] = {0};
+    size_t saved_count = peak_hook_address_count;
+    gulong saved_threads = peak_max_num_threads;
+    GumInvocationListener** saved_listeners = array_listener;
+    gpointer* saved_addresses = hook_address;
+    PeakHookState* saved_states = peak_hook_states;
+    gboolean* saved_physical = peak_hook_physical_attached;
+    uint64_t* saved_pending = peak_hook_pending_observation_ns;
+    gboolean saved_configured = peak_global_configured;
+    gboolean saved_calibrated = peak_soft_calibration_valid;
+    gboolean saved_waiting = atomic_load(&peak_global_admission_waiting);
+    double saved_window = peak_global_closing_window_seconds;
+    double saved_overhead = peak_general_overhead;
+    int result = 0;
+
+    peak_max_num_threads = 1;
+    peak_hook_address_count = COUNT;
+    array_listener = listeners;
+    hook_address = addresses;
+    peak_hook_states = states;
+    peak_hook_physical_attached = physical;
+    peak_hook_pending_observation_ns = pending;
+    peak_global_configured = TRUE;
+    peak_soft_calibration_valid = TRUE;
+    atomic_store(&peak_global_admission_waiting, TRUE);
+    peak_global_closing_window_seconds = 286e-6;
+    peak_general_overhead = 1e-6;
+    for (size_t i = 0; i < COUNT; ++i) {
+        listeners[i] = g_object_new(PEAKGENERAL_TYPE_LISTENER, NULL);
+        addresses[i] = &listeners[i]; /* Unique published identities; no Gum mutation runs. */
+        states[i] = PEAK_HOOK_ATTACHED;
+        physical[i] = TRUE;
+        PeakGeneralListener* listener = PEAKGENERAL_LISTENER(listeners[i]);
+        listener->retired_num_calls = 64;
+        atomic_store(&listener->soft_paused, TRUE);
+        atomic_store(&listener->callback_hook_control, PEAK_HOOK_ATTACHED);
+        /* First64 are idle; next16 share a profitable window including one
+         * idle observed member. Every individual rent is below that window. */
+        atomic_store(&listener->retired_ignored_ns, i >= 64 && i < 79 ? 90000 : 0);
+    }
+    PEAKGENERAL_LISTENER(listeners[80])->retired_num_calls = 63;
+    atomic_store(&PEAKGENERAL_LISTENER(listeners[80])->initial_observation_remaining, 1);
+    pending[81] = 64000;
+    PeakGlobalBudgetView view = {.active = TRUE, .local_credit_ns = 1000000000,
+        .local_closing_reserved_seconds = .001};
+    peak_general_controller_publish_detach_count_requests_unlocked(&view);
+    for (size_t i = 0; i < COUNT; ++i)
+        if (states[i] != PEAK_HOOK_ATTACHED) result = 1;
+    view.local_credit_ns = 0;
+    view.local_closing_reserved_seconds = 0;
+    peak_general_controller_publish_detach_count_requests_unlocked(&view);
+    for (size_t i = 0; i < COUNT; ++i) {
+        PeakHookState expected = i >= 64 && i < 80 ? PEAK_HOOK_DETACH_REQUESTED : PEAK_HOOK_ATTACHED;
+        if (states[i] != expected) result = 2;
+    }
+
+    peak_hook_address_count = saved_count;
+    peak_max_num_threads = saved_threads;
+    array_listener = saved_listeners;
+    hook_address = saved_addresses;
+    peak_hook_states = saved_states;
+    peak_hook_physical_attached = saved_physical;
+    peak_hook_pending_observation_ns = saved_pending;
+    peak_global_configured = saved_configured;
+    peak_soft_calibration_valid = saved_calibrated;
+    atomic_store(&peak_global_admission_waiting, saved_waiting);
+    peak_global_closing_window_seconds = saved_window;
+    peak_general_overhead = saved_overhead;
+    for (size_t i = 0; i < COUNT; ++i) g_object_unref(listeners[i]);
+    return result;
 }
 
 PEAK_API int

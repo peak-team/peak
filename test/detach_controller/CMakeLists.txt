@@ -14,6 +14,7 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
     test_detach_listener_shutdown.c
     ${PROJECT_SOURCE_DIR}/src/general_listener.c
     ${PROJECT_SOURCE_DIR}/src/global_budget.c
+    ${PROJECT_SOURCE_DIR}/src/global_budget_causal.c
     ${PROJECT_SOURCE_DIR}/src/general_listener/attach_policy.c
     ${PROJECT_SOURCE_DIR}/src/general_listener/target_resolver.c
     ${PROJECT_SOURCE_DIR}/src/general_listener/exec_checkpoint_writer.c
@@ -575,6 +576,11 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
   set_tests_properties(test_detach_controller_general_listener_uint64_saturation
     PROPERTIES
       PASS_REGULAR_EXPRESSION "general-listener-uint64-saturation-ok")
+
+  add_test(NAME test_detach_controller_general_listener_cumulative_rental_batch
+    COMMAND test_detach_listener_shutdown general-listener-cumulative-rental-batch)
+  set_tests_properties(test_detach_controller_general_listener_cumulative_rental_batch
+    PROPERTIES PASS_REGULAR_EXPRESSION "general-listener-cumulative-rental-batch-ok")
 
   add_test(NAME test_detach_controller_general_listener_detach_count_latch_state_gate
     COMMAND test_detach_listener_shutdown
