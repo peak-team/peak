@@ -1,11 +1,12 @@
+#ifndef PEAK_GUMARM64READER_H
+#define PEAK_GUMARM64READER_H
+
 /*
  * Copyright (C) 2015-2025 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
 
-#ifndef __GUM_ARM64_READER_H__
-#define __GUM_ARM64_READER_H__
 
 
 
@@ -19,4 +20,4 @@ GUM_API cs_insn * gum_arm64_reader_disassemble_instruction_at (
 
 G_END_DECLS
 
-#endif
+#endif /* PEAK_GUMARM64READER_H */

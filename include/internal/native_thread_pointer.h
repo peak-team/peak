@@ -24,4 +24,4 @@ static inline ptrdiff_t peak_native_tls_offset(const void * address)
 }
 #endif
 
-#endif
+#endif /* PEAK_NATIVE_THREAD_POINTER_H */

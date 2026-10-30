@@ -21,14 +21,16 @@ Original upstream source SHA256 values:
 
 Integrated source SHA256 values (backend/headers/helper/layout):
 
+- `include/internal/native_thread_pointer.h`: `e16ef948564251587f841890695e61ce52d47dd9243f0a3e0acfe0682a17baed`
+
 - `COPYING.frida-gum-17.15.3`: `00764fcc23f0f2ac6d2619a1f9192e55176ecaaa525e76a47aaabc5d87fb087f`
 - `gum_peak_native_gate.S`: `d22ef6381553739778a5db79a810e2d5704ae85a0777e81d537f0ba500f4d463`
-- `gumarm64reader.h`: `24983db63d6089beb5d776baa9fddf131bbea717ae39de7886859f2e5d781db8`
-- `gumarm64relocator.h`: `ec80d4a859b4f2449fa25ea7cf05d2304dd322a18c394105489e4f9a98382807`
+- `gumarm64reader.h`: `46d7e8ec2d7b7647da5912dd29d0fd94c9d8dcea44051d68b72aeaa8e7e21112`
+- `gumarm64relocator.h`: `d57924ba9c54103eaffb8c685243d83bdcaed646a51c17a1dfafb960f4ec719a`
 - `guminterceptor-arm64-native.c`: `89f49142be22ce0c410ddb0001f252874b41c891ca4699a452cdde34a2c6dc8f`
-- `guminterceptor-private-exact.h`: `ad0acf2c4f06af45d8caaeae8c116a7a7e5879c0bb0472da445070611071c445`
+- `guminterceptor-private-exact.h`: `865a0c3d6ac32e6c861445fa2f43cbbd17aae31e6f2c9823efdc74944a151a55`
 - `guminterceptor-x86-native.c`: `b8cbe3723e5eb6e5d1eb79c3bcca9b2ac0a7a602c09db21467fa060835978d1a`
-- `gumx86reader.h`: `ed045423f5e0e7de913eb75e04ffe28eeb0557d4b90f50c8d94df9bec788afcd`
-- `gumx86relocator.h`: `30424decbcb2ca1ce77cc9be7856e5761f49a61ee7c1b2911a47db7bc33a3d89`
+- `gumx86reader.h`: `ae6888acc7824ae67fa0fa7f4d1c9f82334f0694e3239405575cddc1891821c1`
+- `gumx86relocator.h`: `582dcc9e2d90e18de84495f60c6d5789c349f2051def49e4abda2edaa68e85b2`
 - `native-layout.c`: `e9f31c94a3a349d61a37ed63cace036fe46e5f5d06289b9252253f3f73a35347`
-- `native-offsets.h`: `2dde40a97b42b2c9bbb5431b8b59701339c3a12b46943d3e258eaee0e7c259d1`
+- `native-offsets.h`: `8ed5ae33282785973feddd0d5b7b445a32ab33cc0e038e8316e35a590f75e2be`

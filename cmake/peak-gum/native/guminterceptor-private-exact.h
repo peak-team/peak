@@ -1,3 +1,6 @@
+#ifndef PEAK_GUMINTERCEPTOR_PRIVATE_EXACT_H
+#define PEAK_GUMINTERCEPTOR_PRIVATE_EXACT_H
+
 /*
  * Copyright (C) 2008-2026 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  * Copyright (C) 2008 Christian Berentsen <jc.berentsen@gmail.com>
@@ -6,8 +9,6 @@
  * Licence: wxWindows Library Licence, Version 3.1
  */
 
-#ifndef __GUM_INTERCEPTOR_PRIV_H__
-#define __GUM_INTERCEPTOR_PRIV_H__
 
 
 
@@ -109,4 +110,4 @@ G_GNUC_INTERNAL gpointer _gum_interceptor_peek_top_caller_return_address (void);
 G_GNUC_INTERNAL gpointer _gum_interceptor_translate_top_return_address (
     gpointer return_address);
 
-#endif
+#endif /* PEAK_GUMINTERCEPTOR_PRIVATE_EXACT_H */

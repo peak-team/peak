@@ -1,11 +1,12 @@
+#ifndef PEAK_GUMARM64RELOCATOR_H
+#define PEAK_GUMARM64RELOCATOR_H
+
 /*
  * Copyright (C) 2014-2026 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
 
-#ifndef __GUM_ARM64_RELOCATOR_H__
-#define __GUM_ARM64_RELOCATOR_H__
 
 
 
@@ -67,4 +68,4 @@ GUM_API guint gum_arm64_relocator_relocate (gpointer from, guint min_bytes,
 
 G_END_DECLS
 
-#endif
+#endif /* PEAK_GUMARM64RELOCATOR_H */

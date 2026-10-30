@@ -1,11 +1,12 @@
+#ifndef PEAK_GUMX86RELOCATOR_H
+#define PEAK_GUMX86RELOCATOR_H
+
 /*
  * Copyright (C) 2009-2026 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
 
-#ifndef __GUM_X86_RELOCATOR_H__
-#define __GUM_X86_RELOCATOR_H__
 
 
 
@@ -67,4 +68,4 @@ GUM_API guint gum_x86_relocator_relocate (gpointer from, guint min_bytes,
 
 G_END_DECLS
 
-#endif
+#endif /* PEAK_GUMX86RELOCATOR_H */

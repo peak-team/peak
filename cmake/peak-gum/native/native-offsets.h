@@ -1,3 +1,6 @@
+#ifndef PEAK_NATIVE_OFFSETS_H
+#define PEAK_NATIVE_OFFSETS_H
+
 #define CTX_REDIRECT 144
 #define CTX_FAST 152
 #define CTX_REPLACEMENT 112
@@ -25,3 +28,5 @@
 #define N_TLS_REGISTERED 120
 #define N_COST_SHIFT 7
 #define N_RENT_SHIFT 6
+
+#endif /* PEAK_NATIVE_OFFSETS_H */
