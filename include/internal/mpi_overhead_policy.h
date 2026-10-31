@@ -32,4 +32,4 @@ void peak_mpi_overhead_policy_update(PeakMpiOverheadPolicy *policy,
 double peak_mpi_overhead_policy_input(const PeakMpiOverheadPolicySample *current,
     const PeakMpiOverheadPolicySample *acknowledged, double acknowledged_raw_ratio,
     double detach_factor, unsigned local_ranks);
-#endif
+#endif /* PEAK_MPI_OVERHEAD_POLICY_H */

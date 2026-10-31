@@ -24,4 +24,4 @@ double peak_mpi_overhead_sync_update(const PeakMpiOverheadSample* sample,
                                      double detach_factor,
                                      unsigned local_control_ranks);
 
-#endif
+#endif /* PEAK_MPI_OVERHEAD_SYNC_H */
