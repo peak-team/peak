@@ -577,8 +577,8 @@ static void* service(void* unused)
     invalidate_ack();
     bool stopped = !atomic_load(&heartbeat_running);
     atomic_store(&normal_end, !failed || stopped);
-    if (failed && atomic_load(&status) != S_RESOLVE_FAILED) atomic_store(&status, S_UNAVAILABLE);
-    else if (stopped) atomic_store(&status, S_NORMAL_END);
+    if (stopped) atomic_store(&status, S_NORMAL_END);
+    else if (failed && atomic_load(&status) != S_RESOLVE_FAILED) atomic_store(&status, S_UNAVAILABLE);
     close_peer(&client);
     if (peers) for (int i = 0; i < world_size; ++i) close_peer(&peers[i]);
     if (listener >= 0) close(listener);
