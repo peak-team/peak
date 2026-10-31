@@ -19,13 +19,14 @@ PeakMpiOverheadPolicy *peak_mpi_overhead_policy_create(size_t count)
 void peak_mpi_overhead_policy_free(PeakMpiOverheadPolicy *policy) { free(policy); }
 
 void peak_mpi_overhead_policy_update(PeakMpiOverheadPolicy *policy,
-    const PeakMpiOverheadPolicySample *samples, double q, double *ratios,
+    const PeakMpiOverheadPolicySample *samples, double q,
+    double budget_elapsed_seconds, double *ratios,
     PeakMpiOverheadDecision *decision)
 {
     size_t count=policy->count;
     RankPolicy *ranks=policy->ranks;
     memset(decision, 0, sizeof(*decision));
-    double elapsed = samples[0].elapsed_seconds, cost = 0, module = 0, demand = 0, committed = 0;
+    double elapsed = budget_elapsed_seconds, cost = 0, module = 0, demand = 0, committed = 0;
     for (size_t i = 0; i < count; ++i) {
         const PeakMpiOverheadPolicySample *s = &samples[i];
         RankPolicy *r = &ranks[i];
@@ -42,7 +43,6 @@ void peak_mpi_overhead_policy_update(PeakMpiOverheadPolicy *policy,
             r->sequence = s->sequence;
         }
         demand += r->demand_rate_high_water;
-        elapsed = fmin(elapsed, s->elapsed_seconds);
         double local_cost = pc + s->management_seconds;
         cost += local_cost;
         r->cumulative_cap = fmax(r->cumulative_cap, local_cost);

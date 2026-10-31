@@ -330,7 +330,9 @@ static void* service(void* unused)
     struct pollfd* fds = calloc((size_t)world_size + 2, sizeof *fds);
     int free_count = world_size, hello_count = 1, sample_count = 0;
     bool local_first = false;
-    uint64_t deadline = 0, last_sent = 0, last_completed = 0;
+    uint64_t deadline = 0, last_sent = 0, report_sequence = 0;
+    uint64_t anchor_clock = 0;
+    double anchor_elapsed = 0;
     if (world_rank == 0 && addresses) {
         for (struct addrinfo* a = addresses; a && listener < 0; a = a->ai_next)
             listener = open_connection(a, true);
@@ -483,14 +485,27 @@ static void* service(void* unused)
             }
             if (negotiated && (due || !local_first)) {
                 PeakMpiOverheadPolicySample s = local_snapshot();
-                if (s.sequence && s.elapsed_seconds > 0 && s.sequence > samples[0].sequence) {
+                if (s.sequence && s.elapsed_seconds > 0) {
+                    /* Report sequence belongs to this paced helper, not HB.
+                     * Static HB inputs still carry freshly measured module CPU. */
+                    s.sequence = ++report_sequence;
                     samples[0] = s; changed = true;
                     if (!local_first) { local_first = true; ++sample_count; fixed_progress = true; }
                 }
             }
             if (changed && sample_count == world_size) {
+                if (!anchor_clock) {
+                    anchor_elapsed = samples[0].elapsed_seconds;
+                    for (int i = 1; i < world_size; ++i)
+                        anchor_elapsed = fmin(anchor_elapsed, samples[i].elapsed_seconds);
+                    anchor_clock = now;
+                }
+                /* Only the first complete positive vector establishes time.
+                 * Reuse the existing loop clock; no stopped HB freezes qE. */
+                double budget_elapsed = anchor_elapsed + (double)(now - anchor_clock) / 1e9;
                 PeakMpiOverheadDecision decision;
-                peak_mpi_overhead_policy_update(policy, samples, atomic_load(&negotiated_q), ratios, &decision);
+                peak_mpi_overhead_policy_update(policy, samples, atomic_load(&negotiated_q),
+                                                budget_elapsed, ratios, &decision);
                 publish_ack(&samples[0], ratios[0]);
                 fixed_progress |= !active;
                 active = true; atomic_store(&status, S_ACTIVE);
@@ -541,7 +556,7 @@ static void* service(void* unused)
                         else {
                             publish_ack(&s, ratio); fixed_progress |= !active && client.bootstrap;
                             active = true; atomic_store(&status, S_ACTIVE);
-                            last_completed = s.sequence; client.phase = C_IDLE;
+                            client.phase = C_IDLE;
                             if (trace_diagnostics) atomic_fetch_add(&policy_updates, 1);
                         }
                     }
@@ -554,7 +569,8 @@ static void* service(void* unused)
             }
             if ((client.phase == C_LOCAL_SAMPLE && (due || client.bootstrap)) || (client.phase == C_IDLE && due)) {
                 PeakMpiOverheadPolicySample s = local_snapshot();
-                if (s.sequence && s.elapsed_seconds > 0 && s.sequence > last_completed) {
+                if (s.sequence && s.elapsed_seconds > 0) {
+                    s.sequence = ++report_sequence;
                     bool first = client.phase == C_LOCAL_SAMPLE;
                     fixed_progress |= first && client.bootstrap;
                     encode(&client, SAMPLE, world_rank, &s, atomic_load(&negotiated_q), 0, false);

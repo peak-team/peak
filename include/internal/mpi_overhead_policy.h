@@ -3,7 +3,8 @@
 #include <stddef.h>
 #include <stdint.h>
 /* All times are cumulative seconds. module_cpu is disjoint from P/C/M.
- * Call with a complete rank vector; stale ranks hold back common elapsed. */
+ * Call with a complete rank vector. The admitted cohort reference clock is
+ * supplied independently; individual elapsed times still define local rates. */
 typedef struct {
     uint64_t sequence;
     double elapsed_seconds, profile_seconds, control_seconds;
@@ -21,13 +22,18 @@ void peak_mpi_overhead_policy_free(PeakMpiOverheadPolicy *policy);
  * P/C/M cumulative cost caps divided by each rank's elapsed seconds; old unused
  * allocations remain committed across ACKs.
  * profiling_headroom reports only newly issued money. Job commitment above qE
- * suspends new targets without erasing caps or revoking older ACKs. Before all
- * ranks have elapsed data use .9*q/count (unbooked startup exposure). The policy
+ * suspends new targets without erasing caps or revoking older ACKs. For a zero
+ * budget reference the pure policy returns .9*q/count; runtime retains configured
+ * local policy until complete positive admission (unbooked startup exposure).
+ * The policy
  * retains observed P/C cost-rate demand across idle phases; elapsed intervals
  * normalize transport record cadence. Caller retains cumulative cost history.
+ * budget_elapsed_seconds starts at the first complete positive vector's minimum
+ * elapsed, then advances with the runtime's monotonic cohort clock.
  * Conservative prototype only: no claim of parallel coverage or slowdown. */
 void peak_mpi_overhead_policy_update(PeakMpiOverheadPolicy *policy,
-    const PeakMpiOverheadPolicySample *samples, double q, double *ratios,
+    const PeakMpiOverheadPolicySample *samples, double q,
+    double budget_elapsed_seconds, double *ratios,
     PeakMpiOverheadDecision *decision);
 /* Translate an acknowledged raw P/C/M allowance into the existing listener's
  * P+local_ranks*C risk units. Only acknowledged unused spend is available:
