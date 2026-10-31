@@ -2,6 +2,9 @@
 #include "mpi_interceptor.h"
 #include "general_listener.h"
 #include "internal/mpi_teardown_guard.h"
+#ifdef PEAK_MPI_OVERHEAD_SYNC_RUNTIME
+#include "internal/mpi_overhead_sync.h"
+#endif
 #include "logging.h"
 #include "utils/env_parser.h"
 
@@ -342,6 +345,9 @@ mpi_interceptor_call_init(PeakMpiInitFunction init,
     peak_mpi_init_wrapper_depth--;
     if (peak_mpi_init_wrapper_depth == 0) {
         peak_mpi_init_completed(result);
+#ifdef PEAK_MPI_OVERHEAD_SYNC_RUNTIME
+        if (result == MPI_SUCCESS) peak_mpi_overhead_sync_start();
+#endif
     }
     return result;
 }
@@ -366,6 +372,9 @@ mpi_interceptor_call_init_thread(PeakMpiInitThreadFunction init,
     peak_mpi_init_wrapper_depth--;
     if (peak_mpi_init_wrapper_depth == 0) {
         peak_mpi_init_completed(result);
+#ifdef PEAK_MPI_OVERHEAD_SYNC_RUNTIME
+        if (result == MPI_SUCCESS) peak_mpi_overhead_sync_start();
+#endif
     }
     return result;
 }

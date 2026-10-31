@@ -1,5 +1,6 @@
 include(CTest)
 if(BUILD_TESTING)
+    add_subdirectory(mpi_overhead_sync)
     if(CMAKE_SYSTEM_NAME MATCHES "Linux")
         add_test(NAME test_filesystem_stat_stop_guard
             COMMAND ${CMAKE_COMMAND} -E env CC=${CMAKE_C_COMPILER}
