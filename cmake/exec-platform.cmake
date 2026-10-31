@@ -43,3 +43,26 @@ function(peak_exec_append_raw_syscall_trampoline sources_var trampoline_source)
     endif()
     set(${sources_var} ${_peak_exec_sources} PARENT_SCOPE)
 endfunction()
+
+# Standalone budget tools have no listener runtime. Mach-O requires explicit
+# lookup permission even for weak imports that may resolve to null at runtime.
+function(peak_budget_configure_optional_runtime target)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+        foreach(_peak_budget_optional_symbol IN ITEMS
+                pthread_listener_exclude_current_thread
+                pthread_listener_mark_next_created_thread_helper
+                peak_global_budget_listener_idle_try_guard
+                peak_global_budget_listener_idle_unguard
+                peak_global_budget_listener_admission_waiting
+                peak_global_budget_listener_credit_ready
+                peak_global_budget_listener_wallet_decreased
+                peak_global_budget_listener_view_pressure_changed
+                peak_mpi_budget_events_frontier
+                peak_mpi_budget_runtime_begin
+                peak_mpi_budget_runtime_end
+                peak_mpi_budget_runtime_observe
+                peak_mpi_budget_runtime_snapshot)
+            target_link_options(${target} PRIVATE "LINKER:-U,_${_peak_budget_optional_symbol}")
+        endforeach()
+    endif()
+endfunction()

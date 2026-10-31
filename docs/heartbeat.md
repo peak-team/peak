@@ -172,19 +172,43 @@ profile_global_overhead = max(attached_recent_sum, attached_lifetime_sum)
 ```
 
 If `profile_global_overhead` exceeds
-`global_target_ratio * peak_global_detach_factor`, attached candidates are
+`effective_rank_budget * peak_global_detach_factor`, attached candidates are
 ranked by `max(recent_rate, lifetime_ratio)`, then by recent rate and index.
 After each accepted detach request, the heartbeat debits the local projected
 recent and lifetime sums and stops once the projected global overhead is at or
-below `global_target_ratio`.
+below `effective_rank_budget`.
 
 The request context records the call count, lifetime ratio, global profile
 pressure, elapsed time, and recent rate that caused the request. It does not
 perform the mutation. The controller owns mutation ordering.
 
+## MPI Job Budget and Callback Burst Protection
+
+With verified launcher world size `W`, the local fallback policy uses
+`PEAK_GLOBAL_OVERHEAD_RATIO / W` for heartbeat detach and reattach admission.
+This conservative scaling covers successive profiling delays on different ranks.
+World metadata must agree across the available PMI, PMIX, OMPI, MV2 or Intel MPI
+pairs; Slurm is used when no complete MPI pair exists. Unverified metadata uses
+size one. Per-target ratio policy remains independent.
+
+For MPI jobs with global heartbeat enabled, each hook/thread checks every 64th
+callback against its active-thread CPU time. An excessive block publishes a
+request for the existing controller to close the rank's hooks; the callback does
+not mutate code or call MPI. Pending restores are canceled before closing, and
+restoration waits for a quiescent controller, sufficient budget and the normal
+cooldown. The request is tied to the current hook generation so an old callback
+cannot close a later installation.
+
+`MPI budget risk policy:` identifies the configured target, effective rank
+budget and world-size source. Burst counters describe the reporting rank.
+These estimates are conservative admission signals, not direct measurements of
+application slowdown.
+
 ## Reattach Risk Scaling
 
-Node-local rank scaling is a policy input only for reattach admission. The same
+Node-local rank scaling is an additional conservative policy input only for
+reattach admission. It remains in place after world-budget division to account
+for node contention: control cost itself is not multiplied by world size. The same
 scaled value is also emitted as a reporting diagnostic; it does not affect
 detach decisions or hook state.
 
@@ -213,8 +237,9 @@ reattach_spent_seconds =
   profile_spent_seconds + reattach_control_risk_seconds
 reattach_risk_spent_ratio =
   reattach_spent_seconds / total_execution_time
+effective_rank_budget = global_target_ratio / verified_world_size
 reattach_gate_ratio =
-  peak_global_reattach_factor * global_target_ratio
+  peak_global_reattach_factor * effective_rank_budget
 ```
 
 A reattach wave starts only when `reattach_risk_spent_ratio <=
@@ -284,7 +309,7 @@ Admission is expressed in seconds:
 
 ```text
 headroom_seconds =
-  global_target_ratio * total_execution_time
+  effective_rank_budget * total_execution_time
   - profile_spent_seconds
   - local_mpi_ranks * raw_control_spent_seconds
   - pending_reattach_future_leases
@@ -436,7 +461,7 @@ global_rate =
 ema_global_rate =
   hb_ema_a * global_rate + (1 - hb_ema_a) * previous_ema
 err =
-  max(profile_global_overhead / global_target_ratio - 1, 0)
+  max(profile_global_overhead / effective_rank_budget - 1, 0)
 scale =
   1 / (1 + hb_k_err * err + hb_k_rate * ema_global_rate)
 sleep_us =
@@ -629,3 +654,124 @@ Useful local checks for this mechanism include:
 Trace rows, when enabled, are diagnostics. They append request provenance,
 retry state, stop-window details, batch ids, and accounting fields. They do not
 control whether stop-window accounting exists.
+
+## Experimental cross-rank runtime budget
+
+Set `PEAK_MPI_GLOBAL_BUDGET=1` on every rank to use one adaptive budget for the
+MPI job. The option defaults off. PEAK imposes no fixed rank-count cap:
+the broker allocates its cohort table from the actual world size, including a
+single rank, while each client uses constant-size storage. Ranks may run
+different executables, profiling targets and workloads; the budget does not
+require SPMD or C application source.
+
+The native broker runs on PEAK's Linux and macOS platforms. Its fixed-width,
+fixed-byte-order protocol does not depend on C structure padding or host ABI.
+Startup broadcasts one endpoint across `MPI_COMM_WORLD` on the application's
+MPI initialization thread. Background coordination uses TCP, never MPI, so
+requested/provided MPI thread levels are preserved. Bindings that enter the
+interposed `MPI_Init*`/`PMPI_Init*` lifecycle, including Fortran bindings, use
+the same bootstrap. MPI Sessions-only initialization and dynamic addition of
+new MPI worlds still need their own cohort-registration integration; they are
+not restrictions of the budget algorithm.
+
+With heartbeat admission available, global mode defaults to
+`PEAK_MPI_ACTIVATION_POLICY=prepare`: PEAK initializes before MPI and performs
+the standard initial target installation. Each initial hook gets one shared
+64-call observation window across threads; reattachment does not reset it.
+Measured callback cost is included in global accounting. PEAK's function
+statistics count callbacks actually observed; ignored callbacks are charged as
+overhead without increasing those counts. The call count does not bound
+physical-stop wall time; measured control cost is billed separately. Global
+pressure can selectively close sampled hot hooks. Later loader/JIT
+installations and physical recovery require funded leases. Explicit `post-init`
+defers all runtime preparation until MPI initialization returns and omits
+pre-MPI profiling; `prepare` allows initial observations before MPI.
+Explicit `immediate` retains pre-MPI profiling before global coordination
+starts. Non-MPI and heartbeat-disabled configurations keep their existing local
+behavior.
+
+### Shared accounting and admission
+
+The coordinator lends only available lifetime headroom:
+
+```text
+available = max(0, target * job_elapsed - spent - outstanding - closing_reserve)
+```
+
+`spent` combines calibrated profiling cost (including active and ignored-hook
+overhead), measured control-window wall time, management CPU, and broker/client
+CPU. Outside-MPI profiling costs are folded across ranks using observed
+communication dependencies. Inside-MPI costs and costs whose operation or
+synchronization cannot be modeled are conservatively summed across ranks under
+the same budget. Control and management costs are also summed across ranks.
+`spent` is the sum of confirmed and pending costs. `outstanding` includes
+unspent issued credit and control and frontend prepayments awaiting settlement.
+Measured cost enters `spent` when its cost sample is accounted; the matching
+prepayment is released when its settlement watermark is acknowledged. Credits
+use integer nanoseconds and are released only by actual consumption or an
+explicit return. Predictive refill may request more credit than is available;
+partial forecast funding alone does not stop the cohort. Admission still
+depends on cash for the next operation's minimum and closing costs, with
+measured global debt remaining binding. When sampling pauses at its budget edge,
+PEAK wakes the heartbeat once to reconsider demand; ignored calls do not repeat
+that wake.
+
+Root publishes preparation and bootstrap costs before sealing startup. An online
+cohort alone cannot authorize credit. Only original MPI initialization and later
+job runtime earn budget; PEAK startup work does not earn credit for itself.
+
+After standard constructor installation, later loader/JIT installation and
+restoration require a complete mutation/observation lease, with future closing
+cost reserved separately. Closing an already installed hook reduces existing
+instrumentation exposure without waiting for new profiling cash; the full
+measured close cost is charged to `spent`, and any held closing reserve is
+returned only after the close settlement is acknowledged. Closing an initially
+installed hook can leave its measured cost as budget debt. Existing
+profiling-credit and callback-grace budgets still apply. Closing estimates
+account for multiple batches when more than 64 targets are configured. Future
+window quotes use the existing moving estimate of newly
+measured control windows, not a lifetime maximum; historical measured control
+cost remains fully in `spent`. Before a plan has pending mutations or accepted
+observations, PEAK may revise its admission cash and closing request without
+changing callback demand or issued credit. A physical activity revision starts
+the normal idle interval after installation; detached waiting time cannot
+prematurely return the observation lease. Idle returns use a
+nonblocking attempt on the controller's existing listener lock and defer returns
+while an eligible admission awaits its next scan or mutations are pending.
+Callback spending remains bounded atomic work.
+
+Callbacks that exhaust credit notify the controller and share at most 500 µs of
+estimated unfunded grace per rank for the session. The allowance does not renew
+on restore. Accepted per-hook safety requests can merge into one rank-wide
+closing operation; their count is neither a physical-window count nor a network
+error count. Cold bursts may close early if replenishment arrives too late.
+
+### Coordinator lifecycle and reporting
+
+A separate native `peak_budget_broker` process owns the
+ledger. Every rank, including root, is a client, so root's safe thread pauses
+cannot freeze coordination. PEAK uses native `posix_spawn` to avoid calling
+MPI providers' post-initialization fork handlers. The broker starts without
+PEAK preload/audit libraries and closes unrelated file descriptors before
+signaling readiness. Its process CPU is charged to the job budget.
+The broker is installed alongside PEAK and is independent of the Linux
+physical-detach helper. `PEAK_GLOBAL_BUDGET_BROKER` can select its executable.
+
+A rank entering MPI finalization suspends callbacks and drains its controller,
+then retires while its client continues serving peers that still do application
+work. After the existing all-rank finalization proof, FINAL revisions settle
+remaining costs. Root waits for confirmation that every final reply was fully
+written before reaping the broker. Early root finalization therefore does not
+cut off the remaining ranks.
+
+`MPI initial admission:`, `MPI global budget:` and `MPI global settlement:`
+report admission, current accounting and final confirmation. The global budget
+line's causal raw, confirmed, pending, and unrepresented fields distinguish
+measured cost from cost already resolved by MPI ordering and cost still waiting
+for enough event evidence. A failed bootstrap stops the global service; failed
+or stale coordination is reported as unconfirmed global protection. The
+optional timing trace separates startup, report and settlement costs.
+
+The target controls an estimated lifetime budget. Calibration and mutation-cost
+prediction can be imperfect, and short jobs can finish before startup/closing
+costs are amortized. Reports retain final debt when measured costs exceed the estimate.

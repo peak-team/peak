@@ -1720,6 +1720,15 @@ dlopen_interceptor_pop_dynamic_attach_request(PeakDlopenDynamicAttachRequest* re
     return TRUE;
 }
 
+gboolean
+dlopen_interceptor_dynamic_attach_pending(void)
+{
+    pthread_mutex_lock(&dynamic_attach_gate_mutex);
+    gboolean pending = dynamic_attach_queue_length != 0;
+    pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+    return pending;
+}
+
 static gboolean
 dlopen_interceptor_requeue_dynamic_attach_request(PeakDlopenDynamicAttachRequest* request)
 {

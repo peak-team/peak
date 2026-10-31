@@ -99,9 +99,21 @@ struct _PeakGeneralListener {
      * crossing or publishing against a later ATTACHED generation.
      */
     _Atomic unsigned long long callback_hook_control;
+    /* One initial observation window per hook, shared by every thread and
+     * never replenished by physical reattachment. */
+    _Atomic unsigned initial_observation_remaining;
+    /* Logical admission is independent of the installed physical trampoline. */
+    _Atomic gboolean soft_paused;
+    _Atomic uint64_t retired_ignored_ns;
+    _Atomic uint64_t ignored_rent_base_ns;
+    _Atomic uint64_t soft_resume_sample;
+    gboolean soft_pause_calibration;
     _Atomic guint fast_lifetime_closing;
     _Atomic guint fast_lifetime_abandoners;
     GumPeakFastListener fast_listener;
+#if PEAK_HAVE_NATIVE_PAUSED_ENTRY
+    GumPeakNativePause native_pause;
+#endif
     _Atomic guint* fast_active;
     size_t fast_stats_capacity;
     size_t fast_stats_mapping_size;
@@ -125,6 +137,9 @@ struct _PeakGeneralListener {
     gfloat retired_min_time;
     PeakGeneralListenerCheckpointShadow* checkpoint_shadow;
     size_t checkpoint_shadow_mapping_size;
+    /* Controller-only activity observations; lifetime rent remains untouched. */
+    uint64_t rental_observed_ignored_ns;
+    gboolean rental_observation_ready;
 };
 
 struct _PeakGumTargetAttachPlan;
@@ -279,6 +294,7 @@ PEAK_API int peak_general_listener_test_mpi_uint64_type_size(void);
 uint64_t peak_general_listener_test_add_uint64_saturated(uint64_t lhs,
                                                           uint64_t rhs);
 PEAK_API int peak_general_listener_test_detach_count_latch_state_gate(void);
+PEAK_API int peak_general_listener_test_cumulative_rental_batch(void);
 PEAK_API int peak_general_listener_test_checkpoint_snapshot_lock_hold(void);
 PEAK_API int peak_general_listener_test_checkpoint_snapshot_lock_release(void);
 PEAK_API int peak_general_listener_test_checkpoint_mutation_begin(void);
@@ -347,6 +363,9 @@ gboolean peak_general_listener_dettach();
  * pending target hook state transitions have stopped.
  */
 PEAK_API void peak_general_listener_controller_stop(void);
+void peak_general_listener_global_budget_shutdown(int all_ranks_retired_proven);
+void peak_general_listener_account_teardown_cpu(unsigned long long delta_ns);
+void peak_general_listener_begin_teardown_cpu(clockid_t clock, uint64_t start_ns);
 
 /**
  * @brief Processes pending detach/reattach requests for a bounded interval.
@@ -377,6 +396,9 @@ void peak_general_listener_controller_unlock(void);
  * controller thread process pending Gum lifecycle work outside the callback.
  */
 void peak_general_listener_controller_wake(void);
+PEAK_API void peak_general_listener_funded_initial_attach_fallback(void);
+PEAK_API void peak_general_listener_global_budget_startup(double seconds, int ready);
+PEAK_API void peak_general_listener_global_physical_snapshot(void);
 
 /**
  * @brief Marks a dynamically published hook attached.
@@ -418,6 +440,7 @@ PEAK_API PeakHookState peak_general_listener_hook_state(size_t hook_id);
 #ifdef PEAK_ENABLE_TEST_HOOKS
 /** Returns the current local call count for one hook in test builds. */
 PEAK_API gulong peak_general_listener_test_call_count(size_t hook_id);
+PEAK_API uint64_t peak_general_listener_test_all_target_calls(void);
 PEAK_API gulong peak_general_listener_test_total_calls(
     PeakGeneralListener* listener);
 PEAK_API gulong peak_general_listener_test_thread_count(size_t hook_id);

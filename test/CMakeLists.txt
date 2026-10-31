@@ -267,6 +267,22 @@ if(BUILD_TESTING)
         PROPERTIES
             PASS_REGULAR_EXPRESSION "report_snapshot_cxx_link_test_ok")
 
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        # Match the production logger's DSO unwind boundary for cancellation.
+        add_library(test_logging_batch_runtime SHARED ${PROJECT_SOURCE_DIR}/src/logging.c)
+        target_include_directories(test_logging_batch_runtime PRIVATE ${PROJECT_SOURCE_DIR}/include)
+        target_link_libraries(test_logging_batch_runtime PRIVATE Threads::Threads)
+        set_target_properties(test_logging_batch_runtime PROPERTIES C_VISIBILITY_PRESET default)
+        add_executable(test_logging_batch report/test_logging_batch.c)
+        target_include_directories(test_logging_batch PRIVATE
+            ${PROJECT_SOURCE_DIR}/include)
+        target_compile_options(test_logging_batch PRIVATE -UNDEBUG)
+        target_link_libraries(test_logging_batch PRIVATE test_logging_batch_runtime Threads::Threads)
+        add_test(NAME test_logging_batch COMMAND test_logging_batch)
+        set_tests_properties(test_logging_batch PROPERTIES TIMEOUT 20
+            PASS_REGULAR_EXPRESSION "logging_batch_test_ok")
+    endif()
+
     add_executable(test_report_formatter
         report/test_report_formatter.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/output_identity.c
@@ -670,7 +686,19 @@ if(BUILD_TESTING)
     add_subdirectory(utils)
     add_subdirectory(exec_chain)
     add_subdirectory(detach_controller)
+    if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
+        add_subdirectory(global_budget)
+    endif()
     add_subdirectory(detach_runtime)
+    if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_test(NAME test_mpi_burst_budget
+            COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_mpi_burst_budget_check.py
+                --exe $<TARGET_FILE:test_mpi_burst_budget>
+                --libpeak $<TARGET_FILE:peak>)
+        set_tests_properties(test_mpi_burst_budget PROPERTIES TIMEOUT 20)
+    endif()
+
     add_subdirectory(dlopen_controller)
     add_subdirectory(symbol_resolution)
     add_subdirectory(jit)

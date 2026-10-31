@@ -71,6 +71,22 @@ typedef guint (* GumPeakFastActiveCountFunc)(gpointer user_data);
 typedef guint (* GumPeakFastActiveCloseFunc)(gpointer user_data);
 typedef void (* GumPeakFastActiveResetFunc)(gpointer user_data);
 
+typedef struct _GumPeakNativePause {
+    volatile gint enabled;
+    volatile gint * paused;
+    volatile guint * initial_remaining;
+    volatile gint * callbacks_suspended;
+    guint8 * rent_base;
+    guint8 * calls_base;
+    guint64 rent_ns;
+    gsize capacity;
+    gssize tls_initialized, tls_mapped_valid, tls_in_callback, tls_ignore;
+    gssize tls_slot, tls_excluded, tls_inside, tls_registered;
+} GumPeakNativePause;
+#define GUM_PEAK_NATIVE_PAUSE_VERSION 1u
+#define GUM_PEAK_NATIVE_COST_LANE_SHIFT 7u
+#define GUM_PEAK_NATIVE_RENT_LANE_SHIFT 6u
+
 typedef struct _GumPeakFastListener {
     guint version;
     GumPeakFastEnterFunc on_enter;
@@ -86,9 +102,10 @@ typedef struct _GumPeakFastListener {
     gpointer listener_entries_cookie;
     volatile gint enabled;
     volatile gint release_required;
+    GumPeakNativePause * native_pause;
 } GumPeakFastListener;
 
-#define GUM_PEAK_FAST_LISTENER_VERSION 8u
+#define GUM_PEAK_FAST_LISTENER_VERSION 10u
 
 GUM_API gboolean gum_interceptor_peak_invocation_stack_entry_matches(
     guint depth,
@@ -197,6 +214,8 @@ GUM_API gboolean gum_interceptor_peak_resolve_redirect_chain(
     gpointer function_address,
     gpointer * resolved_address);
 #endif
+
+GUM_API gboolean gum_interceptor_peak_native_pause_is_eligible(GumInterceptor *, gpointer, GumInvocationListener *);
 
 #ifdef __cplusplus
 }

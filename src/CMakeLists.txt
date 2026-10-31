@@ -21,6 +21,9 @@ endif()
 set(sources_peak
     dlopen_interceptor.c
     general_listener.c
+    global_budget.c
+    global_budget_causal.c
+    global_budget_spawn.c
     general_listener/attach_policy.c
     general_listener/exec_checkpoint_writer.c
     general_listener/output_identity.c
@@ -109,16 +112,29 @@ target_link_libraries(peak_inspect_symbols PRIVATE
 
 if(PEAK_DETACH_HELPER_SUPPORTED)
     add_executable(peak_detach_helper detach_helper.c)
-    target_include_directories(peak_detach_helper
-        PRIVATE
-            ${PROJECT_SOURCE_DIR}/include
-    )
-    target_compile_definitions(peak
-        PRIVATE
-            "PEAK_DEFAULT_DETACH_HELPER_PATH=\"${CMAKE_CURRENT_BINARY_DIR}/peak_detach_helper\""
-            "PEAK_INSTALL_DETACH_HELPER_PATH=\"${CMAKE_INSTALL_FULL_BINDIR}/peak_detach_helper\""
-    )
+    target_link_libraries(peak_detach_helper PRIVATE Threads::Threads ${M_LIBRARY})
+    target_include_directories(peak_detach_helper PRIVATE ${PROJECT_SOURCE_DIR}/include)
+    target_compile_definitions(peak PRIVATE
+        "PEAK_DEFAULT_DETACH_HELPER_PATH=\"${CMAKE_CURRENT_BINARY_DIR}/peak_detach_helper\""
+        "PEAK_INSTALL_DETACH_HELPER_PATH=\"${CMAKE_INSTALL_FULL_BINDIR}/peak_detach_helper\"")
     add_dependencies(peak peak_detach_helper)
+endif()
+
+if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
+    add_executable(peak_budget_broker budget_broker.c global_budget.c global_budget_causal.c)
+    peak_budget_configure_optional_runtime(peak_budget_broker)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+       CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+        target_sources(peak_budget_broker PRIVATE
+            ${PROJECT_SOURCE_DIR}/cmake/peak-gum/peak_aarch64_raw_syscall.S)
+    endif()
+    target_link_libraries(peak_budget_broker PRIVATE Threads::Threads ${M_LIBRARY})
+    target_include_directories(peak_budget_broker PRIVATE ${PROJECT_SOURCE_DIR}/include)
+    target_compile_definitions(peak PRIVATE
+        PEAK_GLOBAL_BUDGET_NATIVE=1
+        "PEAK_DEFAULT_BUDGET_BROKER_PATH=\"${CMAKE_CURRENT_BINARY_DIR}/peak_budget_broker\""
+        "PEAK_INSTALL_BUDGET_BROKER_PATH=\"${CMAKE_INSTALL_FULL_BINDIR}/peak_budget_broker\"")
+    add_dependencies(peak peak_budget_broker)
 endif()
 
 target_include_directories(peak
@@ -141,6 +157,15 @@ endif()
 if(BUILD_TESTS OR BUILD_TESTING)
     target_compile_definitions(peak PRIVATE PEAK_ENABLE_TEST_HOOKS=1)
     target_compile_definitions(peak PRIVATE PEAK_TARGET_RESOLVER_TESTING=1)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+        foreach(_peak_exec_optional_test_hook IN ITEMS
+                peak_test_exec_resolver_reentry_hook
+                peak_test_exec_spawn_publication_hook
+                peak_test_exec_spawn_resolver_reentry_hook
+                peak_test_exec_spawn_waiter_hook)
+            target_link_options(peak PRIVATE "LINKER:-U,_${_peak_exec_optional_test_hook}")
+        endforeach()
+    endif()
     if(TARGET cuda_interceptor_obj)
         target_compile_definitions(cuda_interceptor_obj
             PRIVATE PEAK_ENABLE_TEST_HOOKS=1)
@@ -214,6 +239,64 @@ target_link_libraries(cuda_interceptor_obj
 endif()
 
 if(MPI_FOUND)
+    # MPI-4 errata changed declarations implemented by some MPI-4.0 providers.
+    # Redeclarations produce hard errors on mismatches; no warning flags or
+    # provider/version whitelist determine the native ABI used by interposers.
+    include(CheckCSourceCompiles)
+    include(CMakePushCheckState)
+    cmake_push_check_state(RESET)
+    set(CMAKE_REQUIRED_LIBRARIES MPI::MPI_C)
+    check_c_source_compiles("#include <mpi.h>
+#if MPI_VERSION < 4
+#error MPI_4_REQUIRED
+#endif
+int main(void) { return 0; }"
+        PEAK_MPI_HAS_VERSION_4)
+    if(PEAK_MPI_HAS_VERSION_4)
+        check_c_source_compiles("#include <mpi.h>
+extern int MPI_Psend_init(const void *, int, MPI_Count, MPI_Datatype, int, int, MPI_Comm, MPI_Info, MPI_Request *);
+extern int PMPI_Psend_init(const void *, int, MPI_Count, MPI_Datatype, int, int, MPI_Comm, MPI_Info, MPI_Request *);
+int main(void) { return 0; }"
+            PEAK_MPI_PSEND_INIT_CONST_BUFFER)
+        if(NOT PEAK_MPI_PSEND_INIT_CONST_BUFFER)
+            check_c_source_compiles("#include <mpi.h>
+extern int MPI_Psend_init(void *, int, MPI_Count, MPI_Datatype, int, int, MPI_Comm, MPI_Info, MPI_Request *);
+extern int PMPI_Psend_init(void *, int, MPI_Count, MPI_Datatype, int, int, MPI_Comm, MPI_Info, MPI_Request *);
+int main(void) { return 0; }"
+                PEAK_MPI_PSEND_INIT_MUTABLE_BUFFER)
+            if(NOT PEAK_MPI_PSEND_INIT_MUTABLE_BUFFER)
+                message(FATAL_ERROR "Installed MPI_Psend_init/PMPI_Psend_init declarations have an unsupported signature")
+            endif()
+        endif()
+        check_c_source_compiles("#include <mpi.h>
+extern int MPI_Pready_list(int, const int *, MPI_Request);
+extern int PMPI_Pready_list(int, const int *, MPI_Request);
+int main(void) { return 0; }"
+            PEAK_MPI_PREADY_LIST_CONST_PARTITIONS)
+        if(NOT PEAK_MPI_PREADY_LIST_CONST_PARTITIONS)
+            check_c_source_compiles("#include <mpi.h>
+extern int MPI_Pready_list(int, int *, MPI_Request);
+extern int PMPI_Pready_list(int, int *, MPI_Request);
+int main(void) { return 0; }"
+                PEAK_MPI_PREADY_LIST_MUTABLE_PARTITIONS)
+            if(NOT PEAK_MPI_PREADY_LIST_MUTABLE_PARTITIONS)
+                message(FATAL_ERROR "Installed MPI_Pready_list/PMPI_Pready_list declarations have an unsupported signature")
+            endif()
+        endif()
+        check_c_source_compiles("#include <mpi.h>
+int main(void) {
+ int (*a)(MPI_Status *, MPI_Datatype, MPI_Count) = &MPI_Status_set_elements_c;
+ int (*b)(MPI_Status *, MPI_Datatype, MPI_Count) = &PMPI_Status_set_elements_c;
+ MPI_Status status; return a(&status, MPI_BYTE, 0) + b(&status, MPI_BYTE, 0);
+}"
+            PEAK_MPI_HAVE_STATUS_SET_ELEMENTS_C)
+        target_compile_definitions(peak PRIVATE
+            PEAK_MPI_PSEND_INIT_CONST_BUFFER=$<BOOL:${PEAK_MPI_PSEND_INIT_CONST_BUFFER}>
+            PEAK_MPI_PREADY_LIST_CONST_PARTITIONS=$<BOOL:${PEAK_MPI_PREADY_LIST_CONST_PARTITIONS}>
+            PEAK_MPI_HAVE_STATUS_SET_ELEMENTS_C=$<BOOL:${PEAK_MPI_HAVE_STATUS_SET_ELEMENTS_C}>)
+    endif()
+    cmake_pop_check_state()
+    target_sources(peak PRIVATE mpi_budget_events.c)
     target_link_libraries(peak
         PRIVATE
             MPI::MPI_C
@@ -239,4 +322,8 @@ install(TARGETS peak
 install(TARGETS peak_inspect_symbols DESTINATION ${CMAKE_INSTALL_BINDIR})
 if(TARGET peak_detach_helper)
     install(TARGETS peak_detach_helper DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
+
+if(TARGET peak_budget_broker)
+    install(TARGETS peak_budget_broker DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()

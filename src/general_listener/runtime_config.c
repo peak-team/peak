@@ -26,6 +26,9 @@
 #define PEAK_MPI_RELEASE_MARGIN_PHASE_COUNT 2U
 
 static unsigned int configured_local_mpi_ranks = 1U;
+static unsigned int configured_world_mpi_ranks = 1U;
+static const char* configured_world_mpi_source = "unverified";
+static bool peak_mpi_env_rank_size_with_source(long*, long*, const char**);
 static PeakEnvWarningState peak_output_timeout_warning_emitted;
 static PeakEnvWarningState peak_output_release_timeout_warning_emitted;
 static PeakEnvWarningState peak_mpi_release_timeout_warning_emitted;
@@ -292,6 +295,33 @@ peak_general_listener_runtime_configure(void)
 {
     configured_local_mpi_ranks =
         peak_general_listener_detect_local_mpi_ranks();
+    long size = 1;
+    const char* source = "unverified";
+    if (peak_mpi_env_rank_size_with_source(NULL, &size, &source)) {
+        configured_world_mpi_ranks = (unsigned int)size;
+        configured_world_mpi_source = source;
+    } else {
+        configured_world_mpi_ranks = 1U;
+        configured_world_mpi_source = "unverified";
+    }
+}
+
+unsigned int
+peak_general_listener_world_mpi_ranks(void)
+{
+    return configured_world_mpi_ranks;
+}
+
+const char*
+peak_general_listener_world_mpi_source(void)
+{
+    return configured_world_mpi_source;
+}
+
+double
+peak_general_listener_rank_budget(double configured_job_budget)
+{
+    return configured_job_budget / (double)configured_world_mpi_ranks;
 }
 
 unsigned int
@@ -391,8 +421,9 @@ peak_general_listener_parse_long_env(const char* name)
     return parsed;
 }
 
-bool
-peak_general_listener_mpi_env_rank_size(long* rank_out, long* size_out)
+static bool
+peak_mpi_env_rank_size_with_source(long* rank_out, long* size_out,
+                                   const char** source_out)
 {
     static const struct {
         const char* rank_name;
@@ -406,6 +437,7 @@ peak_general_listener_mpi_env_rank_size(long* rank_out, long* size_out)
     };
     long resolved_rank = -1;
     long resolved_size = -1;
+    const char* resolved_source = "unverified";
 
     for (size_t i = 0;
          i < sizeof(mpi_pairs) / sizeof(mpi_pairs[0]);
@@ -432,6 +464,7 @@ peak_general_listener_mpi_env_rank_size(long* rank_out, long* size_out)
         }
         resolved_rank = rank;
         resolved_size = size;
+        resolved_source = mpi_pairs[i].size_name;
     }
 
     if (resolved_rank < 0) {
@@ -443,6 +476,7 @@ peak_general_listener_mpi_env_rank_size(long* rank_out, long* size_out)
         if (!rank_present || !size_present) {
             return false;
         }
+        resolved_source = "SLURM_NTASKS";
         resolved_rank = peak_general_listener_parse_long_env(
             "SLURM_PROCID");
         resolved_size = peak_general_listener_parse_long_env(
@@ -453,6 +487,9 @@ peak_general_listener_mpi_env_rank_size(long* rank_out, long* size_out)
             return false;
         }
     }
+    if (source_out != NULL) {
+        *source_out = resolved_source;
+    }
     if (rank_out != NULL) {
         *rank_out = resolved_rank;
     }
@@ -460,6 +497,12 @@ peak_general_listener_mpi_env_rank_size(long* rank_out, long* size_out)
         *size_out = resolved_size;
     }
     return true;
+}
+
+bool
+peak_general_listener_mpi_env_rank_size(long* rank_out, long* size_out)
+{
+    return peak_mpi_env_rank_size_with_source(rank_out, size_out, NULL);
 }
 
 bool

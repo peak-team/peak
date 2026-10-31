@@ -103,4 +103,25 @@ gum_interceptor_peak_release_fast_invocation(
 }
 #endif
 
+#if defined(__linux__) && (defined(__x86_64__) || defined(__amd64__) || defined(__aarch64__)) && \
+    defined(GUM_PEAK_NATIVE_PAUSE_VERSION) && GUM_PEAK_NATIVE_PAUSE_VERSION == 1
+#define PEAK_HAVE_NATIVE_PAUSED_ENTRY 1
+#else
+#define PEAK_HAVE_NATIVE_PAUSED_ENTRY 0
+#endif
+
+static inline gboolean
+peak_gum_native_pause_is_eligible(GumInterceptor * interceptor,
+    gpointer function_address, GumInvocationListener * listener)
+{
+#if PEAK_HAVE_NATIVE_PAUSED_ENTRY
+    return gum_interceptor_peak_native_pause_is_eligible(interceptor, function_address, listener);
+#else
+    (void)interceptor;
+    (void)function_address;
+    (void)listener;
+    return FALSE;
+#endif
+}
+
 #endif /* PEAK_GUM_PEAK_COMPAT_H */

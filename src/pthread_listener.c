@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include "internal/native_thread_pointer.h"
 #include "pthread_listener.h"
 #include "general_listener.h"
 #include "detach_controller.h"
@@ -611,6 +612,17 @@ pthread_listener_reclaim_interval_elapsed(const struct timespec* now)
 }
 
 gboolean
+pthread_listener_detached_reclamation_pending(void)
+{
+#if defined(__linux__)
+    return tid_mapping_initialized && pthread_task_directory_fd >= 0 &&
+        peak_pthread_slot_registry_exit_pending_count(&pthread_slot_registry, NULL) != 0;
+#else
+    return FALSE;
+#endif
+}
+
+gboolean
 pthread_listener_reclaim_detached_slots(void)
 {
 #if defined(__linux__)
@@ -1084,3 +1096,7 @@ size_t pthread_listener_snapshot_threads(pthread_t* tids,
     }
     return count;
 }
+
+#if defined(__linux__) && (defined(__x86_64__) || defined(__amd64__) || defined(__aarch64__))
+ptrdiff_t pthread_listener_native_exclusion_offset(void) { return peak_native_tls_offset(&pthread_thread_excluded); }
+#endif

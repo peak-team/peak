@@ -1285,10 +1285,11 @@ peak_mpi_activation_policy_post_init(void)
 {
     const char* value = getenv(PEAK_MPI_ACTIVATION_POLICY_ENV);
 
-    if (value == NULL || value[0] == '\0' ||
-        g_ascii_strcasecmp(value, "immediate") == 0) {
-        return FALSE;
+    if (value == NULL || value[0] == '\0') {
+        return FALSE; /* The global default installs the standard initial hooks eagerly. */
     }
+    if (g_ascii_strcasecmp(value, "immediate") == 0 ||
+        g_ascii_strcasecmp(value, "prepare") == 0) return FALSE;
     if (g_ascii_strcasecmp(value, "post-init") == 0 ||
         g_ascii_strcasecmp(value, "defer") == 0 ||
         g_ascii_strcasecmp(value, "deferred") == 0) {
@@ -1300,6 +1301,34 @@ peak_mpi_activation_policy_post_init(void)
         PEAK_MPI_ACTIVATION_POLICY_ENV,
         value);
     return FALSE;
+}
+#endif
+
+#ifdef HAVE_MPI
+static _Atomic double peak_mpi_preparation_seconds;
+
+PEAK_API double
+peak_mpi_runtime_preparation_seconds(void)
+{
+    return atomic_load_explicit(&peak_mpi_preparation_seconds, memory_order_acquire);
+}
+
+static gboolean
+peak_mpi_activation_policy_prepare(void)
+{
+#if defined(__linux__) && UINTPTR_MAX == UINT64_MAX
+    const char* policy = getenv(PEAK_MPI_ACTIVATION_POLICY_ENV);
+    const char* global = getenv("PEAK_MPI_GLOBAL_BUDGET");
+    gboolean explicit_prepare = policy != NULL &&
+        g_ascii_strcasecmp(policy, "prepare") == 0;
+    return (found_MPI || explicit_prepare) && global != NULL && strcmp(global, "1") == 0 &&
+        (policy == NULL || policy[0] == '\0' ||
+         g_ascii_strcasecmp(policy, "prepare") == 0 ||
+         g_ascii_strcasecmp(policy, "immediate") == 0) &&
+        heartbeat_time != 0 && (enable_per_target_heartbeat || enable_global_heartbeat);
+#else
+    return FALSE;
+#endif
 }
 #endif
 
@@ -1522,6 +1551,8 @@ peak_activate_runtime(void)
     if (peak_requested_work.cpu || jit_provider_active) {
         peak_general_listener_controller_start();
     }
+    if (peak_requested_work.cpu && !strict_mutation_active)
+        peak_general_listener_funded_initial_attach_fallback();
 #if !defined(__APPLE__)
     if (dynamic_attach_listener_ready) {
         dlopen_interceptor_enable_dynamic_attach();
@@ -1559,6 +1590,7 @@ peak_activate_runtime(void)
             g_free(heartbeat_overhead);
             heartbeat_overhead = NULL;
             heartbeat_time = 0;
+            peak_general_listener_funded_initial_attach_fallback();
             pthread_mutex_lock(&heartbeat_mutex);
             atomic_store(&heartbeat_running, false);
             pthread_mutex_unlock(&heartbeat_mutex);
@@ -1579,9 +1611,15 @@ peak_mpi_init_completed(int result)
 {
     if (result == MPI_SUCCESS) {
         peak_activate_runtime();
-    } else if (atomic_load_explicit(&peak_runtime_activation_state,
-                                    memory_order_acquire) ==
-               PEAK_RUNTIME_ACTIVATION_READY) {
+    } else {
+        found_MPI = 0;
+        peak_detach_controller_configure_mpi_process(FALSE);
+        peak_general_listener_funded_initial_attach_fallback();
+        if (atomic_load_explicit(&peak_runtime_activation_state,
+                                 memory_order_acquire) != PEAK_RUNTIME_ACTIVATION_READY) {
+            peak_log_warn("[peak] MPI initialization failed after preparation; using local admission\n");
+            return;
+        }
         peak_log_warn(
             "[peak] MPI initialization failed while runtime activation was "
             "deferred; falling back to immediate non-MPI activation\n");
@@ -1675,6 +1713,14 @@ peak_test_heartbeat_started(void)
 
 void peak_init()
 {
+    if (peak_exec_skip_mpi_runtime_child(0, NULL)) return;
+#ifdef HAVE_MPI
+    struct timespec preparation_started = {0};
+    const char* preparation_global = getenv("PEAK_MPI_GLOBAL_BUDGET");
+    gboolean preparation_clock_valid = preparation_global != NULL &&
+        strcmp(preparation_global, "1") == 0 &&
+        clock_gettime(CLOCK_MONOTONIC, &preparation_started) == 0;
+#endif
     peak_output_identity_initialize();
     PeakRuntimeNumericConfig numeric_config;
     PeakEnvUnsignedSchema activation_wait_timeout_schema = {
@@ -1768,12 +1814,12 @@ void peak_init()
     gboolean activate_post_mpi_init =
         peak_mpi_activation_policy_post_init();
     /*
-     * An explicit post-init policy is authoritative even for singleton MPI
-     * launches whose runtime provides none of the rank environment variables
+     * Explicit post-init and eligible prepare policies declare an MPI lifecycle
+     * even for singleton launches with none of the rank environment variables
      * used by check_MPI(). Programs without a traditional interposable
      * MPI_Init* lifecycle must leave the default immediate policy selected.
      */
-    if (activate_post_mpi_init) {
+    if (activate_post_mpi_init || peak_mpi_activation_policy_prepare()) {
         found_MPI = 1;
     }
     peak_requested_output_aggregation =
@@ -1811,7 +1857,29 @@ void peak_init()
         }
     }
 #endif
+#ifdef HAVE_MPI
+    gboolean prepare = peak_mpi_activation_policy_prepare();
+    if (prepare) {
+        /* ACTIVE can be observed before activation returns. Until publication,
+         * concurrent MPI initialization must fail closed rather than charge 0. */
+        atomic_store_explicit(&peak_mpi_preparation_seconds, -1.0, memory_order_release);
+        peak_log_report("[peak] MPI activation: policy=prepare targets=standard-initial-install\n");
+    }
+#endif
     peak_activate_runtime();
+#ifdef HAVE_MPI
+    if (prepare) {
+        struct timespec finished = {0};
+        double duration = -1.0;
+        if (preparation_clock_valid && clock_gettime(CLOCK_MONOTONIC, &finished) == 0 &&
+            (finished.tv_sec > preparation_started.tv_sec ||
+             (finished.tv_sec == preparation_started.tv_sec &&
+              finished.tv_nsec >= preparation_started.tv_nsec)))
+            duration = (double)(finished.tv_sec - preparation_started.tv_sec) +
+                (double)(finished.tv_nsec - preparation_started.tv_nsec) / 1e9;
+        atomic_store_explicit(&peak_mpi_preparation_seconds, duration, memory_order_release);
+    }
+#endif
 }
 
 #ifdef HAVE_MPI
@@ -1828,10 +1896,71 @@ peak_mpi_runtime_allows_collectives(void)
 
 #endif
 
+static int
+peak_fini_thread_cpu_ns(unsigned long long *out)
+{
+#ifdef CLOCK_THREAD_CPUTIME_ID
+    struct timespec value;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) == 0) {
+        *out = (unsigned long long)value.tv_sec * 1000000000ULL + value.tv_nsec;
+        return 1;
+    }
+#else
+    (void)out;
+#endif
+    return 0;
+}
+
+#ifdef HAVE_MPI
+static void
+peak_fini_global_settle(int account_teardown, int teardown_cpu_valid,
+                        unsigned long long teardown_cpu_start,
+                        int timing_enabled, int proven)
+{
+    if (account_teardown) {
+        unsigned long long teardown_cpu_end = 0;
+        int valid = teardown_cpu_valid && peak_fini_thread_cpu_ns(&teardown_cpu_end) &&
+                    teardown_cpu_end >= teardown_cpu_start;
+        if (valid) peak_general_listener_account_teardown_cpu(teardown_cpu_end - teardown_cpu_start);
+        if (timing_enabled || !valid)
+            peak_log_report("[peak] MPI teardown CPU: valid=%d seconds=%.9g\n",
+                valid, valid ? (double)(teardown_cpu_end - teardown_cpu_start) / 1e9 : 0.0);
+    }
+    peak_general_listener_global_budget_shutdown(proven);
+}
+
+#endif
+
+static void
+peak_fini_timing_stage(int enabled, double *previous, const char *stage)
+{
+    if (!enabled) return;
+    double now = peak_second();
+    peak_log_report("[peak] MPI timing: stage=fini_%s seconds=%.9g\n", stage, now - *previous);
+    *previous = peak_second();
+}
+
 static void
 peak_fini_impl(void)
 {
     double peak_runtime_start_time = peak_main_time;
+    const char *timing_env = getenv("PEAK_MPI_TIMING_TRACE");
+    int timing_enabled = timing_env && strcmp(timing_env, "1") == 0;
+    double timing_previous = timing_enabled ? peak_second() : 0.0;
+    const char *global_env = getenv("PEAK_MPI_GLOBAL_BUDGET");
+    int account_teardown = global_env && strcmp(global_env, "1") == 0;
+    unsigned long long teardown_cpu_start = 0;
+    int teardown_cpu_valid = account_teardown && peak_fini_thread_cpu_ns(&teardown_cpu_start);
+    if (account_teardown) {
+        clockid_t teardown_clock = (clockid_t)-1;
+#if defined(__linux__)
+        if (!teardown_cpu_valid || pthread_getcpuclockid(pthread_self(), &teardown_clock) != 0)
+            teardown_cpu_valid = 0;
+#else
+        teardown_cpu_valid = 0;
+#endif
+        peak_general_listener_begin_teardown_cpu(teardown_clock, teardown_cpu_start);
+    }
 
 #ifdef HAVE_MPI
     int mpi_finalize_path =
@@ -1854,6 +1983,8 @@ peak_fini_impl(void)
         }
     }
 
+    peak_fini_timing_stage(timing_enabled, &timing_previous, "heartbeat_join");
+
 #if defined(GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION) && \
     GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION >= 2
     /*
@@ -1864,11 +1995,14 @@ peak_fini_impl(void)
     gum_interceptor_peak_quiesce_deferred_module_sync();
 #endif
 
+    peak_fini_timing_stage(timing_enabled, &timing_previous, "deferred_module_quiesce");
     peak_general_listener_controller_stop();
+    peak_fini_timing_stage(timing_enabled, &timing_previous, "controller_stop");
     if (peak_runtime_start_time > 0.0) {
         peak_main_time = peak_second() - peak_runtime_start_time;
     }
     peak_general_listener_freeze_final_report_snapshot();
+    peak_fini_timing_stage(timing_enabled, &timing_previous, "snapshot_freeze");
     if (heartbeat_overhead) {
         g_free(heartbeat_overhead);
         heartbeat_overhead = NULL;
@@ -1907,6 +2041,7 @@ peak_fini_impl(void)
         dlopen_shutdown_flushed = dlopen_interceptor_dettach();
     }
 #endif
+    peak_fini_timing_stage(timing_enabled, &timing_previous, "dlopen_quiesce");
     if (!dlopen_shutdown_flushed) {
         g_printerr("[peak] Skipping remaining PEAK teardown because dlopen listener teardown was not proven safe\n");
         return;
@@ -1928,6 +2063,7 @@ peak_fini_impl(void)
     gboolean report_write_succeeded = FALSE;
     gboolean used_mpi_aggregation = FALSE;
     int report_published = 0;
+    peak_fini_timing_stage(timing_enabled, &timing_previous, "snapshot_support_cleanup");
     PeakOutputAggregationMode output_mode = PEAK_OUTPUT_AGGREGATION_LOCAL;
     int mpi_log_rank = 1;
 
@@ -1979,6 +2115,7 @@ peak_fini_impl(void)
                 TRUE,
                 &report_write_succeeded);
         report_published = 1;
+        peak_fini_timing_stage(timing_enabled, &timing_previous, "report");
     }
 
     /*
@@ -2080,6 +2217,7 @@ peak_fini_impl(void)
                 found_MPI ? TRUE : FALSE,
                 &report_write_succeeded);
         report_published = 1;
+        peak_fini_timing_stage(timing_enabled, &timing_previous, "report");
     }
     /*
      * Keep this check adjacent to PEAK output. If the payload reducer started
@@ -2185,6 +2323,12 @@ peak_fini_impl(void)
             }
         }
     }
+    peak_fini_timing_stage(timing_enabled, &timing_previous, "release");
+    if (!(found_MPI && (mpi_finalize_path || local_requested_mpi_finalize))) {
+        peak_fini_global_settle(account_teardown, teardown_cpu_valid,
+            teardown_cpu_start, timing_enabled, 0);
+        peak_fini_timing_stage(timing_enabled, &timing_previous, "global_settlement");
+    }
     int base_real_mpi_finalize_allowed =
         report_release_gate_allowed &&
         all_ranks_requested_mpi_finalize;
@@ -2238,6 +2382,11 @@ peak_fini_impl(void)
             g_printerr("[peak] Leaving pthread listener bookkeeping allocated before application PMPI_Finalize\n");
         }
 #endif
+        peak_fini_timing_stage(timing_enabled, &timing_previous, "support_teardown");
+        peak_fini_global_settle(account_teardown, teardown_cpu_valid,
+            teardown_cpu_start, timing_enabled,
+            report_release_protocol_completed && all_ranks_requested_mpi_finalize);
+        peak_fini_timing_stage(timing_enabled, &timing_previous, "global_settlement");
         peak_log_shutdown();
         return;
     }
@@ -2555,7 +2704,8 @@ int __libc_start_main(main_fn main, int argc, char** argv,
     real_main = main;
 
     /* Install main_wrapper() only when the command requests PEAK work. */
-    int requested_work = peak_process_requests_work();
+    int requested_work = peak_exec_skip_mpi_runtime_child(argc, argv) ?
+        0 : peak_process_requests_work();
     if (atomic_load_explicit(&peak_exit_interposer_unavailable,
                              memory_order_acquire) != 0) {
         peak_report_snapshot_note_degraded(

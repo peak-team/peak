@@ -866,8 +866,15 @@ G_STATIC_ASSERT(sizeof(PeakGumFunctionContextBackendData17) == 3 * GLIB_SIZEOF_V
 G_STATIC_ASSERT(sizeof(PeakGumX86Relocator17) >= 8 * GLIB_SIZEOF_VOID_P);
 #elif defined(__aarch64__)
 G_STATIC_ASSERT(sizeof(PeakGumArm64Relocator17) >= 8 * GLIB_SIZEOF_VOID_P);
-G_STATIC_ASSERT(sizeof(PeakGumArm64FunctionContextData17) <=
-                sizeof(PeakGumFunctionContextBackendData17));
+G_STATIC_ASSERT(sizeof(PeakGumArm64FunctionContextData17) == 12);
+G_STATIC_ASSERT(sizeof(PeakGumArm64FunctionContextData17) <= 2 * sizeof(gpointer));
+G_STATIC_ASSERT(G_STRUCT_OFFSET(PeakGumFunctionContextBackendData17, p[2]) == 16);
+#if defined(__linux__)
+extern void gum_peak_native_enter_arm64_x16(void);
+extern void gum_peak_native_enter_arm64_x17(void);
+extern void gum_peak_native_enter_arm64_x16_auth(void);
+extern void gum_peak_native_enter_arm64_x17_auth(void);
+#endif
 #endif
 
 static _Thread_local PeakGumInvocationStack17 *
@@ -1775,4 +1782,33 @@ gum_interceptor_peak_safe_pc(GumPeakFunctionContext * ctx,
     }
 
     return NULL;
+}
+
+gboolean gum_interceptor_peak_native_pause_is_eligible(GumInterceptor * interceptor,
+    gpointer function_address, GumInvocationListener * listener)
+{
+#if defined(__linux__) && (defined(__x86_64__) || defined(__amd64__) || defined(__aarch64__))
+    PeakGumInterceptor17 * private_interceptor = (PeakGumInterceptor17 *)interceptor;
+    g_rec_mutex_lock(&private_interceptor->mutex);
+    PeakGumFunctionContext17 * context = peak_gum_find_context(interceptor, function_address, listener);
+    GumPeakFastListener * fast = peak_gum_context_fast_listener_for_enter(context);
+    gboolean eligible = fast != NULL && fast->native_pause != NULL &&
+        g_atomic_int_get(&fast->native_pause->enabled) != 0;
+#if defined(__linux__) && defined(__aarch64__)
+    if (eligible) {
+        gpointer marker = context->backend_data.p[2];
+        eligible = marker == (gpointer)gum_peak_native_enter_arm64_x16 ||
+            marker == (gpointer)gum_peak_native_enter_arm64_x17 ||
+            marker == (gpointer)gum_peak_native_enter_arm64_x16_auth ||
+            marker == (gpointer)gum_peak_native_enter_arm64_x17_auth;
+    }
+#endif
+    g_rec_mutex_unlock(&private_interceptor->mutex);
+    return eligible;
+#else
+    (void)interceptor;
+    (void)function_address;
+    (void)listener;
+    return FALSE;
+#endif
 }

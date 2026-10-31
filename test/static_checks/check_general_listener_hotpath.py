@@ -72,7 +72,7 @@ def main():
         "peak_general_listener_first_attached_generation_is_adjacent",
     )
     threshold_take = function_body(
-        source, "peak_general_listener_take_detach_count_request"
+        source, "peak_general_listener_take_callback_request"
     )
     state_publish = function_body(
         source, "peak_general_controller_set_state_unlocked"
@@ -273,6 +273,11 @@ def main():
         "callback state, initial crossing, and request must share an "
         "always-lock-free generation-tagged atomic word",
     )
+    burst_publish = function_body(source, "peak_general_listener_try_publish_burst_request")
+    grace_claim = function_body(source, "peak_general_listener_claim_global_grace")
+    for token in ("for (", "while (", "pthread_mutex", "MPI_", "malloc(", "gum_interceptor_"):
+        require(token not in burst_publish and token not in grace_claim,
+                "callback budget helpers must remain bounded and avoid locks, allocation, MPI and Gum")
     for token in (
         "pthread_mutex",
         "pthread_cond",
@@ -312,7 +317,7 @@ def main():
         "peak_general_controller_process_pending_unlocked"
     )
     wait_for_wake = controller_main.find(
-        "peak_general_listener_controller_wait(expected_wake_sequence)"
+        "peak_general_listener_controller_wait(expected_wake_sequence,"
     )
     require(
         sequence_snapshot != -1
@@ -341,7 +346,7 @@ def main():
         "controller stop must publish running=false before its lock-free wake",
     )
     require(
-        "peak_general_listener_take_detach_count_request" in publish
+        "peak_general_listener_take_callback_request" in publish
         and "peak_general_listener_request_detach_with_context_unlocked" in publish,
         "controller must consume the CAS latch under its existing request path",
     )

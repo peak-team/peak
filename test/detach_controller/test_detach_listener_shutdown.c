@@ -69,6 +69,12 @@ clear_mpi_launcher_environment(void)
     }
 }
 
+gboolean
+dlopen_interceptor_dynamic_attach_pending(void)
+{
+    return FALSE;
+}
+
 void
 dlopen_interceptor_drain_dynamic_attach_queue(void)
 {
@@ -532,7 +538,9 @@ run_shutdown_prepare_fail_closed(void)
     if (finish_public_listener_fixture(log_template) != 0) {
         return EXIT_FAILURE;
     }
-    fprintf(stderr, "general-listener-shutdown-prepare-fail-closed-ok\n");
+    if (failures == 0) {
+        fprintf(stderr, "general-listener-shutdown-prepare-fail-closed-ok\n");
+    }
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
@@ -584,7 +592,9 @@ run_idle_shutdown_io_fail_closed(void)
     if (finish_public_listener_fixture(log_template) != 0) {
         return EXIT_FAILURE;
     }
-    fprintf(stderr, "general-listener-idle-shutdown-io-fail-closed-ok\n");
+    if (failures == 0) {
+        fprintf(stderr, "general-listener-idle-shutdown-io-fail-closed-ok\n");
+    }
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
@@ -649,7 +659,9 @@ run_final_freeze_after_controller_stop(void)
     if (finish_public_listener_fixture(log_template) != 0) {
         return EXIT_FAILURE;
     }
-    fprintf(stderr, "general-listener-final-freeze-after-controller-stop-ok\n");
+    if (failures == 0) {
+        fprintf(stderr, "general-listener-final-freeze-after-controller-stop-ok\n");
+    }
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
@@ -692,7 +704,9 @@ run_invalid_accounting_baseline_report(void)
     if (finish_public_listener_fixture(log_template) != 0) {
         return EXIT_FAILURE;
     }
-    fprintf(stderr, "general-listener-invalid-accounting-baseline-report-ok\n");
+    if (failures == 0) {
+        fprintf(stderr, "general-listener-invalid-accounting-baseline-report-ok\n");
+    }
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
@@ -806,7 +820,9 @@ run_rank_local_mpi_text_default(void)
     if (finish_public_listener_fixture(log_template) != 0) {
         return EXIT_FAILURE;
     }
-    fprintf(stderr, "general-listener-rank-local-mpi-text-default-ok\n");
+    if (failures == 0) {
+        fprintf(stderr, "general-listener-rank-local-mpi-text-default-ok\n");
+    }
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
@@ -845,7 +861,9 @@ run_slurm_host_parser(void)
                                                            sizeof(host)));
     check_string_equal("single bracket token first host", host, "node007");
 
-    fprintf(stderr, "general-listener-slurm-host-parser-ok\n");
+    if (failures == 0) {
+        fprintf(stderr, "general-listener-slurm-host-parser-ok\n");
+    }
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 #endif
 }
@@ -863,7 +881,22 @@ run_uint64_saturation(void)
                peak_general_listener_test_add_uint64_saturated(
                    UINT64_MAX - 2,
                    2) == UINT64_MAX - 1);
-    fprintf(stderr, "general-listener-uint64-saturation-ok\n");
+    if (failures == 0) {
+        fprintf(stderr, "general-listener-uint64-saturation-ok\n");
+    }
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+static int
+run_cumulative_rental_batch(void)
+{
+    gum_init_embedded();
+    check_true("actual rental walk progresses beyond idle64 and preserves observations",
+               peak_general_listener_test_cumulative_rental_batch() == 0);
+    gum_deinit_embedded();
+    if (failures == 0) {
+        fprintf(stderr, "general-listener-cumulative-rental-batch-ok\n");
+    }
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
@@ -872,7 +905,9 @@ run_detach_count_latch_state_gate(void)
 {
     check_true("detach-count latch obeys callback hook state",
                peak_general_listener_test_detach_count_latch_state_gate() == 0);
-    fprintf(stderr, "general-listener-detach-count-latch-state-gate-ok\n");
+    if (failures == 0) {
+        fprintf(stderr, "general-listener-detach-count-latch-state-gate-ok\n");
+    }
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
@@ -898,7 +933,9 @@ run_call_count_modular_aggregation(void)
                peak_general_listener_test_total_calls(listener) == 0);
     peak_general_listener_free(listener);
     g_object_unref(base);
-    fprintf(stderr, "general-listener-call-count-modular-aggregation-ok\n");
+    if (failures == 0) {
+        fprintf(stderr, "general-listener-call-count-modular-aggregation-ok\n");
+    }
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
@@ -1014,7 +1051,9 @@ run_general_listener_mapping_lifecycle(void)
     checkpoint_mapping_enabled = 0;
     peak_general_listener_test_fail_mapping_after(-1);
     gum_deinit_embedded();
-    fprintf(stderr, "general-listener-mapping-lifecycle-ok\n");
+    if (failures == 0) {
+        fprintf(stderr, "general-listener-mapping-lifecycle-ok\n");
+    }
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
@@ -1031,6 +1070,9 @@ main(int argc, char** argv)
     /* Match PEAK's production initialization contract before any mutation. */
     peak_detach_controller_configure_mpi_process(FALSE);
 
+    if (strcmp(argv[1], "general-listener-cumulative-rental-batch") == 0) {
+        return run_cumulative_rental_batch();
+    }
     if (strcmp(argv[1], "general-listener-shutdown-prepare-fail-closed") == 0) {
         return run_shutdown_prepare_fail_closed();
     }
