@@ -12,7 +12,11 @@ typedef struct {
 } PeakMpiOverheadSample;
 
 /* Startup application thread only, after the original outer MPI initializer.
- * Runtime helpers never call MPI. All world ranks must load PEAK. */
+ * Runtime helpers never call MPI. Partial loading remains ordinary MAIN;
+ * only a validated full cohort enables global feedback. Explicit job endpoint
+ * (numeric IPv4:port or [IPv6]:port) and full shared token never add an
+ * application collective. Launch setup resolves hostnames before configuration;
+ * absent/invalid routing retains MAIN policy without global feedback. */
 void peak_mpi_overhead_sync_start(void);
 
 /* Existing heartbeat only: coalesce the latest cumulative snapshot and read
