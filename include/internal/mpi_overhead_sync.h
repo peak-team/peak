@@ -19,8 +19,9 @@ typedef struct {
  * absent/invalid routing retains MAIN policy without global feedback. */
 void peak_mpi_overhead_sync_start(void);
 
-/* Existing heartbeat only: coalesce the latest cumulative snapshot and read
- * rank-budget telemetry. The existing local-control multiplier is input only;
+/* Existing heartbeat only: owns one-time helper creation, then publishes
+ * snapshots and reads rank-budget telemetry. The existing local-control
+ * multiplier is input only;
  * ACK-priced headroom receives no local elapsed-time credit. No MPI, Gum,
  * controller requests, or helper wake. */
 double peak_mpi_overhead_sync_update(const PeakMpiOverheadSample* sample,

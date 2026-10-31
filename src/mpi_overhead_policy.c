@@ -5,7 +5,7 @@
 
 typedef struct {
     uint64_t sequence;
-    double previous_profile_control, demand_high_water;
+    double previous_profile_control, previous_elapsed, demand_rate_high_water;
 } RankPolicy;
 struct PeakMpiOverheadPolicy { size_t count; RankPolicy ranks[]; };
 PeakMpiOverheadPolicy *peak_mpi_overhead_policy_create(size_t count)
@@ -31,11 +31,16 @@ void peak_mpi_overhead_policy_update(PeakMpiOverheadPolicy *policy,
         double pc = s->profile_seconds + s->control_seconds;
         if (s->sequence > r->sequence) {
             double increment = pc - r->previous_profile_control;
-            if (increment > r->demand_high_water) r->demand_high_water = increment;
+            double interval = s->elapsed_seconds - r->previous_elapsed;
+            if (interval > 0) {
+                double rate = fmax(0, increment) / interval;
+                if (rate > r->demand_rate_high_water) r->demand_rate_high_water = rate;
+            }
             r->previous_profile_control = pc;
+            r->previous_elapsed = s->elapsed_seconds;
             r->sequence = s->sequence;
         }
-        demand += r->demand_high_water;
+        demand += r->demand_rate_high_water;
         elapsed = fmin(elapsed, s->elapsed_seconds);
         cost += pc + s->management_seconds;
         module += s->module_cpu_seconds;
@@ -50,7 +55,7 @@ void peak_mpi_overhead_policy_update(PeakMpiOverheadPolicy *policy,
                                  q * elapsed - cost - module));
     decision->profiling_headroom_seconds = headroom;
     for (size_t i = 0; i < count; ++i) {
-        double weight = demand > 0 ? .5 / count + .5 * ranks[i].demand_high_water / demand
+        double weight = demand > 0 ? .5 / count + .5 * ranks[i].demand_rate_high_water / demand
                                    : 1.0 / count;
         double local_cost = samples[i].profile_seconds + samples[i].control_seconds +
                             samples[i].management_seconds;

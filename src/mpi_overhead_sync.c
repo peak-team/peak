@@ -56,6 +56,9 @@ static PeakMpiOverheadSample latest;
 static PeakMpiOverheadPolicySample acknowledged;
 static double acknowledged_ratio;
 static bool acknowledged_valid;
+/* Creation and stop claims are serialized by sample_lock. */
+static bool stopping, creation_attempted;
+static atomic_bool parameters_ready, creator_excluded;
 static atomic_bool started, running, helper_exited, helper_created, startup_complete;
 static atomic_bool accounting_valid = true;
 static atomic_bool normal_end, cohort_ready, ever_ready, fallback_reported;
@@ -596,8 +599,18 @@ static void* service(void* unused)
 static void stop_sync(void)
 {
     if (getpid() != owner) return;
+    pthread_mutex_lock(&sample_lock);
+    stopping = true;
+    atomic_store(&parameters_ready, false);
     bool created = atomic_exchange(&helper_created, false);
     atomic_store(&running, false);
+    pthread_mutex_unlock(&sample_lock);
+    if (!created) {
+        if (wake_pipe[0] >= 0) close(wake_pipe[0]);
+        if (wake_pipe[1] >= 0) close(wake_pipe[1]);
+        wake_pipe[0] = wake_pipe[1] = -1;
+        free(root_host); free(cohort_token); root_host = cohort_token = NULL;
+    }
     if (created && wake_pipe[1] >= 0) { unsigned char byte = 1; (void)write(wake_pipe[1], &byte, 1); }
     struct timespec until;
     if (created && clock_gettime(CLOCK_REALTIME, &until) == 0) {
@@ -616,9 +629,9 @@ static void stop_sync(void)
     /* Live helper state is retained if cooperative stop reaches its bound.
      * No hostname lookup or MPI can run here. Normal performance is quiet. */
     if (trace_diagnostics)
-        fprintf(stderr, "[peak] MPI overhead sync: rank=%d module_cpu_seconds=%.9g startup_wall_seconds=%.9g accounting_valid=%d helper_created=%d startup_queries=%d helper_exited=%d normal_end=%d cohort_ready=%d ever_ready=%d bootstrap_cpu_seconds=%.9g fallback_reason=%s policy_or_reply_updates=%llu records_received=%llu records_sent=%llu final_proposed_ratio=%.9g configured_q=%.9g negotiated_q=%.9g acknowledged_sequence=%llu last_effective_input=%.9g\n",
+        fprintf(stderr, "[peak] MPI overhead sync: rank=%d module_cpu_seconds=%.9g startup_wall_seconds=%.9g accounting_valid=%d helper_created=%d creator_excluded=%d startup_queries=%d helper_exited=%d normal_end=%d cohort_ready=%d ever_ready=%d bootstrap_cpu_seconds=%.9g fallback_reason=%s policy_or_reply_updates=%llu records_received=%llu records_sent=%llu final_proposed_ratio=%.9g configured_q=%.9g negotiated_q=%.9g acknowledged_sequence=%llu last_effective_input=%.9g\n",
             world_rank, module_seconds(), (double)atomic_load(&startup_wall_ns)/1e9,
-            (int)atomic_load(&accounting_valid), created, startup_queries,
+            (int)atomic_load(&accounting_valid), created, (int)atomic_load(&creator_excluded), startup_queries,
             (int)atomic_load(&helper_exited), (int)atomic_load(&normal_end),
             (int)atomic_load(&cohort_ready), (int)atomic_load(&ever_ready),
             (double)atomic_load(&bootstrap_cpu_ns)/1e9, status_name(atomic_load(&status)),
@@ -646,8 +659,8 @@ void peak_mpi_overhead_sync_start(void)
     bool gum_ignored = startup_interceptor != NULL;
     if (gum_ignored) gum_interceptor_ignore_current_thread(startup_interceptor);
     uint64_t cpu_start = clock_ns(CLOCK_THREAD_CPUTIME_ID), wall_start = clock_ns(CLOCK_MONOTONIC);
+    bool prepared = false;
     owner = getpid(); configured_q = global_target_ratio;
-    (void)atexit(stop_sync);
     if (!cpu_start || !wall_start) { atomic_store(&accounting_valid, false); goto finished; }
     if (PMPI_Comm_rank(MPI_COMM_WORLD, &world_rank) != MPI_SUCCESS ||
         PMPI_Comm_size(MPI_COMM_WORLD, &world_size) != MPI_SUCCESS) goto finished;
@@ -655,25 +668,29 @@ void peak_mpi_overhead_sync_start(void)
     if (world_size <= 1) goto finished;
     if (!parse_route(endpoint, token)) { atomic_store(&status, S_NO_ROUTE); goto finished; }
     if (pipe(wake_pipe) || !nonblocking(wake_pipe[0]) || !nonblocking(wake_pipe[1])) goto finished;
-    atomic_store(&running, true);
-    if (gum_ignored) { gum_interceptor_unignore_current_thread(startup_interceptor); gum_ignored = false; }
-    pthread_listener_mark_next_created_thread_helper();
-    bool created = pthread_create(&helper, NULL, service, NULL) == 0;
-    if (startup_interceptor) { gum_interceptor_ignore_current_thread(startup_interceptor); gum_ignored = true; }
-    atomic_store(&helper_created, created);
-    if (!created) atomic_store(&running, false);
+    prepared = true;
 finished:
-    if (!atomic_load(&helper_created)) {
+    if (!prepared) {
         if (wake_pipe[0] >= 0) close(wake_pipe[0]);
         if (wake_pipe[1] >= 0) close(wake_pipe[1]);
         wake_pipe[0] = wake_pipe[1] = -1;
         free(root_host); free(cohort_token); root_host = cohort_token = NULL;
     }
+    /* Publish only complete setup. An exit callback cannot cancel/free it
+     * between registration and publication, or race a later HB creator. */
+    pthread_mutex_lock(&sample_lock);
+    bool exit_registered = atexit(stop_sync) == 0;
     uint64_t wall_end = clock_ns(CLOCK_MONOTONIC), cpu_end = clock_ns(CLOCK_THREAD_CPUTIME_ID);
     if (wall_start && wall_end >= wall_start) atomic_store(&startup_wall_ns, wall_end - wall_start);
     if (cpu_start && cpu_end >= cpu_start) atomic_store(&startup_cpu_ns, cpu_end - cpu_start);
     else { atomic_store(&accounting_valid, false); atomic_store(&running, false); }
     atomic_store_explicit(&startup_complete, true, memory_order_release);
+    atomic_store(&parameters_ready, prepared && exit_registered && atomic_load(&accounting_valid));
+    pthread_mutex_unlock(&sample_lock);
+    if (prepared && !exit_registered) {
+        close(wake_pipe[0]); close(wake_pipe[1]); wake_pipe[0] = wake_pipe[1] = -1;
+        free(root_host); free(cohort_token); root_host = cohort_token = NULL;
+    }
     if (gum_ignored) gum_interceptor_unignore_current_thread(startup_interceptor);
     peak_general_listener_fast_unignore_current_thread();
 }
@@ -681,7 +698,7 @@ finished:
 double peak_mpi_overhead_sync_update(const PeakMpiOverheadSample* sample, double q,
                                      double detach_factor, unsigned local_control_ranks)
 {
-    if (!sample || !atomic_load(&running) || getpid() != owner) {
+    if (!sample || !atomic_load(&parameters_ready) || getpid() != owner) {
         if (trace_diagnostics && atomic_load(&status) == S_NO_ROUTE &&
             !atomic_exchange(&fallback_reported, true))
             fprintf(stderr, "[peak] MPI overhead sync fallback: reason=no_route policy=main\n");
@@ -692,8 +709,25 @@ double peak_mpi_overhead_sync_update(const PeakMpiOverheadSample* sample, double
         .management_seconds=sample->management_seconds};
     PeakMpiOverheadPolicySample ack; double ratio; bool valid;
     pthread_mutex_lock(&sample_lock);
+    if (stopping || !atomic_load(&parameters_ready)) {
+        pthread_mutex_unlock(&sample_lock);
+        return q;
+    }
     if (sample->sequence > latest.sequence) latest = *sample;
-    ack = acknowledged; ratio = acknowledged_ratio; valid = acknowledged_valid;
+    if (!creation_attempted && atomic_load(&heartbeat_running)) {
+        /* The existing HB is already excluded from user profiling. Leave the
+         * original pthread listener/gate enabled to consume its helper mark.
+         * Creator CPU is normal HB management, never added to module CPU. */
+        creation_attempted = true;
+        atomic_store(&running, true);
+        atomic_store(&creator_excluded, pthread_listener_current_thread_excluded());
+        pthread_listener_mark_next_created_thread_helper();
+        bool created = pthread_create(&helper, NULL, service, NULL) == 0;
+        atomic_store(&helper_created, created);
+        if (!created) atomic_store(&running, false);
+    }
+    ack = acknowledged; ratio = acknowledged_ratio;
+    valid = acknowledged_valid && atomic_load(&running);
     pthread_mutex_unlock(&sample_lock);
     if (!valid) return q; /* Partial/absent cohort is ordinary MAIN, never q/N. */
     current.module_cpu_seconds = module_seconds();

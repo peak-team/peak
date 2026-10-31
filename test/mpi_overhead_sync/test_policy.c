@@ -61,6 +61,22 @@ int main(void)
     CHECK(near(input*current.elapsed_seconds-risk,allowance/(2*factor)));
     current.module_cpu_seconds+=allowance;
     CHECK(peak_mpi_overhead_policy_input(&current,&ack,raw_ratio,factor,2)==0);
+    /* Equal stationary rates must receive equal NEW headroom despite records
+     * arriving at different cadences. Both final clocks and costs are equal. */
+    PeakMpiOverheadPolicy *cadence=peak_mpi_overhead_policy_create(2);
+    CHECK(cadence);
+    PeakMpiOverheadPolicySample constant[2] = {
+        {1,1,.001,0,0,0}, {1,1,.001,0,0,0}};
+    peak_mpi_overhead_policy_update(cadence,constant,.1,ratio,&d);
+    constant[0]=(PeakMpiOverheadPolicySample){2,2,.002,0,0,0};
+    peak_mpi_overhead_policy_update(cadence,constant,.1,ratio,&d);
+    constant[0]=(PeakMpiOverheadPolicySample){3,3,.003,0,0,0};
+    constant[1]=(PeakMpiOverheadPolicySample){2,3,.003,0,0,0};
+    peak_mpi_overhead_policy_update(cadence,constant,.1,ratio,&d);
+    CHECK(near(ratio[0]*3-.003,d.profiling_headroom_seconds/2));
+    CHECK(near(ratio[1]*3-.003,d.profiling_headroom_seconds/2));
+    CHECK(near(d.raw_cost_seconds,.006) && d.debt_seconds==0);
+    peak_mpi_overhead_policy_free(cadence);
     peak_mpi_overhead_policy_free(state);
     return 0;
 }

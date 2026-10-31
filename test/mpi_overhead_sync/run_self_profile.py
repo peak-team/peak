@@ -77,6 +77,8 @@ def main():
                 raise RuntimeError(f'duplicate/unexpected module rank: {fields}')
             if int(fields['helper_created']) != 1 or int(fields['startup_queries']) != 1:
                 raise RuntimeError(f'module local startup path was not exercised: {fields}')
+            if int(fields['creator_excluded']) != 1:
+                raise RuntimeError(f'module creator was not excluded: {fields}')
             if int(fields['ever_ready']) != 1 or any(int(fields[key]) <= 0 for key in
                     ('policy_or_reply_updates', 'records_received', 'records_sent')):
                 raise RuntimeError(f'module transport did not become live: {fields}')
