@@ -2,10 +2,11 @@
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdbool.h>
 
 typedef struct {
     uint64_t sequence;
-    double previous_profile_control, previous_elapsed, demand_rate_high_water;
+    double previous_profile_control, previous_elapsed, demand_rate_high_water, cumulative_cap;
 } RankPolicy;
 struct PeakMpiOverheadPolicy { size_t count; RankPolicy ranks[]; };
 PeakMpiOverheadPolicy *peak_mpi_overhead_policy_create(size_t count)
@@ -24,7 +25,7 @@ void peak_mpi_overhead_policy_update(PeakMpiOverheadPolicy *policy,
     size_t count=policy->count;
     RankPolicy *ranks=policy->ranks;
     memset(decision, 0, sizeof(*decision));
-    double elapsed = samples[0].elapsed_seconds, cost = 0, module = 0, demand = 0;
+    double elapsed = samples[0].elapsed_seconds, cost = 0, module = 0, demand = 0, committed = 0;
     for (size_t i = 0; i < count; ++i) {
         const PeakMpiOverheadPolicySample *s = &samples[i];
         RankPolicy *r = &ranks[i];
@@ -42,7 +43,10 @@ void peak_mpi_overhead_policy_update(PeakMpiOverheadPolicy *policy,
         }
         demand += r->demand_rate_high_water;
         elapsed = fmin(elapsed, s->elapsed_seconds);
-        cost += pc + s->management_seconds;
+        double local_cost = pc + s->management_seconds;
+        cost += local_cost;
+        r->cumulative_cap = fmax(r->cumulative_cap, local_cost);
+        committed += r->cumulative_cap;
         module += s->module_cpu_seconds;
     }
     decision->common_elapsed_seconds = elapsed;
@@ -51,17 +55,22 @@ void peak_mpi_overhead_policy_update(PeakMpiOverheadPolicy *policy,
     decision->budget_seconds = q * elapsed;
     decision->debt_seconds = fmax(0, cost + module - q * elapsed);
     /* Actual transport costs always count, including costs beyond its 10% share. */
-    double headroom = fmax(0, fmin(.9 * q * elapsed - cost,
-                                 q * elapsed - cost - module));
+    double headroom = fmax(0, fmin(.9 * q * elapsed - committed,
+                                 q * elapsed - committed - module));
+    bool suspended = committed + module > q * elapsed;
     decision->profiling_headroom_seconds = headroom;
     for (size_t i = 0; i < count; ++i) {
         double weight = demand > 0 ? .5 / count + .5 * ranks[i].demand_rate_high_water / demand
                                    : 1.0 / count;
         double local_cost = samples[i].profile_seconds + samples[i].control_seconds +
                             samples[i].management_seconds;
+        ranks[i].cumulative_cap += headroom * weight;
         ratios[i] = elapsed <= 0 ? .9 * q / count :
-            headroom <= 0 ? 0 : (local_cost + headroom * weight) / samples[i].elapsed_seconds;
+            suspended || ranks[i].cumulative_cap <= local_cost ? 0 :
+            ranks[i].cumulative_cap / samples[i].elapsed_seconds;
     }
+    decision->committed_total_seconds = committed + headroom + module;
+    decision->unspent_reservation_seconds = committed + headroom - cost;
 }
 
 double peak_mpi_overhead_policy_input(const PeakMpiOverheadPolicySample *current,

@@ -12,12 +12,17 @@ typedef struct {
 typedef struct {
     double common_elapsed_seconds, raw_cost_seconds, module_cpu_seconds;
     double budget_seconds, debt_seconds, profiling_headroom_seconds;
+    double committed_total_seconds, unspent_reservation_seconds;
 } PeakMpiOverheadDecision;
 typedef struct PeakMpiOverheadPolicy PeakMpiOverheadPolicy;
 PeakMpiOverheadPolicy *peak_mpi_overhead_policy_create(size_t count);
 void peak_mpi_overhead_policy_free(PeakMpiOverheadPolicy *policy);
 /* Samples must be cumulative and nondecreasing. Ratios are cumulative local
- * P/C/M targets. Before all ranks have elapsed data use .9*q/count. The policy
+ * P/C/M cumulative cost caps divided by each rank's elapsed seconds; old unused
+ * allocations remain committed across ACKs.
+ * profiling_headroom reports only newly issued money. Job commitment above qE
+ * suspends new targets without erasing caps or revoking older ACKs. Before all
+ * ranks have elapsed data use .9*q/count (unbooked startup exposure). The policy
  * retains observed P/C cost-rate demand across idle phases; elapsed intervals
  * normalize transport record cadence. Caller retains cumulative cost history.
  * Conservative prototype only: no claim of parallel coverage or slowdown. */
