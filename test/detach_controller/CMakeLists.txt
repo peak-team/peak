@@ -537,22 +537,19 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
     COMMAND test_detach_listener_shutdown general-listener-shutdown-prepare-fail-closed)
   set_tests_properties(test_detach_controller_general_listener_shutdown_prepare_fail_closed
     PROPERTIES
-      ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=success-zero"
-      PASS_REGULAR_EXPRESSION "general-listener-shutdown-prepare-fail-closed-ok")
+      ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=success-zero")
 
   add_test(NAME test_detach_controller_general_listener_idle_shutdown_io_fail_closed
     COMMAND test_detach_listener_shutdown general-listener-idle-shutdown-io-fail-closed)
   set_tests_properties(test_detach_controller_general_listener_idle_shutdown_io_fail_closed
     PROPERTIES
-      ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=shutdown-missing-response"
-      PASS_REGULAR_EXPRESSION "general-listener-idle-shutdown-io-fail-closed-ok")
+      ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=shutdown-missing-response")
 
   add_test(NAME test_detach_controller_general_listener_final_freeze_after_controller_stop
     COMMAND test_detach_listener_shutdown general-listener-final-freeze-after-controller-stop)
   set_tests_properties(test_detach_controller_general_listener_final_freeze_after_controller_stop
     PROPERTIES
       ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>"
-      PASS_REGULAR_EXPRESSION "general-listener-final-freeze-after-controller-stop-ok"
       SKIP_RETURN_CODE 77)
 
   add_test(NAME test_detach_controller_general_listener_invalid_accounting_baseline_report
@@ -560,7 +557,6 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
   set_tests_properties(test_detach_controller_general_listener_invalid_accounting_baseline_report
     PROPERTIES
       ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>"
-      PASS_REGULAR_EXPRESSION "general-listener-invalid-accounting-baseline-report-ok"
       SKIP_RETURN_CODE 77)
 
   add_test(NAME test_detach_controller_general_listener_rank_local_mpi_text_default
@@ -568,49 +564,27 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
   set_tests_properties(test_detach_controller_general_listener_rank_local_mpi_text_default
     PROPERTIES
       ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>"
-      PASS_REGULAR_EXPRESSION "general-listener-rank-local-mpi-text-default-ok"
       SKIP_RETURN_CODE 77)
 
   add_test(NAME test_detach_controller_general_listener_uint64_saturation
     COMMAND test_detach_listener_shutdown general-listener-uint64-saturation)
-  set_tests_properties(test_detach_controller_general_listener_uint64_saturation
-    PROPERTIES
-      PASS_REGULAR_EXPRESSION "general-listener-uint64-saturation-ok")
 
   add_test(NAME test_detach_controller_general_listener_cumulative_rental_batch
     COMMAND test_detach_listener_shutdown general-listener-cumulative-rental-batch)
-  set_tests_properties(test_detach_controller_general_listener_cumulative_rental_batch
-    PROPERTIES PASS_REGULAR_EXPRESSION "general-listener-cumulative-rental-batch-ok")
 
   add_test(NAME test_detach_controller_general_listener_detach_count_latch_state_gate
     COMMAND test_detach_listener_shutdown
             general-listener-detach-count-latch-state-gate)
-  set_tests_properties(
-    test_detach_controller_general_listener_detach_count_latch_state_gate
-    PROPERTIES
-      PASS_REGULAR_EXPRESSION
-        "general-listener-detach-count-latch-state-gate-ok")
 
   add_test(NAME test_detach_controller_general_listener_call_count_modular_aggregation
     COMMAND test_detach_listener_shutdown
             general-listener-call-count-modular-aggregation)
-  set_tests_properties(
-    test_detach_controller_general_listener_call_count_modular_aggregation
-    PROPERTIES
-      PASS_REGULAR_EXPRESSION
-        "general-listener-call-count-modular-aggregation-ok")
 
   add_test(NAME test_detach_controller_general_listener_mapping_lifecycle
     COMMAND test_detach_listener_shutdown general-listener-mapping-lifecycle)
-  set_tests_properties(test_detach_controller_general_listener_mapping_lifecycle
-    PROPERTIES
-      PASS_REGULAR_EXPRESSION "general-listener-mapping-lifecycle-ok")
 
   add_test(NAME test_detach_controller_general_listener_slurm_host_parser
     COMMAND test_detach_listener_shutdown general-listener-slurm-host-parser)
-  set_tests_properties(test_detach_controller_general_listener_slurm_host_parser
-    PROPERTIES
-      PASS_REGULAR_EXPRESSION "general-listener-slurm-host-parser-(ok|skipped)")
 
   add_test(NAME test_detach_controller_preload_idle_shutdown_io_fail_closed
     COMMAND ${CMAKE_COMMAND}

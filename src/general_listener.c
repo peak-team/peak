@@ -5458,9 +5458,24 @@ peak_general_controller_publish_detach_count_requests_unlocked(
         PeakGeneralListener* listener =
             PEAKGENERAL_LISTENER(array_listener[hook_id]);
         if (rental_work && peak_general_listener_rental_candidate_unlocked(hook_id)) {
+            uint64_t ignored = peak_general_listener_ignored_rent_ns(listener);
+            /* Only reconsider an observed hook after new ignored work;
+             * completed bursts do not justify closing idle hooks. */
+            gboolean recent_progress = listener->rental_observation_ready &&
+                ignored > listener->rental_observed_ignored_ns;
+            listener->rental_observed_ignored_ns = ignored;
+            listener->rental_observation_ready = TRUE;
             if (!rental_pressure) rental_pressure_waiting = TRUE;
-            else {
-                uint64_t ignored = peak_general_listener_ignored_rent_ns(listener);
+            else if (!recent_progress) {
+                /* No timer: require another real full window of ignored
+                 * progress before observing activity again. Never reset the
+                 * cumulative rent or publish dormant MAX for this skip. */
+                uint64_t next_observation = peak_global_admission_seconds_ns(
+                    peak_global_admission_closing_forecast(
+                        peak_global_closing_window_seconds, 1));
+                if (next_observation > 0 && next_observation != UINT64_MAX)
+                    rental_shortfall = MIN(rental_shortfall, next_observation);
+            } else {
                 uint64_t base = atomic_load(&listener->ignored_rent_base_ns);
                 uint64_t rent = ignored >= base ? ignored - base : 0;
                 rental_ns = UINT64_MAX - rental_ns < rent ? UINT64_MAX : rental_ns + rent;
@@ -9743,6 +9758,10 @@ peak_general_listener_test_cumulative_rental_batch(void)
     PeakHookState states[COUNT];
     gboolean physical[COUNT];
     uint64_t pending[COUNT] = {0};
+    _Alignas(64) PeakBudgetCostLane budget_lane = {0};
+    PeakBudgetCostLane* saved_lanes = peak_budget_cost_lanes;
+    size_t saved_highwater = atomic_load(&peak_budget_lane_highwater);
+    gboolean saved_registered = peak_budget_lane_registered;
     size_t saved_count = peak_hook_address_count;
     gulong saved_threads = peak_max_num_threads;
     GumInvocationListener** saved_listeners = array_listener;
@@ -9764,6 +9783,9 @@ peak_general_listener_test_cumulative_rental_batch(void)
     double saved_overhead = peak_general_overhead;
     int result = 0;
 
+    peak_budget_cost_lanes = &budget_lane;
+    atomic_store(&peak_budget_lane_highwater, 0);
+    peak_budget_lane_registered = FALSE;
     peak_max_num_threads = 1;
     peak_hook_address_count = COUNT;
     array_listener = listeners;
@@ -9785,9 +9807,9 @@ peak_general_listener_test_cumulative_rental_batch(void)
         listener->retired_num_calls = 64;
         atomic_store(&listener->soft_paused, TRUE);
         atomic_store(&listener->callback_hook_control, PEAK_HOOK_ATTACHED);
-        /* First64 are idle; next16 share a profitable window including one
-         * idle observed member. Every individual rent is below that window. */
-        atomic_store(&listener->retired_ignored_ns, i >= 64 && i < 79 ? 90000 : 0);
+        /* The next 16 have equal historical rent. Only hooks 64..78 add new
+         * ignored work after the funded observation; hook 79 remains idle. */
+        atomic_store(&listener->retired_ignored_ns, i >= 64 && i < 80 ? 90000 : 0);
     }
     PEAKGENERAL_LISTENER(listeners[80])->retired_num_calls = 63;
     atomic_store(&PEAKGENERAL_LISTENER(listeners[80])->initial_observation_remaining, 1);
@@ -9833,19 +9855,27 @@ peak_general_listener_test_cumulative_rental_batch(void)
         peak_general_listener_record_ignored_call(ignored, 0, TRUE);
     if (!atomic_load(&peak_rental_dirty) || stride->calls != 0 ||
         atomic_load(&peak_rental_progress_ns) != progress_before + 12800) result = 7;
+    for (size_t i = 64; i < 79; ++i)
+        peak_general_listener_record_ignored_call(PEAKGENERAL_LISTENER(listeners[i]), 0, TRUE);
     peak_general_controller_publish_detach_count_requests_unlocked(&view);
     for (size_t i = 0; i < COUNT; ++i) {
-        PeakHookState expected = i >= 64 && i < 80 ? PEAK_HOOK_DETACH_REQUESTED : PEAK_HOOK_ATTACHED;
+        PeakHookState expected = i == 0 || (i >= 64 && i < 79) ?
+            PEAK_HOOK_DETACH_REQUESTED : PEAK_HOOK_ATTACHED;
         if (states[i] != expected) result = 2;
     }
 
-    if (atomic_load(&peak_rental_threshold_ns) != progress_before + 286000) result = 9;
+    /* Hook 0's partial rent closed with the active group; remaining idle
+     * hooks require one full window of new progress before another scan. */
+    if (atomic_load(&peak_rental_threshold_ns) != progress_before + 12800 + 286000) result = 9;
     /* Last initial observation rearms even when already softpaused. */
     atomic_store(&peak_rental_dirty, FALSE);
     atomic_store(&peak_rental_threshold_ns, UINT64_MAX);
     if (!peak_general_listener_take_initial_observation(PEAKGENERAL_LISTENER(listeners[80])) ||
         !atomic_load(&peak_rental_dirty)) result = 6;
 
+    peak_budget_cost_lanes = saved_lanes;
+    atomic_store(&peak_budget_lane_highwater, saved_highwater);
+    peak_budget_lane_registered = saved_registered;
     peak_hook_address_count = saved_count;
     peak_max_num_threads = saved_threads;
     array_listener = saved_listeners;

@@ -137,6 +137,9 @@ struct _PeakGeneralListener {
     gfloat retired_min_time;
     PeakGeneralListenerCheckpointShadow* checkpoint_shadow;
     size_t checkpoint_shadow_mapping_size;
+    /* Controller-only activity observations; lifetime rent remains untouched. */
+    uint64_t rental_observed_ignored_ns;
+    gboolean rental_observation_ready;
 };
 
 struct _PeakGumTargetAttachPlan;
