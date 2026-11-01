@@ -101,3 +101,16 @@ PeakMpiOverheadInput peak_mpi_overhead_policy_input(const PeakMpiOverheadPolicyS
     return (PeakMpiOverheadInput){quota / current->elapsed_seconds,
         (quota + extra_control_risk) / current->elapsed_seconds};
 }
+
+/* Ordinary MAIN fallback returns its exact ratio. Full observation leases
+ * remain unscaled; for K >= 1, existing deductions fund the unscaled forecast
+ * within normal headroom. */
+double peak_mpi_overhead_next_window_target(double normal_target,
+    double elapsed_seconds, double fresh_control_seconds,
+    double last_stop_seconds, unsigned local_ranks, int coordinated)
+{
+    if (!coordinated || normal_target == 0 || local_ranks == 1)
+        return normal_target;
+    return normal_target + (double)(local_ranks - 1) *
+        (fresh_control_seconds + last_stop_seconds) / elapsed_seconds;
+}

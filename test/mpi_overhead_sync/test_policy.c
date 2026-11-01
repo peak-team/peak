@@ -160,5 +160,20 @@ int main(void)
     peak_mpi_overhead_policy_update(idle,zero,.01,10,ratio,&d);
     CHECK(near(ratio[0],.005) && near(ratio[1],.005));
     peak_mpi_overhead_policy_free(idle);
+    /* N=4: normal h=14ms funds the existing 48ms risk quote + full 1.9ms lease. */
+    double p = .005, control = .007, stop = .012, normal = p + control + .014;
+    double converted = peak_mpi_overhead_next_window_target(normal,1,control,stop,4,1);
+    double room = converted - p - 4*control;
+    CHECK(near(room,.050));
+    CHECK(4*stop+.0019 <= room && stop+.0019 <= .014);
+    CHECK(4*stop+.002001 > room);
+    /* Pending plus new windows retain conservative K=2 deductions/full leases. */
+    CHECK(4*2*stop+.001 > room);
+    double larger = p + control + .1;
+    double pending_room = peak_mpi_overhead_next_window_target(larger,1,control,stop,4,1)-p-4*control;
+    CHECK(4*2*stop+.001 <= pending_room && 2*stop+.001 <= .1);
+    CHECK(peak_mpi_overhead_next_window_target(.0025,10,control,stop,4,0)==.0025);
+    CHECK(peak_mpi_overhead_next_window_target(.0025,10,control,stop,1,1)==.0025);
+    CHECK(peak_mpi_overhead_next_window_target(0,10,control,stop,4,1)==0);
     return 0;
 }

@@ -5636,10 +5636,6 @@ void* peak_heartbeat_monitor(void* arg) {
         }
 
         /* 3) Reattach. */
-#if defined(PEAK_MPI_OVERHEAD_SYNC_RUNTIME)
-        {
-        const double global_target_ratio = mpi_budget_input.control_target;
-#endif
         if (detach_observation_ready &&
             enable_reattach &&
             check_interval != 0 &&
@@ -5684,6 +5680,13 @@ void* peak_heartbeat_monitor(void* arg) {
                 (double)peak_general_listener_control_wall_ns_since_heartbeat(
                     &reattach_accounting_after) / 1e9;
             double reattach_control_risk_seconds = DBL_MAX;
+#if defined(PEAK_MPI_OVERHEAD_SYNC_RUNTIME)
+            /* Existing fresh accounting/last-stop values; budget input only. */
+            const double global_target_ratio = peak_mpi_overhead_next_window_target(
+                mpi_budget_input.profile_target, total_execution_time,
+                reattach_control_spent_seconds, last_stop_seconds,
+                local_mpi_ranks, mpi_budget_input.coordinated);
+#endif
             gboolean reattach_budget_ok =
                 reattach_accounting_coherent &&
                 (enable_per_target_heartbeat || enable_global_heartbeat) &&
@@ -5944,9 +5947,6 @@ void* peak_heartbeat_monitor(void* arg) {
             }
         }
 
-#if defined(PEAK_MPI_OVERHEAD_SYNC_RUNTIME)
-        }
-#endif
         if (wake_controller) {
             peak_general_listener_controller_wake();
         }

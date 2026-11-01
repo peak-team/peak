@@ -31,6 +31,7 @@ void peak_mpi_overhead_policy_update(PeakMpiOverheadPolicy *policy,
     PeakMpiOverheadDecision *decision);
 typedef struct {
     double profile_target, control_target;
+    int coordinated; /* Private coherent tuple flag, set by sync return seam. */
 } PeakMpiOverheadInput;
 
 /* Reexpress acknowledged normal P+C quota, less fresh local M/T once, in
@@ -42,4 +43,9 @@ typedef struct {
 PeakMpiOverheadInput peak_mpi_overhead_policy_input(const PeakMpiOverheadPolicySample *current,
     const PeakMpiOverheadPolicySample *acknowledged, double acknowledged_raw_ratio,
     double detach_factor, unsigned local_ranks);
+/* Budget-input conversion only: reexpress one existing next-stop forecast in
+ * MAIN risk units; no target prices, requests, state or ledger changes. */
+double peak_mpi_overhead_next_window_target(double normal_target,
+    double elapsed_seconds, double fresh_control_seconds,
+    double last_stop_seconds, unsigned local_ranks, int coordinated);
 #endif /* PEAK_MPI_OVERHEAD_POLICY_H */

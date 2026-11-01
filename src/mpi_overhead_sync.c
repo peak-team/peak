@@ -714,6 +714,7 @@ finished:
 
 static PeakMpiOverheadInput budget_input(PeakMpiOverheadInput input, bool global_accounting)
 {
+    input.coordinated = global_accounting;
     if (trace_diagnostics) {
         atomic_store(&last_global_accounting, global_accounting);
         if (global_accounting) atomic_store(&ever_global_accounting, true);
