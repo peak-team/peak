@@ -5301,7 +5301,7 @@ void* peak_heartbeat_monitor(void* arg) {
     double hb_k_rate = heartbeat_args->hb_k_rate;
     double hb_ema_a = heartbeat_args->hb_ema_a;
     unsigned int heartbeat_counter = 0;
-    const unsigned int local_mpi_ranks =
+    const unsigned int configured_local_mpi_ranks =
         peak_general_listener_local_mpi_ranks();
 
     peak_general_listener_fast_ignore_current_thread();
@@ -5496,16 +5496,21 @@ void* peak_heartbeat_monitor(void* arg) {
             &management_cpu_checkpoint_ns,
             &management_cpu_checkpoint_valid);
 #if defined(PEAK_MPI_OVERHEAD_SYNC_RUNTIME)
-        /* Supply only the scalar input to the unchanged policy below. */
-        const double global_target_ratio = enable_global_heartbeat
+        /* Supply coherent quota and control-accounting units; machinery below is unchanged. */
+        const PeakMpiOverheadBudgetInput mpi_budget_input = enable_global_heartbeat
             ? peak_mpi_overhead_sync_update(&(PeakMpiOverheadSample){
                   .elapsed_seconds = total_execution_time,
                   .profile_seconds = profile_spent_seconds,
                   .control_seconds = control_spent_seconds,
                   .management_seconds = peak_general_listener_management_cpu_seconds(),
                   .sequence = heartbeat_counter,
-              }, configured_global_target_ratio, peak_global_detach_factor, local_mpi_ranks)
-            : configured_global_target_ratio;
+              }, configured_global_target_ratio, peak_global_detach_factor, configured_local_mpi_ranks)
+            : (PeakMpiOverheadBudgetInput){configured_global_target_ratio, false};
+        const double global_target_ratio = mpi_budget_input.target_ratio;
+        const unsigned int local_mpi_ranks = mpi_budget_input.global_accounting
+            ? 1U : configured_local_mpi_ranks;
+#else
+        const unsigned int local_mpi_ranks = configured_local_mpi_ranks;
 #endif
         spent_ratio =
             (profile_spent_seconds + control_spent_seconds) /

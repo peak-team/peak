@@ -31,6 +31,9 @@ int main(int argc, char **argv)
     int status = MPI_Allreduce(&value, &sum, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
     int valid = status == MPI_SUCCESS && size == 2 && sum == 3;
     printf("self_profile_science rank=%d valid=%d sum=%d\n", rank, valid, sum);
+    /* Let an ordinary HB consume the validated ACK before teardown. */
+    struct timespec observe = {1, 0};
+    nanosleep(&observe, NULL);
     if (MPI_Finalize() != MPI_SUCCESS) return 1;
     return valid ? 0 : 1;
 }

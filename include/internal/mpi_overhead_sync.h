@@ -2,6 +2,7 @@
 #define PEAK_MPI_OVERHEAD_SYNC_H
 
 #include <stdint.h>
+#include <stdbool.h>
 
 typedef struct {
     double elapsed_seconds;
@@ -19,12 +20,16 @@ typedef struct {
  * absent/invalid routing retains MAIN policy without global feedback. */
 void peak_mpi_overhead_sync_start(void);
 
-/* Existing heartbeat only: owns one-time helper creation, then publishes
- * snapshots and reads rank-budget telemetry. The existing local-control
- * multiplier is input only;
- * ACK-priced headroom receives no local elapsed-time credit. No MPI, Gum,
- * controller requests, or helper wake. */
-double peak_mpi_overhead_sync_update(const PeakMpiOverheadSample* sample,
+typedef struct {
+    double target_ratio;
+    bool global_accounting;
+} PeakMpiOverheadBudgetInput;
+
+/* Existing HB only. Ratio and accounting units come from ONE coherent ACK
+ * decision: validated global accounting uses once-counted control cost; all
+ * fallback paths retain configured MAIN ratio and real local multiplicity.
+ * No MPI/Gum/controller request/wake; helpers and protocol are unchanged. */
+PeakMpiOverheadBudgetInput peak_mpi_overhead_sync_update(const PeakMpiOverheadSample* sample,
                                      double configured_ratio,
                                      double detach_factor,
                                      unsigned local_control_ranks);

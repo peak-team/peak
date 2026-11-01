@@ -67,6 +67,7 @@ static _Atomic double target_ratio, last_effective_input, negotiated_q;
 static atomic_uint_fast64_t helper_cpu_ns, startup_cpu_ns, startup_wall_ns, bootstrap_cpu_ns;
 static atomic_uint_fast64_t policy_updates, records_sent, records_received, last_ack_sequence;
 static atomic_bool trace_diagnostics;
+static atomic_bool last_global_accounting, ever_global_accounting;
 static bool startup_queries;
 static pthread_t helper;
 static int wake_pipe[2] = {-1, -1};
@@ -645,7 +646,7 @@ static void stop_sync(void)
     /* Live helper state is retained if cooperative stop reaches its bound.
      * No hostname lookup or MPI can run here. Normal performance is quiet. */
     if (trace_diagnostics)
-        fprintf(stderr, "[peak] MPI overhead sync: rank=%d module_cpu_seconds=%.9g startup_wall_seconds=%.9g accounting_valid=%d helper_created=%d creator_excluded=%d startup_queries=%d helper_exited=%d normal_end=%d cohort_ready=%d ever_ready=%d bootstrap_cpu_seconds=%.9g fallback_reason=%s policy_or_reply_updates=%llu records_received=%llu records_sent=%llu final_proposed_ratio=%.9g configured_q=%.9g negotiated_q=%.9g acknowledged_sequence=%llu last_effective_input=%.9g\n",
+        fprintf(stderr, "[peak] MPI overhead sync: rank=%d module_cpu_seconds=%.9g startup_wall_seconds=%.9g accounting_valid=%d helper_created=%d creator_excluded=%d startup_queries=%d helper_exited=%d normal_end=%d cohort_ready=%d ever_ready=%d bootstrap_cpu_seconds=%.9g fallback_reason=%s policy_or_reply_updates=%llu records_received=%llu records_sent=%llu final_proposed_ratio=%.9g configured_q=%.9g negotiated_q=%.9g acknowledged_sequence=%llu last_effective_input=%.9g global_accounting=%d ever_global_accounting=%d\n",
             world_rank, module_seconds(), (double)atomic_load(&startup_wall_ns)/1e9,
             (int)atomic_load(&accounting_valid), created, (int)atomic_load(&creator_excluded), startup_queries,
             (int)atomic_load(&helper_exited), (int)atomic_load(&normal_end),
@@ -654,7 +655,7 @@ static void stop_sync(void)
             (unsigned long long)atomic_load(&policy_updates),
             (unsigned long long)atomic_load(&records_received), (unsigned long long)atomic_load(&records_sent),
             atomic_load(&target_ratio), configured_q, atomic_load(&negotiated_q),
-            (unsigned long long)atomic_load(&last_ack_sequence), atomic_load(&last_effective_input));
+            (unsigned long long)atomic_load(&last_ack_sequence), atomic_load(&last_effective_input), (int)atomic_load(&last_global_accounting), (int)atomic_load(&ever_global_accounting));
 }
 
 void peak_mpi_overhead_sync_start(void)
@@ -711,14 +712,23 @@ finished:
     peak_general_listener_fast_unignore_current_thread();
 }
 
-double peak_mpi_overhead_sync_update(const PeakMpiOverheadSample* sample, double q,
+static PeakMpiOverheadBudgetInput budget_input(double ratio, bool global_accounting)
+{
+    if (trace_diagnostics) {
+        atomic_store(&last_global_accounting, global_accounting);
+        if (global_accounting) atomic_store(&ever_global_accounting, true);
+    }
+    return (PeakMpiOverheadBudgetInput){ratio, global_accounting};
+}
+
+PeakMpiOverheadBudgetInput peak_mpi_overhead_sync_update(const PeakMpiOverheadSample* sample, double q,
                                      double detach_factor, unsigned local_control_ranks)
 {
     if (!sample || !atomic_load(&parameters_ready) || getpid() != owner) {
         if (trace_diagnostics && atomic_load(&status) == S_NO_ROUTE &&
             !atomic_exchange(&fallback_reported, true))
             fprintf(stderr, "[peak] MPI overhead sync fallback: reason=no_route policy=main\n");
-        return q;
+        return budget_input(q, false);
     }
     PeakMpiOverheadPolicySample current = {.sequence=sample->sequence,.elapsed_seconds=sample->elapsed_seconds,
         .profile_seconds=sample->profile_seconds,.control_seconds=sample->control_seconds,
@@ -727,7 +737,7 @@ double peak_mpi_overhead_sync_update(const PeakMpiOverheadSample* sample, double
     pthread_mutex_lock(&sample_lock);
     if (stopping || !atomic_load(&parameters_ready)) {
         pthread_mutex_unlock(&sample_lock);
-        return q;
+        return budget_input(q, false);
     }
     if (sample->sequence > latest.sequence) latest = *sample;
     if (!creation_attempted && atomic_load(&heartbeat_running)) {
@@ -743,13 +753,13 @@ double peak_mpi_overhead_sync_update(const PeakMpiOverheadSample* sample, double
         if (!created) atomic_store(&running, false);
     }
     ack = acknowledged; ratio = acknowledged_ratio;
-    valid = acknowledged_valid && atomic_load(&running);
+    valid = acknowledged_valid && atomic_load(&running) && atomic_load(&accounting_valid);
     pthread_mutex_unlock(&sample_lock);
-    if (!valid) return q; /* Partial/absent cohort is ordinary MAIN, never q/N. */
+    if (!valid) return budget_input(q, false); /* Partial/absent cohort is ordinary MAIN, never q/N. */
     current.module_cpu_seconds = module_seconds();
     double effective = peak_mpi_overhead_policy_input(&current,&ack,ratio,detach_factor,local_control_ranks);
     if (trace_diagnostics) atomic_store(&last_effective_input,effective);
-    return effective;
+    return budget_input(effective, true);
 }
 
 #ifdef PEAK_ENABLE_TEST_HOOKS

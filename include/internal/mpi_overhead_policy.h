@@ -18,29 +18,21 @@ typedef struct {
 typedef struct PeakMpiOverheadPolicy PeakMpiOverheadPolicy;
 PeakMpiOverheadPolicy *peak_mpi_overhead_policy_create(size_t count);
 void peak_mpi_overhead_policy_free(PeakMpiOverheadPolicy *policy);
-/* Samples must be cumulative and nondecreasing. Ratios are cumulative local
- * P/C/M cumulative cost caps divided by each rank's elapsed seconds; old unused
- * allocations remain committed across ACKs.
- * profiling_headroom reports only newly issued money. Job commitment above qE
- * suspends new targets without erasing caps or revoking older ACKs. For a zero
- * budget reference the pure policy returns .9*q/count; runtime retains configured
- * local policy until complete positive admission (unbooked startup exposure).
- * The policy
- * retains observed P/C cost-rate demand across idle phases; elapsed intervals
- * normalize transport record cadence. Caller retains cumulative cost history.
- * budget_elapsed_seconds starts at the first complete positive vector's minimum
- * elapsed, then advances with the runtime's monotonic cohort clock.
- * Conservative prototype only: no claim of parallel coverage or slowdown. */
+/* Full actual P/C/M/T history and debt are retained. Ratios represent weighted
+ * CURRENT cumulative allowed P+C quotas after full actual M/T, with no fixed reserve.
+ * Paid P+C is charged first; only remaining quota is weighted. Global P+C
+ * overdraw reduces local quotas proportionally. Legacy decision fields describe
+ * current quota+M/T and actual spare, never hard leases or issuance/reservation.
+ * Main compares local risk against the resulting quota.
+ * Demand rates and explicit cohort reference retain their existing semantics. */
 void peak_mpi_overhead_policy_update(PeakMpiOverheadPolicy *policy,
     const PeakMpiOverheadPolicySample *samples, double q,
     double budget_elapsed_seconds, double *ratios,
     PeakMpiOverheadDecision *decision);
-/* Translate an acknowledged raw P/C/M allowance into the existing listener's
- * P+local_ranks*C risk units. Only acknowledged unused spend is available:
- * later elapsed time creates no credit until acknowledged. Current cost growth,
- * including disjoint module CPU, consumes that allowance once. detach_factor
- * discounts only NEW spend; already-paid risk is not divided by it. This scalar
- * also affects detach decisions and requires measured duty/coverage validation. */
+/* Return acknowledged cumulative P+C quota/current elapsed, subtracting fresh
+ * local M/T once. P/C are compared by main, not debited again here. F/N remain
+ * API-compatible unused inputs: main applies their unchanged risk/hysteresis.
+ * No unacknowledged elapsed-time credit; sampled feedback is not a hard lease. */
 double peak_mpi_overhead_policy_input(const PeakMpiOverheadPolicySample *current,
     const PeakMpiOverheadPolicySample *acknowledged, double acknowledged_raw_ratio,
     double detach_factor, unsigned local_ranks);

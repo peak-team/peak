@@ -82,6 +82,8 @@ def main():
             if int(fields['ever_ready']) != 1 or any(int(fields[key]) <= 0 for key in
                     ('policy_or_reply_updates', 'records_received', 'records_sent')):
                 raise RuntimeError(f'module transport did not become live: {fields}')
+            if int(fields['ever_global_accounting']) != 1:
+                raise RuntimeError(f'no actual HB global accounting return: {fields}')
             startup_ranks.add(rank)
         if startup_ranks != {0, 1}:
             raise RuntimeError(f'missing module startup receipts: {startup_ranks}')
