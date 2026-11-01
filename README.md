@@ -318,6 +318,8 @@ reported partial and failed.
 
 | Variable | Purpose |
 | --- | --- |
+| `PEAK_MPI_OVERHEAD_SYNC_ENDPOINT` | Optional live-feedback route to MPI world rank 0: numeric `IPv4-address:port` or `[IPv6-address]:port`. Use the actual rank 0 routable address and an available port distinct from the report transport port. |
+| `PEAK_MPI_OVERHEAD_SYNC_TOKEN` | Full shared cohort identifier, set once per run and passed unchanged to participating ranks. Use a distinct value for concurrent runs; the token separates cohorts. |
 | `PEAK_MPI_ACTIVATION_POLICY` | Runtime activation timing: `immediate` (default) preserves complete startup and pre-MPI profiling. `post-init` is an explicit large-scale MPI loader-safety mode that performs no Gum mutation, module pinning, controller startup, or heartbeat work until the outermost intercepted `MPI_Init`, `PMPI_Init`, `MPI_Init_thread`, or `PMPI_Init_thread` returns. It intentionally omits all earlier behavior, including a target invocation that contains MPI initialization; `defer` and `deferred` are accepted aliases. Use the default for non-MPI, MPI Sessions-only, static/hidden MPI bindings, and any runtime whose traditional C init symbols cannot be dynamically interposed. |
 | `PEAK_OUTPUT_AGGREGATION` | Final output transport: `mpi` (default), `socket`, or `local`, with documented aliases. On the intercepted-finalize path, socket/local publish before MPI teardown coordination and fold participation into the long release gate; MPI aggregation remains proof-first. |
 | `PEAK_MPI_COLLECTIVE_OUTPUT` | Legacy aggregate-output switch; `PEAK_OUTPUT_AGGREGATION` takes precedence. |
@@ -335,6 +337,26 @@ reported partial and failed.
 | `PEAK_OUTPUT_AGGREGATION_BIND_ADDRESS` | Bind the socket reducer to this IPv4 node-local address. By default it binds only the resolved root-host address. |
 | `PEAK_OUTPUT_AGGREGATION_ALLOW_BROAD_BIND` | Explicitly permit binding the reducer to all interfaces. Default: disabled. |
 | `PEAK_OUTPUT_AGGREGATION_SOCKET_FALLBACK` | Enable MPI-reducer-to-socket and socket-to-rank-local fallback paths. Default: enabled. |
+
+Live overhead feedback requires a complete matching world cohort. Partial-rank
+profiling still runs normally; incomplete membership retains baseline control.
+`PEAK_MPI_OVERHEAD_SYNC=0`, missing routing settings, or a disabled heartbeat
+select baseline control. The helper adds no MPI collectives or background MPI
+calls and does not change the requested MPI thread level. Its actual CPU cost
+is accounted, and it self-throttles.
+
+Set `ROOT_ADDRESS` to the actual world rank 0 routable IPv4 address and
+`RUN_TOKEN` once for the run, then pass both settings to every rank:
+
+```bash
+mpiexec -n 4 env PEAK_TARGET=my_mpi_work \
+  PEAK_MPI_OVERHEAD_SYNC_ENDPOINT="$ROOT_ADDRESS:43127" \
+  PEAK_MPI_OVERHEAD_SYNC_TOKEN="$RUN_TOKEN" \
+  LD_PRELOAD=/path/to/libpeak.so ./mpi_application
+```
+
+Launch setup may resolve a hostname once; library routing uses numeric
+addresses without DNS, an external broker, or a shared filesystem.
 
 MPI finalization and aggregation are deliberately bounded and locally
 fail-closed. A rank that observes a collective error or timeout stops issuing
@@ -628,11 +650,11 @@ toolchains and host capabilities detected during configuration.
   from anonymous executable pages.
 - Strict detach backend availability depends on platform signal support and,
   for the helper backend, host ptrace policy.
-- Heartbeat control uses process-local measurements. Local-rank scaling is a
-  reattach policy input and reporting diagnostic, and is conservative only when
-  launcher metadata reports the ranks per node correctly. It is not an MPI-wide
-  overhead proof; measured A/B overhead remains authoritative. The current
-  60-second cooldown is provisional under the linked validation standard.
+- Baseline heartbeat control uses process-local measurements. A configured
+  full cohort supplies an adaptive MPI-wide input; local-rank scaling remains
+  dependent on correct launcher metadata. Measured A/B overhead remains
+  authoritative. The unchanged 60-second
+  cooldown is provisional under the linked validation standard.
 - MPI output and finalization behavior is runtime-sensitive. MPI aggregation is
   the default. Reporting uses an all-rank post-publication release gate;
   jobs return to the real finalizer by default on every runtime after the

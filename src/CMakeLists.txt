@@ -73,7 +73,9 @@ if(MPI_FOUND)
     list(APPEND sources_peak
         general_listener/mpi_report_transport.c
         mpi_teardown_guard.c
-        mpi_interceptor.c)
+        mpi_interceptor.c
+        mpi_overhead_sync.c
+        mpi_overhead_policy.c)
 endif()
 if(PEAK_CUDA_ENABLED)
     list(APPEND sources_peak $<TARGET_OBJECTS:cuda_interceptor_obj>)
@@ -214,6 +216,7 @@ target_link_libraries(cuda_interceptor_obj
 endif()
 
 if(MPI_FOUND)
+    target_compile_definitions(peak PRIVATE PEAK_MPI_OVERHEAD_SYNC_RUNTIME=1)
     target_link_libraries(peak
         PRIVATE
             MPI::MPI_C

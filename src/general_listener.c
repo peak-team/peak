@@ -11,6 +11,9 @@
 #include "internal/general_listener/report_model.h"
 #include "internal/general_listener/report_snapshot.h"
 #include "internal/general_listener/runtime_config.h"
+#if defined(PEAK_MPI_OVERHEAD_SYNC_RUNTIME)
+#include "internal/mpi_overhead_sync.h"
+#endif
 #include "internal/general_listener/selector_test_hooks.h"
 #include "internal/general_listener/socket_report_transport.h"
 #ifdef HAVE_MPI
@@ -5285,6 +5288,9 @@ peak_heartbeat_wait_us(unsigned int sleep_us)
 }
 
 void* peak_heartbeat_monitor(void* arg) {
+#if defined(PEAK_MPI_OVERHEAD_SYNC_RUNTIME)
+    const double configured_global_target_ratio = global_target_ratio;
+#endif
     PeakHeartbeatArgs* heartbeat_args = (PeakHeartbeatArgs*)arg;
     peak_general_listener_exclude_current_thread();
     unsigned int heartbeat_time = heartbeat_args->heartbeat_time;
@@ -5489,6 +5495,19 @@ void* peak_heartbeat_monitor(void* arg) {
         peak_general_listener_management_cpu_checkpoint(
             &management_cpu_checkpoint_ns,
             &management_cpu_checkpoint_valid);
+#if defined(PEAK_MPI_OVERHEAD_SYNC_RUNTIME)
+        /* Supply coherent profile/cadence and reattach budget inputs. */
+        const PeakMpiOverheadInput mpi_budget_input = enable_global_heartbeat
+            ? peak_mpi_overhead_sync_update(&(PeakMpiOverheadSample){
+                  .elapsed_seconds = total_execution_time,
+                  .profile_seconds = profile_spent_seconds,
+                  .control_seconds = control_spent_seconds,
+                  .management_seconds = peak_general_listener_management_cpu_seconds(),
+                  .sequence = heartbeat_counter,
+              }, configured_global_target_ratio, peak_global_detach_factor, local_mpi_ranks)
+            : (PeakMpiOverheadInput){configured_global_target_ratio, configured_global_target_ratio};
+        const double global_target_ratio = mpi_budget_input.profile_target;
+#endif
         spent_ratio =
             (profile_spent_seconds + control_spent_seconds) /
             total_execution_time;
@@ -5661,6 +5680,13 @@ void* peak_heartbeat_monitor(void* arg) {
                 (double)peak_general_listener_control_wall_ns_since_heartbeat(
                     &reattach_accounting_after) / 1e9;
             double reattach_control_risk_seconds = DBL_MAX;
+#if defined(PEAK_MPI_OVERHEAD_SYNC_RUNTIME)
+            /* Existing fresh accounting/last-stop values; budget input only. */
+            const double global_target_ratio = peak_mpi_overhead_next_window_target(
+                mpi_budget_input.profile_target, total_execution_time,
+                reattach_control_spent_seconds, last_stop_seconds,
+                local_mpi_ranks, mpi_budget_input.coordinated);
+#endif
             gboolean reattach_budget_ok =
                 reattach_accounting_coherent &&
                 (enable_per_target_heartbeat || enable_global_heartbeat) &&
