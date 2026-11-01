@@ -712,23 +712,23 @@ finished:
     peak_general_listener_fast_unignore_current_thread();
 }
 
-static PeakMpiOverheadBudgetInput budget_input(double ratio, bool global_accounting)
+static PeakMpiOverheadInput budget_input(PeakMpiOverheadInput input, bool global_accounting)
 {
     if (trace_diagnostics) {
         atomic_store(&last_global_accounting, global_accounting);
         if (global_accounting) atomic_store(&ever_global_accounting, true);
     }
-    return (PeakMpiOverheadBudgetInput){ratio, global_accounting};
+    return input;
 }
 
-PeakMpiOverheadBudgetInput peak_mpi_overhead_sync_update(const PeakMpiOverheadSample* sample, double q,
+PeakMpiOverheadInput peak_mpi_overhead_sync_update(const PeakMpiOverheadSample* sample, double q,
                                      double detach_factor, unsigned local_control_ranks)
 {
     if (!sample || !atomic_load(&parameters_ready) || getpid() != owner) {
         if (trace_diagnostics && atomic_load(&status) == S_NO_ROUTE &&
             !atomic_exchange(&fallback_reported, true))
             fprintf(stderr, "[peak] MPI overhead sync fallback: reason=no_route policy=main\n");
-        return budget_input(q, false);
+        return budget_input((PeakMpiOverheadInput){q, q}, false);
     }
     PeakMpiOverheadPolicySample current = {.sequence=sample->sequence,.elapsed_seconds=sample->elapsed_seconds,
         .profile_seconds=sample->profile_seconds,.control_seconds=sample->control_seconds,
@@ -737,7 +737,7 @@ PeakMpiOverheadBudgetInput peak_mpi_overhead_sync_update(const PeakMpiOverheadSa
     pthread_mutex_lock(&sample_lock);
     if (stopping || !atomic_load(&parameters_ready)) {
         pthread_mutex_unlock(&sample_lock);
-        return budget_input(q, false);
+        return budget_input((PeakMpiOverheadInput){q, q}, false);
     }
     if (sample->sequence > latest.sequence) latest = *sample;
     if (!creation_attempted && atomic_load(&heartbeat_running)) {
@@ -755,10 +755,10 @@ PeakMpiOverheadBudgetInput peak_mpi_overhead_sync_update(const PeakMpiOverheadSa
     ack = acknowledged; ratio = acknowledged_ratio;
     valid = acknowledged_valid && atomic_load(&running) && atomic_load(&accounting_valid);
     pthread_mutex_unlock(&sample_lock);
-    if (!valid) return budget_input(q, false); /* Partial/absent cohort is ordinary MAIN, never q/N. */
+    if (!valid) return budget_input((PeakMpiOverheadInput){q, q}, false); /* Partial/absent cohort is ordinary MAIN, never q/N. */
     current.module_cpu_seconds = module_seconds();
-    double effective = peak_mpi_overhead_policy_input(&current,&ack,ratio,detach_factor,local_control_ranks);
-    if (trace_diagnostics) atomic_store(&last_effective_input,effective);
+    PeakMpiOverheadInput effective = peak_mpi_overhead_policy_input(&current,&ack,ratio,detach_factor,local_control_ranks);
+    if (trace_diagnostics) atomic_store(&last_effective_input,effective.profile_target);
     return budget_input(effective, true);
 }
 

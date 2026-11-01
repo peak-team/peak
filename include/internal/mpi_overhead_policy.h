@@ -29,11 +29,17 @@ void peak_mpi_overhead_policy_update(PeakMpiOverheadPolicy *policy,
     const PeakMpiOverheadPolicySample *samples, double q,
     double budget_elapsed_seconds, double *ratios,
     PeakMpiOverheadDecision *decision);
-/* Return acknowledged cumulative P+C quota/current elapsed, subtracting fresh
- * local M/T once. P/C are compared by main, not debited again here. F/N remain
- * API-compatible unused inputs: main applies their unchanged risk/hysteresis.
- * No unacknowledged elapsed-time credit; sampled feedback is not a hard lease. */
-double peak_mpi_overhead_policy_input(const PeakMpiOverheadPolicySample *current,
+typedef struct {
+    double profile_target, control_target;
+} PeakMpiOverheadInput;
+
+/* Reexpress acknowledged normal P+C quota, less fresh local M/T once, in
+ * MAIN's original P+N*C risk units by adding only (N-1)*current C. No P addback,
+ * no P/C second debit or F division. Profile target stays quota/E; only the
+ * reattach input adds control risk. True headroom remains quota-(P+C).
+ * MAIN keeps actual N, F/a gates and future N-scaled forecasts unchanged.
+ * No unacknowledged time credit or hard-lease claim; F remains API-compatible. */
+PeakMpiOverheadInput peak_mpi_overhead_policy_input(const PeakMpiOverheadPolicySample *current,
     const PeakMpiOverheadPolicySample *acknowledged, double acknowledged_raw_ratio,
     double detach_factor, unsigned local_ranks);
 #endif /* PEAK_MPI_OVERHEAD_POLICY_H */

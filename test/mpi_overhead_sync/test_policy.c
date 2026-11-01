@@ -25,16 +25,16 @@ int main(void)
     CHECK(d.profiling_headroom_seconds == 0);
     CHECK(near(d.committed_total_seconds, .1));
     PeakMpiOverheadPolicySample ack = s, current = ack;
-    double input = peak_mpi_overhead_policy_input(&current,&ack,ratio[0],1.2,1);
-    CHECK(near(input, .01));
+    PeakMpiOverheadInput input = peak_mpi_overhead_policy_input(&current,&ack,ratio[0],1.2,1);
+    CHECK(near(input.profile_target, .01) && input.profile_target == input.control_target);
     current.profile_seconds += 1; current.control_seconds += 2;
-    CHECK(near(peak_mpi_overhead_policy_input(&current,&ack,ratio[0],1.2,1), .01));
+    CHECK(near(peak_mpi_overhead_policy_input(&current,&ack,ratio[0],1.2,1).profile_target, .01));
     /* Fresh local M/T is charged once; advancing local time adds no credit. */
     current.management_seconds += .01; current.module_cpu_seconds += .02;
     current.elapsed_seconds = 20;
-    CHECK(near(peak_mpi_overhead_policy_input(&current,&ack,ratio[0],1.2,1), .07/20));
+    CHECK(near(peak_mpi_overhead_policy_input(&current,&ack,ratio[0],1.2,1).profile_target, .07/20));
     current.module_cpu_seconds += .1;
-    CHECK(peak_mpi_overhead_policy_input(&current,&ack,ratio[0],1.2,1) == 0);
+    CHECK(peak_mpi_overhead_policy_input(&current,&ack,ratio[0],1.2,1).profile_target == 0);
     peak_mpi_overhead_policy_free(one);
 
     PeakMpiOverheadPolicy *two = peak_mpi_overhead_policy_create(2);
@@ -116,5 +116,23 @@ int main(void)
     CHECK(near(d.raw_cost_seconds,.12) && near(d.debt_seconds,.02));
     CHECK(near(10*(ratio[0]+ratio[1]),.1));
     peak_mpi_overhead_policy_free(paid);
+    /* Module-only risk conversion preserves true headroom with REAL local N. */
+    PeakMpiOverheadPolicySample risk_ack = {1,10,.02,.01,.002,.001};
+    PeakMpiOverheadPolicySample risk_now = risk_ack;
+    risk_now.profile_seconds += .003; risk_now.control_seconds += .002;
+    risk_now.management_seconds += .001; risk_now.module_cpu_seconds += .002;
+    risk_now.elapsed_seconds = 11;
+    for (unsigned n = 2; n <= 4; n += 2) {
+        PeakMpiOverheadInput target = peak_mpi_overhead_policy_input(
+            &risk_now,&risk_ack,.01,1.2,n);
+        CHECK(near(target.profile_target*11,.097));
+        CHECK(near(target.control_target*11-(risk_now.profile_seconds+n*risk_now.control_seconds),
+                   .097-(risk_now.profile_seconds+risk_now.control_seconds)));
+    }
+    PeakMpiOverheadPolicySample many = {1,100,0,.01,0,0};
+    PeakMpiOverheadInput separated = peak_mpi_overhead_policy_input(
+        &many,&many,.00001,1.2,128);
+    CHECK(near(separated.profile_target,.00001));
+    CHECK(near(separated.control_target,.01271));
     return 0;
 }

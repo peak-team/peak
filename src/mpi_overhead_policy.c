@@ -72,18 +72,21 @@ void peak_mpi_overhead_policy_update(PeakMpiOverheadPolicy *policy,
     decision->unspent_reservation_seconds = decision->profiling_headroom_seconds;
 }
 
-double peak_mpi_overhead_policy_input(const PeakMpiOverheadPolicySample *current,
+PeakMpiOverheadInput peak_mpi_overhead_policy_input(const PeakMpiOverheadPolicySample *current,
     const PeakMpiOverheadPolicySample *acknowledged, double acknowledged_raw_ratio,
     double detach_factor, unsigned local_ranks)
 {
     /* Main applies its own P+N*C risk, F/a hysteresis and quote deductions. */
     (void)detach_factor;
-    (void)local_ranks;
     double fresh_runtime = fmax(0,
         current->management_seconds + current->module_cpu_seconds -
         acknowledged->management_seconds - acknowledged->module_cpu_seconds);
     double quota = fmax(0, acknowledged_raw_ratio * acknowledged->elapsed_seconds -
                            fresh_runtime);
-    if (quota <= 0 || current->elapsed_seconds <= 0) return 0;
-    return quota / current->elapsed_seconds;
+    if (quota <= 0 || current->elapsed_seconds <= 0)
+        return (PeakMpiOverheadInput){0, 0};
+    double extra_control_risk = local_ranks > 1
+        ? (double)(local_ranks - 1) * current->control_seconds : 0;
+    return (PeakMpiOverheadInput){quota / current->elapsed_seconds,
+        (quota + extra_control_risk) / current->elapsed_seconds};
 }
