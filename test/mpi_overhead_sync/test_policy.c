@@ -134,5 +134,31 @@ int main(void)
         &many,&many,.00001,1.2,128);
     CHECK(near(separated.profile_target,.00001));
     CHECK(near(separated.control_target,.01271));
+    /* Only positive paid-PC ranks share spare; every sample can join anew. */
+    PeakMpiOverheadPolicy *active = peak_mpi_overhead_policy_create(2);
+    CHECK(active);
+    PeakMpiOverheadPolicySample av[2] = {{1,10,.02,0,0,0},{1,10,0,0,0,0}};
+    peak_mpi_overhead_policy_update(active,av,.01,10,ratio,&d);
+    CHECK(near(ratio[0]*10,.1) && ratio[1] == 0);
+    CHECK(near(d.raw_cost_seconds,.02) && near(d.profiling_headroom_seconds,.08));
+    av[1] = (PeakMpiOverheadPolicySample){2,20,.01,0,0,0};
+    av[0].sequence++; av[0].elapsed_seconds = 20;
+    peak_mpi_overhead_policy_update(active,av,.01,20,ratio,&d);
+    /* Both active: EXACT old half-uniform/highwater weights 7/12 and 5/12. */
+    CHECK(near(ratio[0]*20,.02+(.2-.03)*7/12));
+    CHECK(near(ratio[1]*20,.01+(.2-.03)*5/12));
+    CHECK(near(20*(ratio[0]+ratio[1]),.2));
+    av[0].profile_seconds=.2; av[1].profile_seconds=.1;
+    av[0].sequence++; av[1].sequence++;
+    peak_mpi_overhead_policy_update(active,av,.01,20,ratio,&d);
+    CHECK(near(ratio[0]*20,2*.2/3) && near(ratio[1]*20,.2/3));
+    CHECK(near(d.raw_cost_seconds,.3) && near(d.debt_seconds,.1));
+    peak_mpi_overhead_policy_free(active);
+    PeakMpiOverheadPolicy *idle = peak_mpi_overhead_policy_create(2);
+    CHECK(idle);
+    PeakMpiOverheadPolicySample zero[2] = {{1,10,0,0,0,0},{1,10,0,0,0,0}};
+    peak_mpi_overhead_policy_update(idle,zero,.01,10,ratio,&d);
+    CHECK(near(ratio[0],.005) && near(ratio[1],.005));
+    peak_mpi_overhead_policy_free(idle);
     return 0;
 }
