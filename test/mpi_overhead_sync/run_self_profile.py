@@ -13,6 +13,34 @@ import sys
 import tempfile
 
 
+def validate_csv_reports(files, producers):
+    ranks = set()
+    sample_fields = ('count', 'per_thread', 'per_rank', 'call_max_s', 'call_min_s',
+                     'total_s', 'exclusive_s', 'thread_max_s', 'thread_min_s',
+                     'overhead_s', 'dropped_calls', 'dropped_threads')
+    for path in files:
+        match = re.search(r'-r([01])-p([0-9]+)-', path.name)
+        if path.suffix != '.csv' or not match:
+            raise RuntimeError(f'unrecognized rank CSV {path.name}')
+        rank, pid = map(int, match.groups())
+        with path.open(newline='') as stream:
+            rows = list(csv.DictReader(stream))
+        if pid not in producers.values():
+            if not rows or any(not (r['function'].startswith('PEAK_CAPABILITY_') or
+                    r['function'] in ('PEAK_CUDA_API_COVERAGE', 'PEAK_DEGRADED_CAPABILITIES')) or
+                    any(float(r[field]) != 0 for field in sample_fields) for r in rows):
+                raise RuntimeError(f'auxiliary CSV contains profiling data: {path.name}')
+            continue
+        if producers[rank] != pid or rank in ranks:
+            raise RuntimeError(f'duplicate/misranked application CSV {path.name}')
+        ranks.add(rank)
+        rows = [r for r in rows if r['function'] == 'MPI_Comm_rank']
+        if len(rows) != 1 or int(rows[0]['count']) != 1:
+            raise RuntimeError(f'expected one profiled application call: {path.name}: {rows}')
+    if ranks != {0, 1}:
+        raise RuntimeError(f'missing rank CSV: {ranks}')
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--library', required=True)
@@ -68,6 +96,12 @@ def main():
             expected = f'self_profile_science rank={rank} valid=1 sum=3'
             if output.decode().count(expected) != 1:
                 raise RuntimeError(f'missing scientific result for rank {rank}')
+        producer_rows = re.findall(
+            r'self_profile_science rank=([01]) valid=1 sum=3 pid=([1-9][0-9]*)',
+            output.decode())
+        producers = {int(rank): int(pid) for rank, pid in producer_rows}
+        if len(producer_rows) != 2 or set(producers) != {0, 1} or len(set(producers.values())) != 2:
+            raise RuntimeError(f'invalid application rank/PID producers: {producer_rows}')
         receipts = re.findall(r"\[peak\] MPI overhead sync: ([^\n]+)", errors.decode())
         startup_ranks = set()
         for receipt in receipts:
@@ -88,20 +122,7 @@ def main():
         if startup_ranks != {0, 1}:
             raise RuntimeError(f'missing module startup receipts: {startup_ranks}')
         files = list(Path(directory).glob('peak_statslog*'))
-        if len(files) != 2 or any(p.suffix != '.csv' for p in files):
-            raise RuntimeError(f'expected two final rank CSVs, found {files}')
-        ranks = set()
-        for path in files:
-            match = re.search(r'-r([01])-p', path.name)
-            if not match:
-                raise RuntimeError(f'unrecognized rank CSV {path.name}')
-            ranks.add(int(match.group(1)))
-            with path.open(newline='') as stream:
-                rows = [r for r in csv.DictReader(stream) if r['function'] == 'MPI_Comm_rank']
-            if len(rows) != 1 or int(rows[0]['count']) != 1:
-                raise RuntimeError(f'expected one profiled application call: {path.name}: {rows}')
-        if ranks != {0, 1}:
-            raise RuntimeError(f'missing rank CSV: {ranks}')
+        validate_csv_reports(files, producers)
     print('mpi_bootstrap_self_profile_ok')
 
 

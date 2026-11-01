@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <dlfcn.h>
 #include <time.h>
+#include <unistd.h>
 int main(int argc, char **argv)
 {
     if (MPI_Init(&argc, &argv) != MPI_SUCCESS) return 1;
@@ -30,7 +31,8 @@ int main(int argc, char **argv)
     int value = rank + 1;
     int status = MPI_Allreduce(&value, &sum, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
     int valid = status == MPI_SUCCESS && size == 2 && sum == 3;
-    printf("self_profile_science rank=%d valid=%d sum=%d\n", rank, valid, sum);
+    printf("self_profile_science rank=%d valid=%d sum=%d pid=%ld\n",
+           rank, valid, sum, (long)getpid());
     /* Let an ordinary HB consume the validated ACK before teardown. */
     struct timespec observe = {1, 0};
     nanosleep(&observe, NULL);
