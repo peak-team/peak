@@ -76,6 +76,13 @@ if(MPI_FOUND)
         mpi_teardown_guard.c
         mpi_interceptor.c
         mpi_cost_model.c
+        mpi_causal_cost.c
+        mpi_causal_runtime.c
+        mpi_causal_events.c
+        mpi_progress_contract.c
+        mpi_causal_batches.c
+        mpi_causal_backend.c
+        mpi_causal_transport.c
         mpi_observer.c
         mpi_policy_adapter.c)
 endif()

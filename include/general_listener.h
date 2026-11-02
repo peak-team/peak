@@ -168,6 +168,7 @@ typedef struct {
     double hb_k_err;
     double hb_k_rate;
     double hb_ema_a;
+    gboolean mpi_service_only;
 } PeakHeartbeatArgs;
 
 /**
