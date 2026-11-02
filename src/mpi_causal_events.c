@@ -3890,7 +3890,8 @@ FORWARD_BOTH(Neighbor_alltoall,
 
 #if MPI_VERSION >= 4
 /* MPICH 4.0 published a mutable send buffer; 4.0.1 corrected it. */
-#if defined(MPICH_NUMVERSION) && MPICH_NUMVERSION < 40001300
+#if defined(MPICH_NUMVERSION) && MPICH_NUMVERSION >= 40000000 && \
+    MPICH_NUMVERSION < 40001300
 #define PEAK_MPI_PSEND_CONST
 #else
 #define PEAK_MPI_PSEND_CONST const
