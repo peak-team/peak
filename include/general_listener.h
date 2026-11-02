@@ -182,6 +182,8 @@ void peak_general_listener_attach();
 
 /** Records the monotonic application start used by final overhead reporting. */
 void peak_general_listener_note_runtime_start(double start_time);
+/** Optional final physical-success telemetry; no per-profile work. */
+void peak_general_listener_print_hook_coverage(void);
 
 /**
  * @brief Freezes final application-boundary overhead inputs.

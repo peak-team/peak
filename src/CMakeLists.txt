@@ -27,6 +27,7 @@ set(sources_peak
     general_listener/report_formatter.c
     general_listener/report_maxima.c
     general_listener/report_model.c
+    general_listener/hook_coverage.c
     general_listener/report_snapshot.c
     general_listener/runtime_config.c
     general_listener/socket_report_transport.c

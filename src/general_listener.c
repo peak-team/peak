@@ -9,6 +9,7 @@
 #include "internal/general_listener/report_formatter.h"
 #include "internal/general_listener/report_maxima.h"
 #include "internal/general_listener/report_model.h"
+#include "internal/general_listener/hook_coverage.h"
 #include "internal/general_listener/report_snapshot.h"
 #include "internal/general_listener/runtime_config.h"
 #include "internal/general_listener/selector_test_hooks.h"
@@ -436,6 +437,9 @@ static unsigned int peak_controller_configured_shutdown_drain_ms = 1000;
 static gsize peak_controller_trace_config_initialized = 0;
 static gchar* peak_controller_trace_path = NULL;
 static gboolean peak_controller_trace_enabled = FALSE;
+static PeakHookCoverage* peak_hook_coverage_metrics;
+static gboolean peak_hook_coverage_requested;
+static gboolean peak_hook_coverage_failed;
 static gboolean peak_dynamic_attach_needed = FALSE;
 #define PEAK_GENERAL_CONTROLLER_MAX_BATCH_CANDIDATES 64U
 
@@ -1048,6 +1052,7 @@ peak_general_listener_note_runtime_start(double start_time)
     gboolean baseline_valid;
 
     peak_general_listener_reset_final_report_snapshot();
+    (void)peak_hook_coverage_start(peak_hook_coverage_metrics, start_time);
     baseline_valid =
         peak_general_listener_accounting_snapshot(&accounting_baseline);
     atomic_store_explicit(&peak_general_listener_runtime_start_ns,
@@ -2519,9 +2524,48 @@ peak_general_controller_mark_pending_started_unlocked(size_t hook_id,
 }
 
 static void
+peak_general_listener_note_physical_attach_unlocked(size_t hook_id,
+                                                     gboolean reattach)
+{
+    if (peak_hook_coverage_metrics != NULL) {
+        (void)peak_hook_coverage_attach(peak_hook_coverage_metrics, hook_id,
+                                        peak_second(), reattach);
+    }
+}
+
+void
+peak_general_listener_print_hook_coverage(void)
+{
+    if (!peak_hook_coverage_requested) return;
+    long rank = -1, size = -1;
+    (void)peak_general_listener_mpi_env_rank_size(&rank, &size);
+    double now = peak_second();
+    for (size_t i = 0; i < peak_hook_address_count; i++) {
+        PeakHookCoverageSample sample;
+        int available = !peak_hook_coverage_failed &&
+            peak_hook_coverage_snapshot(peak_hook_coverage_metrics, i, now,
+                                         &sample);
+        const char* name = peak_hook_strings != NULL && peak_hook_strings[i] != NULL
+            ? peak_hook_strings[i] : "<unknown>";
+        if (!available) {
+            fprintf(stderr, "[peak hook coverage] available=0 pid=%ld rank=%ld hook=%zu target=%s\n",
+                    (long)getpid(), rank, i, name);
+            continue;
+        }
+        fprintf(stderr, "[peak hook coverage] available=1 pid=%ld rank=%ld hook=%zu attach_successes=%llu reattach_successes=%llu detach_successes=%llu attached_wall_seconds=%.12g target=%s\n",
+                (long)getpid(), rank, i,
+                (unsigned long long)sample.attach_successes,
+                (unsigned long long)sample.reattach_successes,
+                (unsigned long long)sample.detach_successes,
+                sample.attached_wall_seconds, name);
+    }
+}
+
+static void
 peak_general_listener_note_detach_success_unlocked(size_t hook_id,
                                                    double now)
 {
+    (void)peak_hook_coverage_detach(peak_hook_coverage_metrics, hook_id, now);
     if (peak_hook_last_detach_time == NULL || hook_id >= peak_hook_address_count) {
         return;
     }
@@ -2532,6 +2576,7 @@ peak_general_listener_note_detach_success_unlocked(size_t hook_id,
 static void
 peak_general_listener_note_reattach_success_unlocked(size_t hook_id)
 {
+    peak_general_listener_note_physical_attach_unlocked(hook_id, TRUE);
     if (hook_id >= peak_hook_address_count ||
         peak_hook_reattach_request_calls == NULL ||
         peak_hook_reattach_request_calls_valid == NULL ||
@@ -2764,6 +2809,7 @@ peak_general_controller_mpi_finalize_requested(void)
 void
 peak_general_listener_controller_mark_attached_unlocked(size_t hook_id)
 {
+    peak_general_listener_note_physical_attach_unlocked(hook_id, FALSE);
     peak_general_controller_set_state_unlocked(hook_id, PEAK_HOOK_ATTACHED);
 }
 
@@ -3175,6 +3221,9 @@ peak_general_listener_expand_dynamic_hook_tables_unlocked(
     peak_hook_last_detach_time =
         g_renew(double, peak_hook_last_detach_time, new_count);
     peak_hook_states = g_renew(PeakHookState, peak_hook_states, new_count);
+    if (peak_hook_coverage_metrics != NULL &&
+        !peak_hook_coverage_grow(peak_hook_coverage_metrics, new_count))
+        peak_hook_coverage_failed = TRUE;
     peak_hook_next_retry_time = g_renew(double, peak_hook_next_retry_time, new_count);
     peak_hook_pending_observed_time =
         g_renew(double, peak_hook_pending_observed_time, new_count);
@@ -3439,6 +3488,7 @@ peak_general_listener_dynamic_attach_symbol(const char* symbol_name,
             g_free(peak_demangled_strings[i]);
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
             array_listener[i] = new_listener;
+            peak_general_listener_note_physical_attach_unlocked(i, FALSE);
             array_listener_gum_detached[i] = FALSE;
             array_listener_gum_detach_flushed[i] = TRUE;
             peak_general_controller_reset_retry_unlocked(i);
@@ -7471,6 +7521,13 @@ peak_general_listener_attach()
     array_listener_gum_detach_flushed = g_new0(gboolean, peak_hook_address_count);
     peak_hook_last_detach_time = g_new0(double, peak_hook_address_count);
     peak_hook_states = g_new0(PeakHookState, peak_hook_address_count);
+    const char* coverage_setting = g_getenv("PEAK_HOOK_COVERAGE_METRICS");
+    peak_hook_coverage_requested = coverage_setting != NULL &&
+        strcmp(coverage_setting, "1") == 0;
+    if (peak_hook_coverage_requested) {
+        peak_hook_coverage_metrics = peak_hook_coverage_create(peak_hook_address_count);
+        peak_hook_coverage_failed = peak_hook_coverage_metrics == NULL;
+    }
     if (!peak_hook_status_reserve(peak_hook_address_count)) {
         g_error("unable to reserve hook status cells");
     }
@@ -7749,6 +7806,7 @@ peak_general_listener_attach()
             if (attach_status == GUM_ATTACH_OK) {
                 hook_address[i] = resolved_hook_address;
                 array_listener[i] = new_listener;
+            peak_general_listener_note_physical_attach_unlocked(i, FALSE);
                 array_listener_gum_detached[i] = FALSE;
                 array_listener_gum_detach_flushed[i] = TRUE;
                 peak_general_controller_set_state_unlocked(i, PEAK_HOOK_ATTACHED);

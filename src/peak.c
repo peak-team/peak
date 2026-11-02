@@ -1824,6 +1824,7 @@ peak_fini_impl(void)
 #endif
 
     peak_general_listener_controller_stop();
+    peak_general_listener_print_hook_coverage();
     if (peak_runtime_start_time > 0.0) {
         peak_main_time = peak_second() - peak_runtime_start_time;
     }
