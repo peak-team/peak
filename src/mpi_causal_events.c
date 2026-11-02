@@ -851,6 +851,33 @@ void peak_mpi_causal_events_init(void) {
       MPI_LONG,
       MPI_UNSIGNED_LONG,
       MPI_LONG_LONG_INT,
+#ifdef MPI_UNSIGNED_LONG_LONG
+      MPI_UNSIGNED_LONG_LONG,
+#endif
+#ifdef MPI_INT8_T
+      MPI_INT8_T,
+#endif
+#ifdef MPI_UINT8_T
+      MPI_UINT8_T,
+#endif
+#ifdef MPI_INT16_T
+      MPI_INT16_T,
+#endif
+#ifdef MPI_UINT16_T
+      MPI_UINT16_T,
+#endif
+#ifdef MPI_INT32_T
+      MPI_INT32_T,
+#endif
+#ifdef MPI_UINT32_T
+      MPI_UINT32_T,
+#endif
+#ifdef MPI_INT64_T
+      MPI_INT64_T,
+#endif
+#ifdef MPI_UINT64_T
+      MPI_UINT64_T,
+#endif
       MPI_FLOAT,
       MPI_DOUBLE,
       MPI_LONG_DOUBLE,

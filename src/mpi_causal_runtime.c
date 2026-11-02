@@ -25,6 +25,7 @@ static _Atomic unsigned char *peers;
 static unsigned char *peer_snapshot;
 static uint64_t *slot_prefixes;
 static size_t slots;
+static size_t observer_work_budget = 8192;
 static int rank_id, world_size;
 static uint64_t incarnation, raw_generation;
 static double origin, startup, activation_start;
@@ -88,6 +89,16 @@ int peak_mpi_causal_runtime_prepare(size_t n, double q, double hb, double ema) {
     return 0;
   double begin = clock_seconds();
   slots = n;
+  const char *work_budget_env = getenv("PEAK_MPI_OBSERVER_WORK_BUDGET");
+  uint64_t parsed_work_budget;
+  observer_work_budget = 8192;
+  if (work_budget_env) {
+    if (parse_unsigned(work_budget_env, 1048576, &parsed_work_budget) &&
+        parsed_work_budget > 0)
+      observer_work_budget = (size_t)parsed_work_budget;
+    else
+      fprintf(stderr, "[peak mpi causal] invalid PEAK_MPI_OBSERVER_WORK_BUDGET; using 8192 (valid range 1..1048576)\n");
+  }
   origin = begin;
   if (!peak_mpi_causal_cost_prepare(n)) {
     fprintf(
@@ -443,7 +454,7 @@ void peak_mpi_causal_runtime_tick(double now, double elapsed, double C,
     freeze_raw(&raw);
   double L = raw.L;
 
-  peak_mpi_causal_service_tick(service, capture, &raw, now, 65536, 8192);
+  peak_mpi_causal_service_tick(service, capture, &raw, now, 65536, observer_work_budget);
   PeakMpiPolicyReason service_fault =
       peak_mpi_causal_service_fault_reason(service);
   if (service_fault != PEAK_MPI_POLICY_NO_REASON)
@@ -523,9 +534,9 @@ void peak_mpi_causal_runtime_report(void) {
           contract->pml, contract->coll, contract->pml_verified,
           contract->coll_verified, contract->fixed_rules_verified);
   fprintf(stderr,
-          "[peak mpi causal control] rank=%d heartbeat=%s hook_controller=%s\n",
+          "[peak mpi causal control] rank=%d heartbeat=%s hook_controller=%s work_budget=%zu configured_slots=%zu\n",
           rank_id, heartbeat_enabled ? "enabled" : "disabled",
-          hook_controller_enabled ? "enabled" : "none");
+          hook_controller_enabled ? "enabled" : "none", observer_work_budget, slots);
   PeakMpiCausalServiceStats stats = {0};
   if (service)
     peak_mpi_causal_service_stats(service, &stats);
