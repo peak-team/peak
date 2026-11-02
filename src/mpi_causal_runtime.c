@@ -127,7 +127,7 @@ int peak_mpi_causal_runtime_prepare(size_t n, double q, double hb, double ema) {
   PeakMpiObserver *calibration = peak_mpi_observer_create(&calibration_config);
   if (calibration) {
     PeakMpiObserverProducer writer;
-    PeakMpiObserverRecord record = {0};
+    PeakMpiObserverRecord record = {.kind = PEAK_MPI_OBSERVER_EVENT_START, .op_uid = 1};
     peak_mpi_observer_activate(calibration);
     if (peak_mpi_observer_claim(calibration, 0, 1, 1, &writer) ==
         PEAK_MPI_OBSERVER_OK) {
