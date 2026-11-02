@@ -660,13 +660,21 @@ static int public_scalar(MPI_T_cvar_handle handle, MPI_Datatype datatype,
 }
 static int public_string(MPI_T_cvar_handle handle, MPI_Datatype datatype,
                          int count, char *out, size_t capacity) {
+  /* MPI_T count is storage capacity, not the current string length. Vista's
+   * public PML/coll handles each report2048 bytes for short selected values. */
+  char storage[4096];
   int size = 0;
-  if (datatype != MPI_CHAR || count < 1 || (size_t)count > capacity ||
+  if (datatype != MPI_CHAR || count < 1 || (size_t)count > sizeof(storage) ||
       PMPI_Type_size(datatype, &size) != MPI_SUCCESS || size != 1)
     return 0;
-  memset(out, 0, capacity);
-  return MPI_T_cvar_read(handle, out) == MPI_SUCCESS &&
-         memchr(out, 0, (size_t)count) != NULL;
+  memset(storage, 0, sizeof(storage));
+  if (MPI_T_cvar_read(handle, storage) != MPI_SUCCESS)
+    return 0;
+  const char *end = memchr(storage, 0, (size_t)count);
+  if (!end || (size_t)(end - storage) >= capacity)
+    return 0;
+  memcpy(out, storage, (size_t)(end - storage) + 1);
+  return 1;
 }
 static void public_verification(PeakMpiProgressVerification *result) {
   int tools_provided = 0;
