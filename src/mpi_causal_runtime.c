@@ -335,6 +335,31 @@ void peak_mpi_causal_runtime_mpi_initialized(void) {
   startup += clock_seconds() - initialization_start;
   atomic_store_explicit(&backend_ready, 1, memory_order_release);
 }
+/* A cohort's permanent failure also ends fine production locally. This does
+ * not touch counters, object lifetime or temporary feedback-stale state. */
+static void latch_capture_coarse(void) {
+  if (!receiver.permanent_coarse)
+    return;
+  PeakMpiObserverReason reason;
+  switch (receiver.coarse_reason) {
+  case PEAK_MPI_POLICY_MISSING_CONTRACT:
+    reason = PEAK_MPI_OBSERVER_REASON_CAPABILITY;
+    break;
+  case PEAK_MPI_POLICY_RESOURCE_LIMIT:
+    reason = PEAK_MPI_OBSERVER_REASON_OBJECT_CAPACITY;
+    break;
+  case PEAK_MPI_POLICY_BAD_IDENTITY:
+    reason = PEAK_MPI_OBSERVER_REASON_IDENTITY;
+    break;
+  case PEAK_MPI_POLICY_EVENT_LOSS:
+    reason = PEAK_MPI_OBSERVER_REASON_METADATA;
+    break;
+  default:
+    reason = PEAK_MPI_OBSERVER_REASON_METADATA;
+    break;
+  }
+  peak_mpi_causal_runtime_fail(reason);
+}
 static void freeze_raw(PeakMpiCausalRaw *raw) {
   raw->lost_events = 0;
   for (size_t i = 0; i < slots; i++) {
@@ -391,6 +416,7 @@ void peak_mpi_causal_runtime_tick(double now, double elapsed, double C,
               : PEAK_MPI_POLICY_BAD_IDENTITY,
           now);
     }
+    latch_capture_coarse();
     return;
   }
   for (int i = 0; i < world_size; i++)
@@ -442,6 +468,7 @@ void peak_mpi_causal_runtime_tick(double now, double elapsed, double C,
             ? PEAK_MPI_POLICY_MISSING_CONTRACT
             : PEAK_MPI_POLICY_EVENT_LOSS,
         now);
+  latch_capture_coarse();
   if (peak_mpi_policy_receiver_snapshot(&receiver, now, raw.elapsed, L, 0,
                                         &last_decision) == PEAK_MPI_POLICY_OK) {
     double dt = previous_tick ? fmax(0, now - previous_tick) : 0;
