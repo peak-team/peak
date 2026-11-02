@@ -1261,6 +1261,66 @@ peak_mpi_activation_policy_post_init(void)
 }
 #endif
 
+#ifdef HAVE_MPI
+static void
+peak_activate_mpi_service_only_runtime(void)
+{
+    atomic_store_explicit(&peak_runtime_owner_pid, getpid(), memory_order_release);
+    peak_main_time = peak_second();
+    peak_general_listener_note_runtime_start(peak_main_time);
+    peak_mpi_causal_runtime_activation_end();
+    peak_mpi_causal_runtime_configure_control(heartbeat_time != 0, FALSE);
+    args = NULL;
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    gboolean fail_heartbeat_setup =
+        getenv("PEAK_TEST_FAIL_HEARTBEAT_SETUP_ALLOCATION") != NULL;
+#else
+    gboolean fail_heartbeat_setup = FALSE;
+#endif
+    if (heartbeat_time && !fail_heartbeat_setup)
+        args = g_try_new0(PeakHeartbeatArgs, 1);
+    if (args) {
+        args->heartbeat_time = heartbeat_time;
+        args->mpi_service_only = TRUE;
+        args->check_interval = check_interval;
+        args->hb_min_us = hb_min_us;
+        args->hb_max_us = hb_max_us;
+        args->hb_k_err = hb_k_err;
+        args->hb_k_rate = hb_k_rate;
+        args->hb_ema_a = hb_ema_a;
+        atomic_store(&heartbeat_running, true);
+        int heartbeat_create_result;
+#ifdef PEAK_ENABLE_TEST_HOOKS
+        if (atomic_exchange_explicit(&peak_test_fail_heartbeat_create, 0,
+                                     memory_order_acq_rel) != 0 ||
+            (getenv("PEAK_TEST_FAIL_HEARTBEAT_CREATE") != NULL &&
+             getenv("PEAK_TEST_FAIL_HEARTBEAT_CREATE")[0] != '\0')) {
+            heartbeat_create_result = EAGAIN;
+        } else
+#endif
+        {
+            heartbeat_create_result = pthread_create(&heartbeat_thread,
+                NULL, peak_heartbeat_monitor, args);
+        }
+        if (heartbeat_create_result == 0) {
+            atomic_store_explicit(&peak_heartbeat_started, 1,
+                                  memory_order_release);
+        } else {
+            atomic_store(&heartbeat_running, false);
+            g_free(args);
+            args = NULL;
+        }
+    }
+    if (!args && heartbeat_time) {
+        peak_report_snapshot_note_degraded(PEAK_PROFILER_DEGRADED_HEARTBEAT,
+            "heartbeat setup or thread creation failed");
+        peak_mpi_causal_runtime_configure_control(FALSE, FALSE);
+    }
+    atomic_store_explicit(&peak_runtime_active, 1, memory_order_release);
+    peak_runtime_activation_publish(PEAK_RUNTIME_ACTIVATION_ACTIVE);
+}
+#endif
+
 static void
 peak_activate_runtime(void)
 {
@@ -1297,59 +1357,7 @@ peak_activate_runtime(void)
     if (peak_mpi_causal_runtime_requested() && !peak_requested_work.cpu &&
         !peak_requested_work.gpu && !peak_requested_work.memory &&
         !peak_requested_work.jit) {
-        atomic_store_explicit(&peak_runtime_owner_pid, getpid(), memory_order_release);
-        peak_main_time = peak_second();
-        peak_general_listener_note_runtime_start(peak_main_time);
-        peak_mpi_causal_runtime_activation_end();
-        peak_mpi_causal_runtime_configure_control(heartbeat_time != 0, FALSE);
-        args = NULL;
-#ifdef PEAK_ENABLE_TEST_HOOKS
-        gboolean fail_heartbeat_setup =
-            getenv("PEAK_TEST_FAIL_HEARTBEAT_SETUP_ALLOCATION") != NULL;
-#else
-        gboolean fail_heartbeat_setup = FALSE;
-#endif
-        if (heartbeat_time && !fail_heartbeat_setup)
-            args = g_try_new0(PeakHeartbeatArgs, 1);
-        if (args) {
-            args->heartbeat_time = heartbeat_time;
-            args->mpi_service_only = TRUE;
-            args->check_interval = check_interval;
-            args->hb_min_us = hb_min_us;
-            args->hb_max_us = hb_max_us;
-            args->hb_k_err = hb_k_err;
-            args->hb_k_rate = hb_k_rate;
-            args->hb_ema_a = hb_ema_a;
-            atomic_store(&heartbeat_running, true);
-            int heartbeat_create_result;
-#ifdef PEAK_ENABLE_TEST_HOOKS
-            if (atomic_exchange_explicit(&peak_test_fail_heartbeat_create, 0,
-                                         memory_order_acq_rel) != 0 ||
-                (getenv("PEAK_TEST_FAIL_HEARTBEAT_CREATE") != NULL &&
-                 getenv("PEAK_TEST_FAIL_HEARTBEAT_CREATE")[0] != '\0')) {
-                heartbeat_create_result = EAGAIN;
-            } else
-#endif
-            {
-                heartbeat_create_result = pthread_create(&heartbeat_thread,
-                    NULL, peak_heartbeat_monitor, args);
-            }
-            if (heartbeat_create_result == 0) {
-                atomic_store_explicit(&peak_heartbeat_started, 1,
-                                      memory_order_release);
-            } else {
-                atomic_store(&heartbeat_running, false);
-                g_free(args);
-                args = NULL;
-            }
-        }
-        if (!args && heartbeat_time) {
-            peak_report_snapshot_note_degraded(PEAK_PROFILER_DEGRADED_HEARTBEAT,
-                "heartbeat setup or thread creation failed");
-            peak_mpi_causal_runtime_configure_control(FALSE, FALSE);
-        }
-        atomic_store_explicit(&peak_runtime_active, 1, memory_order_release);
-        peak_runtime_activation_publish(PEAK_RUNTIME_ACTIVATION_ACTIVE);
+        peak_activate_mpi_service_only_runtime();
         return;
     }
 #endif

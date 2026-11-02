@@ -29,4 +29,4 @@ peak_mpi_causal_transport_requested_nonce(const PeakMpiCausalTransport *);
 void peak_mpi_causal_transport_stats(const PeakMpiCausalTransport *,
                                      PeakMpiCausalServiceStats *);
 
-#endif
+#endif /* PEAK_MPI_CAUSAL_TRANSPORT_H */

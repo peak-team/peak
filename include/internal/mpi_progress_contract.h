@@ -56,4 +56,4 @@ int peak_mpi_progress_contract_supports(const PeakMpiProgressContract *,
                                         PeakMpiCausalOperation operation,
                                         unsigned flags);
 
-#endif
+#endif /* PEAK_MPI_PROGRESS_CONTRACT_H */

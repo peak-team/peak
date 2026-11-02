@@ -189,4 +189,4 @@ void peak_mpi_cost_model_stats(const PeakMpiCostModel *, PeakMpiCostStats *);
 }
 #endif
 
-#endif
+#endif /* PEAK_MPI_COST_MODEL_H */

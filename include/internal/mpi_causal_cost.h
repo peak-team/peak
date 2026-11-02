@@ -13,4 +13,4 @@ int peak_mpi_causal_cost_read_prefix(size_t count, double *profile,
 int peak_mpi_causal_cost_read(double *profile_seconds,
                               double *observer_seconds);
 
-#endif
+#endif /* PEAK_MPI_CAUSAL_COST_H */

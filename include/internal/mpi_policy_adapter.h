@@ -224,4 +224,4 @@ PeakMpiPolicyResult peak_mpi_policy_receiver_snapshot(PeakMpiPolicyReceiver *rec
 #ifdef __cplusplus
 }
 #endif
-#endif
+#endif /* PEAK_MPI_POLICY_ADAPTER_H */

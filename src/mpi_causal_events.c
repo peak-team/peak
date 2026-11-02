@@ -3889,10 +3889,16 @@ FORWARD_BOTH(Neighbor_alltoall,
              sendbuf, sendcount, sendtype, recvbuf, recvcount, recvtype, comm)
 
 #if MPI_VERSION >= 4
-DECLARE_REAL(Psend_init, (const void *buf, int partitions, MPI_Count count,
+/* MPICH 4.0 published a mutable send buffer; 4.0.1 corrected it. */
+#if defined(MPICH_NUMVERSION) && MPICH_NUMVERSION < 40001300
+#define PEAK_MPI_PSEND_CONST
+#else
+#define PEAK_MPI_PSEND_CONST const
+#endif
+DECLARE_REAL(Psend_init, (PEAK_MPI_PSEND_CONST void *buf, int partitions, MPI_Count count,
                           MPI_Datatype datatype, int dest, int tag,
                           MPI_Comm comm, MPI_Info info, MPI_Request *request))
-static int wrap_Psend_init(Fn_Psend_init real, const void *buf, int partitions,
+static int wrap_Psend_init(Fn_Psend_init real, PEAK_MPI_PSEND_CONST void *buf, int partitions,
                            MPI_Count count, MPI_Datatype datatype, int dest,
                            int tag, MPI_Comm comm, MPI_Info info,
                            MPI_Request *request) {
@@ -3906,10 +3912,11 @@ static int wrap_Psend_init(Fn_Psend_init real, const void *buf, int partitions,
   return rc;
 }
 FORWARD_BOTH(Psend_init,
-             (const void *buf, int partitions, MPI_Count count,
+             (PEAK_MPI_PSEND_CONST void *buf, int partitions, MPI_Count count,
               MPI_Datatype datatype, int dest, int tag, MPI_Comm comm,
               MPI_Info info, MPI_Request *request),
              buf, partitions, count, datatype, dest, tag, comm, info, request)
+#undef PEAK_MPI_PSEND_CONST
 DECLARE_REAL(Precv_init, (void *buf, int partitions, MPI_Count count,
                           MPI_Datatype datatype, int source, int tag,
                           MPI_Comm comm, MPI_Info info, MPI_Request *request))

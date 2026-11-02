@@ -69,4 +69,4 @@ static inline void peak_mpi_causal_runtime_publish_price(double price) {
 }
 #endif
 
-#endif
+#endif /* PEAK_MPI_CAUSAL_RUNTIME_H */

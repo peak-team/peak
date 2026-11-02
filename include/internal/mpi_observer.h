@@ -1,5 +1,5 @@
-#ifndef PEAK_INTERNAL_MPI_OBSERVER_H
-#define PEAK_INTERNAL_MPI_OBSERVER_H
+#ifndef PEAK_MPI_OBSERVER_H
+#define PEAK_MPI_OBSERVER_H
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -193,4 +193,4 @@ PeakMpiObserverStatus peak_mpi_observer_feedback_read(PeakMpiObserver *observer,
 #ifdef __cplusplus
 }
 #endif
-#endif
+#endif /* PEAK_MPI_OBSERVER_H */

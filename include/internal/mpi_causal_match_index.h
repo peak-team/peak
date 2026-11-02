@@ -56,4 +56,4 @@ size_t peak_mpi_causal_match_index_next(const PeakMpiCausalMatchIndex *,
 #ifdef __cplusplus
 }
 #endif
-#endif
+#endif /* PEAK_MPI_CAUSAL_MATCH_INDEX_H */

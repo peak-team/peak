@@ -2549,11 +2549,11 @@ peak_general_listener_print_hook_coverage(void)
         const char* name = peak_hook_strings != NULL && peak_hook_strings[i] != NULL
             ? peak_hook_strings[i] : "<unknown>";
         if (!available) {
-            fprintf(stderr, "[peak hook coverage] available=0 pid=%ld rank=%ld hook=%zu target=%s\n",
+            peak_log_report("[peak hook coverage] available=0 pid=%ld rank=%ld hook=%zu target=%s\n",
                     (long)getpid(), rank, i, name);
             continue;
         }
-        fprintf(stderr, "[peak hook coverage] available=1 pid=%ld rank=%ld hook=%zu attach_successes=%llu reattach_successes=%llu detach_successes=%llu attached_wall_seconds=%.12g target=%s\n",
+        peak_log_report("[peak hook coverage] available=1 pid=%ld rank=%ld hook=%zu attach_successes=%llu reattach_successes=%llu detach_successes=%llu attached_wall_seconds=%.12g target=%s\n",
                 (long)getpid(), rank, i,
                 (unsigned long long)sample.attach_successes,
                 (unsigned long long)sample.reattach_successes,

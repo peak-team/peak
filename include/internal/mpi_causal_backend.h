@@ -91,4 +91,4 @@ int peak_mpi_causal_service_ingest_raw(PeakMpiCausalService *service,
 #ifdef __cplusplus
 }
 #endif
-#endif
+#endif /* PEAK_MPI_CAUSAL_BACKEND_H */

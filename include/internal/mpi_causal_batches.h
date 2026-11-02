@@ -56,4 +56,4 @@ int peak_mpi_causal_batches_prefix_clear(const PeakMpiCausalBatches *,
                                          unsigned rank,
                                          const uint64_t *prefixes, size_t slots,
                                          size_t *cursor, size_t *work_budget);
-#endif
+#endif /* PEAK_MPI_CAUSAL_BATCHES_H */

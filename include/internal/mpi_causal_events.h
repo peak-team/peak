@@ -58,4 +58,4 @@ void peak_mpi_causal_runtime_note_members(const int32_t *members, size_t count);
 int peak_mpi_causal_runtime_internal_enter(void);
 void peak_mpi_causal_runtime_internal_leave(int previous);
 
-#endif
+#endif /* PEAK_MPI_CAUSAL_EVENTS_H */

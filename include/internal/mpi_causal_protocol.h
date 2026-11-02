@@ -121,4 +121,4 @@ typedef struct {
  * frontend.
  */
 
-#endif
+#endif /* PEAK_MPI_CAUSAL_PROTOCOL_H */

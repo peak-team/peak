@@ -18,4 +18,4 @@ int peak_hook_coverage_detach(PeakHookCoverage *coverage, size_t hook,
                               double now);
 int peak_hook_coverage_snapshot(const PeakHookCoverage *coverage, size_t hook,
                                 double now, PeakHookCoverageSample *sample);
-#endif
+#endif /* PEAK_HOOK_COVERAGE_H */
