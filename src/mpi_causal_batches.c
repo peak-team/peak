@@ -3,310 +3,650 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define NONE SIZE_MAX
+#define TOMBSTONE SIZE_MAX
+#define PROBES 64u
+
 typedef struct {
   PeakMpiObserverRecord r;
-  uint64_t attempted;
-  size_t next_free, position;
+  size_t free_next, next, op, position, slot_previous, slot_next;
   unsigned rank;
-  int used;
-} Entry;
-enum { FIND, GATHER, VALIDATE, READY, RETIRE, ERROR };
-struct PeakMpiCausalBatches {
-  size_t world, capacity, pending, free_head;
-  Entry *entries;
-  uint64_t *last, version, attempt_version;
-  size_t *begins, *ends, *activations, *subrecords, *active;
-  size_t scan_limit, retire_epoch;
-  size_t nb, ne, na, ns, begin, end, native, scan, find_cursor, retire;
-  size_t pair_count, duplicate_count, end_match;
-  unsigned rank;
+} BatchEntry;
+typedef struct {
   uint64_t uid;
-  int state;
+  unsigned rank;
+  size_t free_next, group, begin, end, next_group;
+  size_t activation_head, activation_tail, sub_head, sub_tail;
+  size_t activation_count, sub_count;
+} BatchOperation;
+typedef struct {
+  uint64_t uid, previous;
+  unsigned rank;
+  size_t free_next, begin, end, successor, ready_next;
+  size_t operation_head, operation_tail, begin_head, begin_tail;
+  size_t operations, begins, ends, pairs, activations, subrecords;
+  int queued, exposed;
+} BatchGroup;
+enum {
+  IDLE,
+  BUILD_BEGIN,
+  BUILD_ACTIVATIONS,
+  BUILD_SUBRECORDS,
+  BUILD_END,
+  BUILD_MARKER,
+  READY,
+  RETIRE_RECORDS,
+  RETIRE_OPERATIONS,
+  RETIRE_GROUP,
+  ERROR
 };
-#define NONE SIZE_MAX
-PeakMpiCausalBatches *peak_mpi_causal_batches_create(size_t world, size_t cap) {
-  PeakMpiCausalBatches *b;
-  size_t i;
-  if (!world || !cap || world > UINT32_MAX || cap > SIZE_MAX / sizeof(Entry) ||
-      cap > SIZE_MAX / sizeof(size_t))
+struct PeakMpiCausalBatches {
+  size_t world, slots, capacity, group_capacity, pending;
+  BatchEntry *entries;
+  BatchOperation *operations;
+  BatchGroup *groups;
+  size_t *operation_index, *group_index;
+  size_t operation_index_capacity, group_index_capacity;
+  size_t free_entry, free_operation, free_group;
+  size_t *active, *plan, *slot_head, *slot_tail, *rank_next;
+  uint64_t *last;
+  size_t ready_head, ready_tail, current, plan_count;
+  size_t cursor, parent_cursor, retire, retire_operation, retire_epoch;
+  int state, compact_plan;
+  unsigned error_rank;
+  uint64_t error_uid;
+};
+
+static size_t hash(unsigned rank, uint64_t uid) {
+  uint64_t x = uid ^ ((uint64_t)rank * UINT64_C(0x9e3779b97f4a7c15));
+  x ^= x >> 30;
+  x *= UINT64_C(0xbf58476d1ce4e5b9);
+  x ^= x >> 27;
+  x *= UINT64_C(0x94d049bb133111eb);
+  return (size_t)(x ^ (x >> 31));
+}
+static void invalid(PeakMpiCausalBatches *b, unsigned rank, uint64_t uid) {
+  b->state = ERROR;
+  b->error_rank = rank;
+  b->error_uid = uid;
+}
+static size_t group_find(PeakMpiCausalBatches *b, unsigned rank, uint64_t uid,
+                         int create) {
+  size_t h = hash(rank, uid), empty = NONE;
+  for (size_t i = 0; i < PROBES; i++) {
+    size_t at = (h + i) & (b->group_index_capacity - 1);
+    size_t v = b->group_index[at];
+    if (v == TOMBSTONE) {
+      if (empty == NONE)
+        empty = at;
+    } else if (!v) {
+      if (empty == NONE)
+        empty = at;
+      break;
+    } else {
+      BatchGroup *g = &b->groups[v - 1];
+      if (g->rank == rank && g->uid == uid)
+        return v - 1;
+    }
+  }
+  if (!create || empty == NONE || b->free_group == NONE)
+    return NONE;
+  size_t at = b->free_group;
+  BatchGroup *g = &b->groups[at];
+  b->free_group = g->free_next;
+  memset(g, 0, sizeof(*g));
+  g->rank = rank;
+  g->uid = uid;
+  g->begin = g->end = g->successor = g->ready_next = NONE;
+  g->operation_head = g->operation_tail = g->begin_head = g->begin_tail = NONE;
+  b->group_index[empty] = at + 1;
+  return at;
+}
+static size_t operation_find(PeakMpiCausalBatches *b, unsigned rank,
+                             uint64_t uid, int create) {
+  size_t h = hash(rank, uid), empty = NONE;
+  for (size_t i = 0; i < PROBES; i++) {
+    size_t at = (h + i) & (b->operation_index_capacity - 1);
+    size_t v = b->operation_index[at];
+    if (v == TOMBSTONE) {
+      if (empty == NONE)
+        empty = at;
+    } else if (!v) {
+      if (empty == NONE)
+        empty = at;
+      break;
+    } else {
+      BatchOperation *o = &b->operations[v - 1];
+      if (o->rank == rank && o->uid == uid)
+        return v - 1;
+    }
+  }
+  if (!create || empty == NONE || b->free_operation == NONE)
+    return NONE;
+  size_t at = b->free_operation;
+  BatchOperation *o = &b->operations[at];
+  b->free_operation = o->free_next;
+  memset(o, 0, sizeof(*o));
+  o->rank = rank;
+  o->uid = uid;
+  o->group = o->begin = o->end = o->next_group = NONE;
+  o->activation_head = o->activation_tail = o->sub_head = o->sub_tail = NONE;
+  b->operation_index[empty] = at + 1;
+  return at;
+}
+static void group_remove(PeakMpiCausalBatches *b, size_t index) {
+  BatchGroup *g = &b->groups[index];
+  size_t h = hash(g->rank, g->uid);
+  for (size_t i = 0; i < PROBES; i++) {
+    size_t at = (h + i) & (b->group_index_capacity - 1);
+    if (b->group_index[at] == index + 1) {
+      b->group_index[at] = TOMBSTONE;
+      break;
+    }
+  }
+  g->free_next = b->free_group;
+  b->free_group = index;
+}
+static void operation_remove(PeakMpiCausalBatches *b, size_t index) {
+  BatchOperation *o = &b->operations[index];
+  size_t h = hash(o->rank, o->uid);
+  for (size_t i = 0; i < PROBES; i++) {
+    size_t at = (h + i) & (b->operation_index_capacity - 1);
+    if (b->operation_index[at] == index + 1) {
+      b->operation_index[at] = TOMBSTONE;
+      break;
+    }
+  }
+  o->free_next = b->free_operation;
+  b->free_operation = index;
+}
+static void maybe_ready(PeakMpiCausalBatches *b, size_t index) {
+  BatchGroup *g = &b->groups[index];
+  if (b->state == ERROR || g->begin == NONE || g->end == NONE)
+    return;
+  size_t expected = b->entries[g->end].r.completion_count;
+  if (!expected || g->begins > expected || g->ends > expected ||
+      g->operations > expected) {
+    invalid(b, g->rank, g->uid);
+    return;
+  }
+  if (g->queued || g->exposed)
+    return;
+  if (g->begins != expected || g->ends != expected || g->pairs != expected ||
+      g->previous != b->last[g->rank])
+    return;
+  if (b->rank_next[g->rank] != index) {
+    invalid(b, g->rank, g->uid);
+    return;
+  }
+  g->queued = 1;
+  g->ready_next = NONE;
+  if (b->ready_tail == NONE)
+    b->ready_head = index;
+  else
+    b->groups[b->ready_tail].ready_next = index;
+  b->ready_tail = index;
+}
+static int attach(PeakMpiCausalBatches *b, size_t op, size_t group) {
+  BatchOperation *o = &b->operations[op];
+  BatchGroup *g = &b->groups[group];
+  if (o->group != NONE) {
+    if (o->group != group) {
+      invalid(b, g->rank, g->uid);
+      return 0;
+    }
+    return 1;
+  }
+  o->group = group;
+  if (g->operation_tail == NONE)
+    g->operation_head = op;
+  else
+    b->operations[g->operation_tail].next_group = op;
+  g->operation_tail = op;
+  g->operations++;
+  g->activations += o->activation_count;
+  g->subrecords += o->sub_count;
+  return 1;
+}
+static void append(PeakMpiCausalBatches *b, size_t *head, size_t *tail,
+                   size_t record) {
+  if (*tail == NONE)
+    *head = record;
+  else
+    b->entries[*tail].next = record;
+  *tail = record;
+}
+
+PeakMpiCausalBatches *peak_mpi_causal_batches_create_with_slots(size_t world,
+                                                                size_t slots,
+                                                                size_t cap) {
+  if (!world || !cap || world > UINT32_MAX ||
+      world > SIZE_MAX / sizeof(size_t) || cap > SIZE_MAX / 16 ||
+      cap > SIZE_MAX / sizeof(BatchEntry) ||
+      cap > SIZE_MAX / sizeof(BatchOperation) ||
+      cap > SIZE_MAX / (2 * sizeof(BatchGroup)) ||
+      (slots &&
+       (world > SIZE_MAX / slots || world * slots > SIZE_MAX / sizeof(size_t))))
     return NULL;
-  b = calloc(1, sizeof(*b));
+  PeakMpiCausalBatches *b = calloc(1, sizeof(*b));
   if (!b)
     return NULL;
   b->world = world;
+  b->slots = slots;
   b->capacity = cap;
-  b->entries = calloc(cap, sizeof(Entry));
-  b->last = calloc(world, sizeof(uint64_t));
-  b->begins = calloc(cap, sizeof(size_t));
-  b->ends = calloc(cap, sizeof(size_t));
-  b->activations = calloc(cap, sizeof(size_t));
-  b->subrecords = calloc(cap, sizeof(size_t));
+  b->group_capacity = cap * 2;
+  b->operation_index_capacity = b->group_index_capacity = 2;
+  while (b->operation_index_capacity < cap * 2)
+    b->operation_index_capacity *= 2;
+  while (b->group_index_capacity < cap * 4)
+    b->group_index_capacity *= 2;
+  b->entries = calloc(cap, sizeof(*b->entries));
+  b->operations = calloc(cap, sizeof(*b->operations));
+  b->groups = calloc(b->group_capacity, sizeof(*b->groups));
+  b->operation_index = calloc(b->operation_index_capacity, sizeof(size_t));
+  b->group_index = calloc(b->group_index_capacity, sizeof(size_t));
   b->active = calloc(cap, sizeof(size_t));
-  if (!b->entries || !b->last || !b->begins || !b->ends || !b->activations ||
-      !b->subrecords || !b->active) {
+  b->plan = calloc(cap, sizeof(size_t));
+  b->last = calloc(world, sizeof(uint64_t));
+  b->rank_next = malloc(world * sizeof(size_t));
+  if (slots) {
+    b->slot_head = malloc(world * slots * sizeof(size_t));
+    b->slot_tail = malloc(world * slots * sizeof(size_t));
+  }
+  if (!b->entries || !b->operations || !b->groups || !b->operation_index ||
+      !b->group_index || !b->active || !b->plan || !b->last || !b->rank_next ||
+      (slots && (!b->slot_head || !b->slot_tail))) {
     peak_mpi_causal_batches_destroy(b);
     return NULL;
   }
-  for (i = 0; i < cap; i++) {
-    b->entries[i].next_free = i + 1;
-    b->entries[i].attempted = UINT64_MAX;
+  for (size_t i = 0; i < cap; i++) {
+    b->entries[i].free_next = b->operations[i].free_next = i + 1;
   }
-  b->free_head = 0;
-  b->version = 1;
+  b->entries[cap - 1].free_next = b->operations[cap - 1].free_next = NONE;
+  for (size_t i = 0; i < b->group_capacity; i++)
+    b->groups[i].free_next = i + 1;
+  b->groups[b->group_capacity - 1].free_next = NONE;
+  for (size_t i = 0; i < world; i++)
+    b->rank_next[i] = NONE;
+  for (size_t i = 0; slots && i < world * slots; i++)
+    b->slot_head[i] = b->slot_tail[i] = NONE;
+  b->ready_head = b->ready_tail = b->current = NONE;
   return b;
+}
+PeakMpiCausalBatches *peak_mpi_causal_batches_create(size_t world, size_t cap) {
+  return peak_mpi_causal_batches_create_with_slots(world, 0, cap);
 }
 void peak_mpi_causal_batches_destroy(PeakMpiCausalBatches *b) {
   if (!b)
     return;
   free(b->entries);
-  free(b->last);
-  free(b->begins);
-  free(b->ends);
-  free(b->activations);
-  free(b->subrecords);
+  free(b->operations);
+  free(b->groups);
+  free(b->operation_index);
+  free(b->group_index);
   free(b->active);
+  free(b->plan);
+  free(b->last);
+  free(b->rank_next);
+  free(b->slot_head);
+  free(b->slot_tail);
   free(b);
 }
 int peak_mpi_causal_batches_ingest(PeakMpiCausalBatches *b, unsigned rank,
                                    const PeakMpiObserverRecord *r) {
-  size_t i;
-  if (!b || !r || rank >= b->world || b->free_head >= b->capacity)
+  if (!b || !r || rank >= b->world || b->free_entry == NONE)
     return 0;
-  i = b->free_head;
-  b->free_head = b->entries[i].next_free;
-  b->entries[i].r = *r;
-  b->entries[i].rank = rank;
-  b->entries[i].used = 1;
-  b->entries[i].attempted = UINT64_MAX;
-  b->entries[i].position = b->pending;
-  b->active[b->pending++] = i;
-  b->version++;
+  if (b->state == ERROR)
+    return 1;
+  if (!r->thread_uid || (b->slots && r->thread_uid > b->slots)) {
+    invalid(b, rank, r->op_uid);
+    return 1;
+  }
+  size_t group = NONE, op = NONE;
+  if (r->phase == PEAK_MPI_CAUSAL_GROUP_BEGIN ||
+      r->phase == PEAK_MPI_CAUSAL_GROUP_END)
+    group = group_find(b, rank, r->op_uid, 1);
+  else if (r->phase == PEAK_MPI_CAUSAL_CALL_BEGIN ||
+           r->phase == PEAK_MPI_CAUSAL_CALL_END) {
+    group = group_find(b, rank, r->batch_uid, 1);
+    op = operation_find(b, rank, r->op_uid, 1);
+  } else if (r->phase == PEAK_MPI_CAUSAL_REQUEST_ACTIVATE ||
+             r->phase == PEAK_MPI_CAUSAL_REQUEST_COMPLETE ||
+             r->phase == PEAK_MPI_CAUSAL_REQUEST_RETIRED ||
+             r->phase == PEAK_MPI_CAUSAL_MESSAGE_BOUND) {
+    op = operation_find(b, rank, r->batch_uid, 1);
+    if (op != NONE)
+      group = b->operations[op].group;
+  } else {
+    invalid(b, rank, r->op_uid);
+    return 1;
+  }
+  if ((r->phase == PEAK_MPI_CAUSAL_GROUP_BEGIN ||
+       r->phase == PEAK_MPI_CAUSAL_GROUP_END ||
+       r->phase == PEAK_MPI_CAUSAL_CALL_BEGIN ||
+       r->phase == PEAK_MPI_CAUSAL_CALL_END) &&
+      group == NONE)
+    return 0;
+  if (r->phase != PEAK_MPI_CAUSAL_GROUP_BEGIN &&
+      r->phase != PEAK_MPI_CAUSAL_GROUP_END && op == NONE)
+    return 0;
+  if (group != NONE && b->groups[group].exposed) {
+    invalid(b, rank, b->groups[group].uid);
+    return 1;
+  }
+  size_t predecessor = NONE;
+  if (r->phase == PEAK_MPI_CAUSAL_GROUP_BEGIN &&
+      r->input_ref != b->last[rank]) {
+    predecessor = group_find(b, rank, r->input_ref, 1);
+    if (predecessor == NONE)
+      return 0;
+  }
+  size_t record = b->free_entry;
+  BatchEntry *e = &b->entries[record];
+  b->free_entry = e->free_next;
+  e->r = *r;
+  e->rank = rank;
+  e->next = e->slot_previous = e->slot_next = NONE;
+  e->op = op;
+  e->position = b->pending;
+  b->active[b->pending++] = record;
+  if (b->slots) {
+    size_t at = (size_t)rank * b->slots + r->thread_uid - 1;
+    e->slot_previous = b->slot_tail[at];
+    if (e->slot_previous == NONE)
+      b->slot_head[at] = record;
+    else
+      b->entries[e->slot_previous].slot_next = record;
+    b->slot_tail[at] = record;
+  }
+  if (r->phase == PEAK_MPI_CAUSAL_GROUP_BEGIN) {
+    BatchGroup *g = &b->groups[group];
+    if (g->begin != NONE || r->input_ref == r->op_uid) {
+      invalid(b, rank, g->uid);
+      return 1;
+    }
+    g->begin = record;
+    g->previous = r->input_ref;
+    if (g->previous == b->last[rank]) {
+      if (b->rank_next[rank] != NONE && b->rank_next[rank] != group)
+        invalid(b, rank, g->uid);
+      else
+        b->rank_next[rank] = group;
+    } else {
+      if (b->groups[predecessor].successor != NONE &&
+          b->groups[predecessor].successor != group)
+        invalid(b, rank, g->uid);
+      else
+        b->groups[predecessor].successor = group;
+    }
+  } else if (r->phase == PEAK_MPI_CAUSAL_GROUP_END) {
+    BatchGroup *g = &b->groups[group];
+    if (g->end != NONE) {
+      invalid(b, rank, g->uid);
+      return 1;
+    }
+    g->end = record;
+  } else if (r->phase == PEAK_MPI_CAUSAL_CALL_BEGIN ||
+             r->phase == PEAK_MPI_CAUSAL_CALL_END) {
+    BatchOperation *o = &b->operations[op];
+    BatchGroup *g = &b->groups[group];
+    if (!attach(b, op, group))
+      return 1;
+    if (r->phase == PEAK_MPI_CAUSAL_CALL_BEGIN) {
+      if (o->begin != NONE) {
+        invalid(b, rank, g->uid);
+        return 1;
+      }
+      o->begin = record;
+      append(b, &g->begin_head, &g->begin_tail, record);
+      g->begins++;
+      if (o->end != NONE)
+        g->pairs++;
+    } else {
+      if (o->end != NONE) {
+        invalid(b, rank, g->uid);
+        return 1;
+      }
+      o->end = record;
+      g->ends++;
+      if (o->begin != NONE)
+        g->pairs++;
+    }
+  } else {
+    BatchOperation *o = &b->operations[op];
+    if (r->phase == PEAK_MPI_CAUSAL_REQUEST_ACTIVATE) {
+      append(b, &o->activation_head, &o->activation_tail, record);
+      o->activation_count++;
+      if (group != NONE)
+        b->groups[group].activations++;
+    } else {
+      append(b, &o->sub_head, &o->sub_tail, record);
+      o->sub_count++;
+      if (group != NONE)
+        b->groups[group].subrecords++;
+    }
+  }
+  if (group != NONE)
+    maybe_ready(b, group);
   return 1;
 }
 static void view(const PeakMpiCausalBatches *b, PeakMpiCausalBatchView *v) {
   if (!v)
     return;
   memset(v, 0, sizeof(*v));
-  v->rank = b->rank;
-  v->group_uid = b->uid;
-  v->native_count = b->nb;
-  v->record_count = 2 + b->nb + b->ne + b->na + b->ns;
-  v->concurrent = b->nb > 1;
-  v->begin = &b->entries[b->begin].r;
-  v->end = b->end == NONE ? NULL : &b->entries[b->end].r;
+  if (b->state == ERROR) {
+    v->rank = b->error_rank;
+    v->group_uid = b->error_uid;
+    return;
+  }
+  const BatchGroup *g = &b->groups[b->current];
+  v->rank = g->rank;
+  v->group_uid = g->uid;
+  v->native_count = g->begins;
+  v->record_count = b->plan_count;
+  v->concurrent = g->begins > 1;
+  v->begin = &b->entries[g->begin].r;
+  v->end = &b->entries[g->end].r;
 }
-static void incomplete(PeakMpiCausalBatches *b) {
-  b->entries[b->begin].attempted = b->attempt_version;
-  b->state = FIND;
-  b->scan = 0;
-  b->scan_limit = b->pending;
+static void free_record(PeakMpiCausalBatches *b, size_t index) {
+  BatchEntry *e = &b->entries[index];
+  if (b->slots) {
+    size_t at = (size_t)e->rank * b->slots + e->r.thread_uid - 1;
+    if (e->slot_previous == NONE)
+      b->slot_head[at] = e->slot_next;
+    else
+      b->entries[e->slot_previous].slot_next = e->slot_next;
+    if (e->slot_next == NONE)
+      b->slot_tail[at] = e->slot_previous;
+    else
+      b->entries[e->slot_next].slot_previous = e->slot_previous;
+  }
+  b->pending--;
+  b->active[e->position] = b->active[b->pending];
+  b->entries[b->active[e->position]].position = e->position;
+  e->free_next = b->free_entry;
+  b->free_entry = index;
+  b->retire_epoch = (b->retire_epoch + 1) % (SIZE_MAX / (b->capacity + 1));
+}
+/* The common four-record shape already has direct immutable references.
+ * Avoid walking empty phase lists and copying those same references into a
+ * second plan. Generic/concurrent groups still use the materialized plan. */
+static size_t record_index_at(const PeakMpiCausalBatches *b, size_t index) {
+  if (!b->compact_plan)
+    return b->plan[index];
+  const BatchGroup *g = &b->groups[b->current];
+  const BatchOperation *o = &b->operations[g->operation_head];
+  switch (index) {
+  case 0:
+    return g->begin;
+  case 1:
+    return o->begin;
+  case 2:
+    return o->end;
+  default:
+    return g->end;
+  }
+}
+int peak_mpi_causal_batches_prepare_next_work(PeakMpiCausalBatches *b,
+                                              size_t budget,
+                                              PeakMpiCausalBatchView *v,
+                                              size_t *work_used) {
+  size_t used = 0;
+  if (work_used)
+    *work_used = 0;
+  if (!b)
+    return -1;
+  if (b->state == READY || b->state == ERROR) {
+    view(b, v);
+    return b->state == READY ? 1 : -1;
+  }
+  while (used < budget) {
+    used++;
+    if (b->state == IDLE) {
+      if (b->ready_head == NONE)
+        break;
+      b->current = b->ready_head;
+      BatchGroup *g = &b->groups[b->current];
+      b->ready_head = g->ready_next;
+      if (b->ready_head == NONE)
+        b->ready_tail = NONE;
+      g->queued = 0;
+      g->exposed = 1;
+      b->compact_plan = g->begins == 1 && !g->activations && !g->subrecords;
+      if (b->compact_plan) {
+        b->plan_count = 4;
+        b->state = READY;
+        view(b, v);
+        if (work_used)
+          *work_used = used;
+        return 1;
+      }
+      b->plan_count = 1;
+      b->plan[0] = g->begin;
+      b->cursor = g->begin_head;
+      b->state = BUILD_BEGIN;
+    } else if (b->state == BUILD_BEGIN) {
+      if (b->cursor == NONE) {
+        b->parent_cursor = b->groups[b->current].begin_head;
+        b->cursor = NONE;
+        b->state = BUILD_ACTIVATIONS;
+      } else {
+        size_t at = b->cursor;
+        b->plan[b->plan_count++] = at;
+        b->cursor = b->entries[at].next;
+      }
+    } else if (b->state == BUILD_ACTIVATIONS || b->state == BUILD_SUBRECORDS) {
+      if (b->cursor != NONE) {
+        size_t at = b->cursor;
+        b->plan[b->plan_count++] = at;
+        b->cursor = b->entries[at].next;
+      } else if (b->parent_cursor != NONE) {
+        BatchEntry *parent = &b->entries[b->parent_cursor];
+        BatchOperation *o = &b->operations[parent->op];
+        b->cursor =
+            b->state == BUILD_ACTIVATIONS ? o->activation_head : o->sub_head;
+        b->parent_cursor = parent->next;
+      } else if (b->state == BUILD_ACTIVATIONS) {
+        b->parent_cursor = b->groups[b->current].begin_head;
+        b->state = BUILD_SUBRECORDS;
+      } else {
+        b->cursor = b->groups[b->current].begin_head;
+        b->state = BUILD_END;
+      }
+    } else if (b->state == BUILD_END) {
+      if (b->cursor == NONE)
+        b->state = BUILD_MARKER;
+      else {
+        BatchEntry *parent = &b->entries[b->cursor];
+        b->plan[b->plan_count++] = b->operations[parent->op].end;
+        b->cursor = parent->next;
+      }
+    } else if (b->state == BUILD_MARKER) {
+      b->plan[b->plan_count++] = b->groups[b->current].end;
+      b->state = READY;
+      view(b, v);
+      if (work_used)
+        *work_used = used;
+      return 1;
+    } else if (b->state == RETIRE_RECORDS) {
+      if (b->retire == b->plan_count)
+        b->state = RETIRE_OPERATIONS;
+      else
+        free_record(b, record_index_at(b, b->retire++));
+    } else if (b->state == RETIRE_OPERATIONS) {
+      if (b->retire_operation == NONE)
+        b->state = RETIRE_GROUP;
+      else {
+        size_t at = b->retire_operation;
+        b->retire_operation = b->operations[at].next_group;
+        operation_remove(b, at);
+      }
+    } else if (b->state == RETIRE_GROUP) {
+      BatchGroup *g = &b->groups[b->current];
+      unsigned rank = g->rank;
+      uint64_t uid = g->uid;
+      size_t next = g->successor;
+      b->last[rank] = uid;
+      b->rank_next[rank] = next;
+      group_remove(b, b->current);
+      b->current = NONE;
+      b->state = IDLE;
+      if (next != NONE)
+        maybe_ready(b, next);
+    }
+    if (b->state == ERROR) {
+      view(b, v);
+      if (work_used)
+        *work_used = used;
+      return -1;
+    }
+  }
+  if (work_used)
+    *work_used = used;
+  return 0;
 }
 int peak_mpi_causal_batches_prepare_next(PeakMpiCausalBatches *b, size_t budget,
                                          PeakMpiCausalBatchView *v) {
-  if (!b)
-    return -1;
-  if (b->state == READY) {
-    view(b, v);
-    return 1;
-  }
-  if (b->state == ERROR) {
-    view(b, v);
-    return -1;
-  }
-  while (budget) {
-    Entry *e;
-    const PeakMpiObserverRecord *r;
-    size_t i;
-    if (b->state == FIND) {
-      if (!b->scan)
-        b->scan_limit = b->pending;
-      if (b->scan == b->scan_limit) {
-        budget--;
-        b->scan = 0;
-        return 0;
-      }
-      if (b->find_cursor >= b->scan_limit)
-        b->find_cursor = 0;
-      i = b->active[b->find_cursor];
-      b->find_cursor = (b->find_cursor + 1) % b->scan_limit;
-      b->scan++;
-      budget--;
-      e = &b->entries[i];
-      r = &e->r;
-      if (!e->used || r->phase != PEAK_MPI_CAUSAL_GROUP_BEGIN ||
-          r->input_ref != b->last[e->rank] || e->attempted == b->version)
-        continue;
-      b->rank = e->rank;
-      b->uid = r->op_uid;
-      b->begin = i;
-      b->end = NONE;
-      b->nb = b->ne = b->na = b->ns = 0;
-      b->native = 0;
-      b->scan = 0;
-      b->attempt_version = b->version;
-      b->scan_limit = b->pending;
-      b->state = GATHER;
-      continue;
-    }
-    if (b->state == GATHER) {
-      if (b->scan == b->scan_limit) {
-        budget--;
-        if (b->end == NONE || !b->nb ||
-            b->entries[b->end].r.completion_count != b->nb) {
-          incomplete(b);
-          continue;
-        }
-        b->state = VALIDATE;
-        b->scan = 0;
-        b->pair_count = b->duplicate_count = 0;
-        b->end_match = NONE;
-        continue;
-      }
-      i = b->active[b->scan++];
-      budget--;
-      e = &b->entries[i];
-      r = &e->r;
-      if (!e->used || e->rank != b->rank)
-        continue;
-      if (r->phase == PEAK_MPI_CAUSAL_GROUP_END && r->op_uid == b->uid) {
-        if (b->end != NONE) {
-          b->state = ERROR;
-          view(b, v);
-          return -1;
-        }
-        b->end = i;
-      }
-      if (r->phase == PEAK_MPI_CAUSAL_GROUP_BEGIN && r->op_uid == b->uid &&
-          i != b->begin) {
-        b->state = ERROR;
-        view(b, v);
-        return -1;
-      }
-      if (r->phase == PEAK_MPI_CAUSAL_CALL_BEGIN && r->batch_uid == b->uid)
-        b->begins[b->nb++] = i;
-      continue;
-    }
-    if (b->state == VALIDATE) {
-      const PeakMpiObserverRecord *start = &b->entries[b->begins[b->native]].r;
-      if (b->scan == b->scan_limit) {
-        budget--;
-        if (b->pair_count > 1) {
-          b->state = ERROR;
-          view(b, v);
-          return -1;
-        }
-        if (b->pair_count != 1) {
-          incomplete(b);
-          continue;
-        }
-        if (b->duplicate_count != 1) {
-          b->state = ERROR;
-          view(b, v);
-          return -1;
-        }
-        b->ends[b->ne++] = b->end_match;
-        b->native++;
-        b->scan = 0;
-        b->pair_count = b->duplicate_count = 0;
-        b->end_match = NONE;
-        if (b->native == b->nb) {
-          b->state = READY;
-          view(b, v);
-          return 1;
-        }
-        continue;
-      }
-      i = b->active[b->scan++];
-      budget--;
-      e = &b->entries[i];
-      r = &e->r;
-      if (!e->used || e->rank != b->rank)
-        continue;
-      if (r->phase == PEAK_MPI_CAUSAL_CALL_BEGIN && r->op_uid == start->op_uid)
-        b->duplicate_count++;
-      if (r->phase == PEAK_MPI_CAUSAL_CALL_END && r->op_uid == start->op_uid &&
-          r->batch_uid == b->uid) {
-        b->pair_count++;
-        b->end_match = i;
-      }
-      if (r->batch_uid == start->op_uid) {
-        if (r->phase == PEAK_MPI_CAUSAL_REQUEST_ACTIVATE)
-          b->activations[b->na++] = i;
-        else if (r->phase == PEAK_MPI_CAUSAL_REQUEST_COMPLETE ||
-                 r->phase == PEAK_MPI_CAUSAL_REQUEST_RETIRED ||
-                 r->phase == PEAK_MPI_CAUSAL_MESSAGE_BOUND)
-          b->subrecords[b->ns++] = i;
-      }
-      continue;
-    }
-    if (b->state == RETIRE) {
-      size_t n = 2 + b->nb + b->ne + b->na + b->ns;
-      if (b->retire == n) {
-        budget--;
-        b->last[b->rank] = b->uid;
-        b->state = FIND;
-        b->scan = 0;
-        b->find_cursor = 0;
-        b->scan_limit = b->pending;
-        continue;
-      }
-      i = b->retire++;
-      if (!i)
-        i = b->begin;
-      else if (--i < b->nb)
-        i = b->begins[i];
-      else if ((i -= b->nb) < b->na)
-        i = b->activations[i];
-      else if ((i -= b->na) < b->ns)
-        i = b->subrecords[i];
-      else if ((i -= b->ns) < b->ne)
-        i = b->ends[i];
-      else
-        i = b->end;
-      budget--;
-      e = &b->entries[i];
-      e->used = 0;
-      e->next_free = b->free_head;
-      b->free_head = i;
-      b->pending--;
-      b->active[e->position] = b->active[b->pending];
-      b->entries[b->active[e->position]].position = e->position;
-      b->retire_epoch = (b->retire_epoch + 1) % (SIZE_MAX / (b->capacity + 1));
-      b->version++;
-      continue;
-    }
-  }
-  return 0;
+  return peak_mpi_causal_batches_prepare_next_work(b, budget, v, NULL);
 }
 const PeakMpiObserverRecord *
-peak_mpi_causal_batches_record_at(const PeakMpiCausalBatches *b, size_t i) {
-  size_t slot;
-  if (!b || b->state != READY)
+peak_mpi_causal_batches_record_at(const PeakMpiCausalBatches *b, size_t index) {
+  return b && b->state == READY && index < b->plan_count
+             ? &b->entries[record_index_at(b, index)].r
+             : NULL;
+}
+const PeakMpiObserverRecord *
+peak_mpi_causal_batches_call_end(const PeakMpiCausalBatches *b, unsigned rank,
+                                 uint64_t uid) {
+  if (!b || b->state != READY || rank >= b->world)
     return NULL;
-  if (!i)
-    slot = b->begin;
-  else if (--i < b->nb)
-    slot = b->begins[i];
-  else if ((i -= b->nb) < b->na)
-    slot = b->activations[i];
-  else if ((i -= b->na) < b->ns)
-    slot = b->subrecords[i];
-  else if ((i -= b->ns) < b->ne)
-    slot = b->ends[i];
-  else if (i == b->ne)
-    slot = b->end;
-  else
-    return NULL;
-  return &b->entries[slot].r;
+  size_t h = hash(rank, uid);
+  for (size_t i = 0; i < PROBES; i++) {
+    size_t v = b->operation_index[(h + i) & (b->operation_index_capacity - 1)];
+    if (!v)
+      return NULL;
+    if (v != TOMBSTONE) {
+      const BatchOperation *o = &b->operations[v - 1];
+      if (o->rank == rank && o->uid == uid)
+        return o->group == b->current && o->end != NONE ? &b->entries[o->end].r
+                                                        : NULL;
+    }
+  }
+  return NULL;
 }
 void peak_mpi_causal_batches_commit(PeakMpiCausalBatches *b) {
   if (b && b->state == READY) {
-    b->state = RETIRE;
+    b->state = RETIRE_RECORDS;
     b->retire = 0;
+    b->retire_operation = b->groups[b->current].operation_head;
   }
 }
 size_t peak_mpi_causal_batches_pending(const PeakMpiCausalBatches *b) {
   return b ? b->pending : 0;
+}
+uint64_t peak_mpi_causal_batches_last_group(const PeakMpiCausalBatches *b,
+                                            unsigned rank) {
+  return b && rank < b->world ? b->last[rank] : 0;
 }
 int peak_mpi_causal_batches_prefix_clear(const PeakMpiCausalBatches *b,
                                          unsigned rank,
@@ -314,12 +654,30 @@ int peak_mpi_causal_batches_prefix_clear(const PeakMpiCausalBatches *b,
                                          size_t *cursor, size_t *budget) {
   if (!b || !prefixes || !cursor || !budget || rank >= b->world)
     return 0;
-  /* Cursor carries the retirement epoch: swap-removal invalidates an older
-   * partial scan, while append-only ingestion cannot hide an old prefix. */
-  size_t base = b->capacity + 1, pos;
-  pos = *cursor / base == b->retire_epoch ? *cursor % base : 0;
+  if (b->slots) {
+    if (slots != b->slots)
+      return 0;
+    while (*cursor < slots && *budget) {
+      size_t slot = (*cursor)++;
+      size_t head = b->slot_head[(size_t)rank * slots + slot];
+      (*budget)--;
+      if (head != NONE && b->entries[head].r.sequence <= prefixes[slot]) {
+        *cursor = 0;
+        return 0;
+      }
+    }
+    if (*cursor == slots) {
+      *cursor = 0;
+      return 1;
+    }
+    return -1;
+  }
+  /* Compatibility for independent callers without a configured slot count.
+   * Production uses the per-slot oldest-pending index above. */
+  size_t base = b->capacity + 1;
+  size_t pos = *cursor / base == b->retire_epoch ? *cursor % base : 0;
   while (pos < b->pending && *budget) {
-    const Entry *e = &b->entries[b->active[pos++]];
+    const BatchEntry *e = &b->entries[b->active[pos++]];
     (*budget)--;
     if (e->rank == rank && (!e->r.thread_uid || e->r.thread_uid > slots ||
                             e->r.sequence <= prefixes[e->r.thread_uid - 1])) {
@@ -333,9 +691,4 @@ int peak_mpi_causal_batches_prefix_clear(const PeakMpiCausalBatches *b,
   }
   *cursor = b->retire_epoch * base + pos;
   return -1;
-}
-
-uint64_t peak_mpi_causal_batches_last_group(const PeakMpiCausalBatches *b,
-                                            unsigned rank) {
-  return b && rank < b->world ? b->last[rank] : 0;
 }

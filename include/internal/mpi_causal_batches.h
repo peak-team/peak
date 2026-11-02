@@ -14,17 +14,34 @@ typedef struct {
  * All storage allocated at create; capacity full returns backpressure. */
 PeakMpiCausalBatches *peak_mpi_causal_batches_create(size_t world,
                                                      size_t capacity);
+/* Configured producer slots enable O(slots) oldest-pending prefix queries. */
+PeakMpiCausalBatches *
+peak_mpi_causal_batches_create_with_slots(size_t world, size_t slots,
+                                          size_t capacity);
 void peak_mpi_causal_batches_destroy(PeakMpiCausalBatches *);
 int peak_mpi_causal_batches_ingest(PeakMpiCausalBatches *, unsigned rank,
                                    const PeakMpiObserverRecord *);
-/* Every inspected slot/comparison and retirement uses one work unit.
+/* Every plan-list and retirement transition uses one work unit; metadata
+ * index operations have a fixed 64-probe bound.
  * 1: coherent plan ready, 0: incomplete/work exhausted, -1: invalid group.
  * Plan remains immutable until commit; errors remain visible until destroy. */
 int peak_mpi_causal_batches_prepare_next(PeakMpiCausalBatches *,
                                          size_t work_budget,
                                          PeakMpiCausalBatchView *);
+/* Reports every build/retirement transition actually consumed. A ready view
+ * is immutable and returns with used=0 until commit. */
+int peak_mpi_causal_batches_prepare_next_work(PeakMpiCausalBatches *,
+                                              size_t work_budget,
+                                              PeakMpiCausalBatchView *,
+                                              size_t *work_used);
 const PeakMpiObserverRecord *
 peak_mpi_causal_batches_record_at(const PeakMpiCausalBatches *, size_t index);
+/* Native END metadata is already immutable when a closed plan is READY.
+ * This bounded lookup does not advance cost or alter phase ordering. */
+const PeakMpiObserverRecord *
+peak_mpi_causal_batches_call_end(const PeakMpiCausalBatches *, unsigned rank,
+                                 uint64_t op_uid);
+/* O(1): starts group-owned retirement; the next prepare call pays its work. */
 void peak_mpi_causal_batches_commit(PeakMpiCausalBatches *);
 size_t peak_mpi_causal_batches_pending(const PeakMpiCausalBatches *);
 uint64_t peak_mpi_causal_batches_last_group(const PeakMpiCausalBatches *,

@@ -81,6 +81,7 @@ if(MPI_FOUND)
         mpi_causal_events.c
         mpi_progress_contract.c
         mpi_causal_batches.c
+        mpi_causal_match_index.c
         mpi_causal_backend.c
         mpi_causal_transport.c
         mpi_observer.c
