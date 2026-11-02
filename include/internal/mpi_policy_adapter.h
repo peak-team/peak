@@ -100,6 +100,8 @@ typedef struct {
      * partial diagnostic unless its complete flag is set. risk/U_tail/T_safe
      * must likewise be gated by validity flags; zero-filled unknown payload
      * fields never establish zero cost. */
+    /* Age includes both covered events and usable stable pressure observations;
+     * fresh mixed cuts alone cannot keep feedback usable indefinitely. */
     double received_raw_sum, age_seconds, oldest_unresolved_age;
     uint64_t lost_events;
     /* Fine coverage means one complete prefix/frontier/backlog cut. Coarse

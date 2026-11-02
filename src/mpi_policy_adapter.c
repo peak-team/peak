@@ -23,6 +23,8 @@ struct PeakMpiPolicy {
     PeakMpiPolicyReason reason;
     double g, F, created_at, last_now, cut_received_at, cut_age;
     double oldest_unresolved_age, baseline_F, baseline_at;
+    /* Coverage may remain fresh while mixed cuts provide no usable pressure. */
+    double pressure_received_at, pressure_age;
     uint64_t revision, last_input_generation, last_cut_id, policy_generation;
     uint64_t lost_events, seen;
     int active, membership_complete, have_input_generation, have_cut;
@@ -133,8 +135,13 @@ static int apply_raw(Member *m, const PeakMpiPolicySample *s, double now) {
     if (m->have_raw && s->generation <= m->raw.generation) return 0;
     m->raw = *s; m->raw_received_at = now; m->have_raw = 1; return 1;
 }
+static double pressure_age(const PeakMpiPolicy *p, double now) {
+    return p->active && p->mode != PEAK_MPI_POLICY_COARSE ?
+        age_add(p->pressure_age, now-p->pressure_received_at) : 0;
+}
 static double coverage_age(const PeakMpiPolicy *p, double now) {
     double age = p->have_cut ? age_add(p->cut_age, now-p->cut_received_at) : now-p->created_at;
+    age = maximum(age, pressure_age(p, now));
     if (!p->have_cut) return age;
     for (size_t i=0; i<p->count; ++i) {
         const Member *m = &p->members[i];
@@ -171,7 +178,7 @@ PeakMpiPolicy *peak_mpi_policy_create(const PeakMpiPolicyConfig *c,
     p->membership_complete = !!membership_complete;
     p->mode = p->active ? PEAK_MPI_POLICY_COMPLETE : PEAK_MPI_POLICY_LOCAL;
     p->g = c->initial_multiplier ? c->initial_multiplier : 1;
-    p->created_at = p->last_now = now; p->revision = 1;
+    p->created_at = p->last_now = p->pressure_received_at = now; p->revision = 1;
     p->policy_generation = c->policy_generation;
     for (size_t i=0; i<count; ++i) {
         if (find_member(p, ids[i]) != SIZE_MAX) { peak_mpi_policy_free(p); return NULL; }
@@ -250,9 +257,12 @@ PeakMpiPolicyResult peak_mpi_policy_submit_cut(PeakMpiPolicy *p,
     }
     /* Retain a valid local cut's actual history without inventing an actual
      * communication edge or activating global policy. */
-    if (p->mode == PEAK_MPI_POLICY_STALE) {
+    if (p->mode == PEAK_MPI_POLICY_STALE && !mixed && !policy_change) {
         p->mode = PEAK_MPI_POLICY_COMPLETE; p->reason = PEAK_MPI_POLICY_NO_REASON;
         p->baseline_valid = 0;
+    }
+    if (!mixed && !policy_change) {
+        p->pressure_received_at = now; p->pressure_age = age;
     }
     if (!p->active) p->baseline_valid = 0;
     else if (p->mode != PEAK_MPI_POLICY_COARSE) {
@@ -334,7 +344,7 @@ PeakMpiPolicyResult peak_mpi_policy_merge(PeakMpiPolicy *p, const PeakMpiPolicy 
     } else if (p->mode == PEAK_MPI_POLICY_STALE || s->mode == PEAK_MPI_POLICY_STALE) make_stale(p);
     else p->mode = PEAK_MPI_POLICY_COMPLETE;
     p->have_cut = p->baseline_valid = p->have_input_generation = 0;
-    p->created_at = now;
+    p->created_at = p->pressure_received_at = now; p->pressure_age = 0;
     return bump(p) ? PEAK_MPI_POLICY_OK : PEAK_MPI_POLICY_CAPACITY;
 }
 PeakMpiPolicyResult peak_mpi_policy_mark_coarse(PeakMpiPolicy *p,
@@ -380,6 +390,7 @@ static PeakMpiPolicyResult feedback_common(PeakMpiPolicy *p, double now,
     f->received_raw_complete = p->membership_complete;
     f->tails_complete = f->coverage_complete;
     f->age_seconds = p->have_cut ? age_add(p->cut_age, now-p->cut_received_at) : now-p->created_at;
+    f->age_seconds = maximum(f->age_seconds, pressure_age(p, now));
     f->T_safe = INFINITY;
     double coarse_sum = 0;
     for (size_t i=0; i<p->count; ++i) {
