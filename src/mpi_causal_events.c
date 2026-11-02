@@ -676,78 +676,82 @@ static int public_string(MPI_T_cvar_handle handle, MPI_Datatype datatype,
   memcpy(out, storage, (size_t)(end - storage) + 1);
   return 1;
 }
+/* Read a required public control by name. Unrelated inventory entries are
+ * deliberately outside the capability predicate. 0 means absent; -1 means
+ * the named control was found but its metadata/value could not be verified. */
+static int public_control(const char *requested, char *text, size_t capacity,
+                          int *value) {
+  int index = -1;
+  if (MPI_T_cvar_get_index(requested, &index) != MPI_SUCCESS)
+    return 0;
+  char name[192];
+  int length = (int)sizeof(name), verbosity = 0, description_length = 0,
+      binding = 0, scope = 0;
+  MPI_Datatype datatype;
+  MPI_T_enum enumeration;
+  if (MPI_T_cvar_get_info(index, name, &length, &verbosity, &datatype,
+                          &enumeration, NULL, &description_length, &binding,
+                          &scope) != MPI_SUCCESS ||
+      binding != MPI_T_BIND_NO_OBJECT)
+    return -1;
+  MPI_T_cvar_handle handle;
+  int count = 0;
+  if (MPI_T_cvar_handle_alloc(index, NULL, &handle, &count) != MPI_SUCCESS)
+    return -1;
+  int okay = value ? public_scalar(handle, datatype, count, value)
+                   : public_string(handle, datatype, count, text, capacity);
+  if (MPI_T_cvar_handle_free(&handle) != MPI_SUCCESS)
+    okay = 0;
+  return okay ? 1 : -1;
+}
 static void public_verification(PeakMpiProgressVerification *result) {
+  const char *profile = getenv("PEAK_MPI_PROGRESS_PROFILE");
+  int intel =
+      profile && !strcmp(profile, "intel-2021.11-ofi-opx-host-async-v1");
+  int ompi = profile &&
+             !strcmp(profile, "ompi-5.0.5-ucx-1.17-rc-proto2-host-observed-v1");
+  if (!intel && !ompi)
+    return;
   int tools_provided = 0;
   if (MPI_T_init_thread(MPI_THREAD_SINGLE, &tools_provided) != MPI_SUCCESS)
     return;
-  int number = 0, valid = 1, async_found = 0, async = -1;
-  if (MPI_T_cvar_get_num(&number) != MPI_SUCCESS || number < 0 ||
-      number > 16384)
-    valid = 0;
-  for (int index = 0; valid && index < number; ++index) {
-    char name[192];
-    int length = (int)sizeof(name), verbosity = 0, description_length = 0,
-        binding = 0, scope = 0;
-    MPI_Datatype datatype;
-    MPI_T_enum enumeration;
-    if (MPI_T_cvar_get_info(index, name, &length, &verbosity, &datatype,
-                            &enumeration, NULL, &description_length, &binding,
-                            &scope) != MPI_SUCCESS) {
-      valid = 0;
-      break;
-    }
-    name[sizeof(name) - 1] = 0;
-    int is_async = !strcmp(name, "MPIR_CVAR_ASYNC_PROGRESS") ||
-                   !strcmp(name, "I_MPI_ASYNC_PROGRESS");
-    int is_pml = !strcmp(name, "pml"), is_coll = !strcmp(name, "coll"),
-        is_dynamic = !strcmp(name, "coll_tuned_use_dynamic_rules");
-    if (!is_async && !is_pml && !is_coll && !is_dynamic)
-      continue;
-    if (binding != MPI_T_BIND_NO_OBJECT) {
-      valid = 0;
-      break;
-    }
-    MPI_T_cvar_handle handle;
-    int count = 0;
-    if (MPI_T_cvar_handle_alloc(index, NULL, &handle, &count) != MPI_SUCCESS) {
-      valid = 0;
-      break;
-    }
-    int value = -1, okay = 1;
-    if (is_pml)
-      okay = public_string(handle, datatype, count, result->pml,
-                           sizeof(result->pml));
-    else if (is_coll)
-      okay = public_string(handle, datatype, count, result->coll,
-                           sizeof(result->coll));
-    else
-      okay = public_scalar(handle, datatype, count, &value);
-    if (MPI_T_cvar_handle_free(&handle) != MPI_SUCCESS)
-      okay = 0;
-    if (!okay) {
-      valid = 0;
-      break;
-    }
-    if (is_async) {
-      if (async_found && async != value) {
+  int valid = 1;
+  if (ompi) {
+    int dynamic = -1;
+    result->pml_verified =
+        public_control("pml", result->pml, sizeof(result->pml), NULL) == 1;
+    result->coll_verified =
+        public_control("coll", result->coll, sizeof(result->coll), NULL) == 1;
+    result->fixed_rules_verified =
+        public_control("coll_tuned_use_dynamic_rules", NULL, 0, &dynamic) ==
+            1 &&
+        dynamic == 0;
+    valid = result->pml_verified && result->coll_verified &&
+            result->fixed_rules_verified;
+  } else {
+    const char *names[] = {"MPIR_CVAR_ASYNC_PROGRESS", "I_MPI_ASYNC_PROGRESS"};
+    int found = 0, async = -1;
+    for (unsigned i = 0; i < sizeof(names) / sizeof(*names); ++i) {
+      int value = -1, status = public_control(names[i], NULL, 0, &value);
+      if (status < 0) {
         valid = 0;
         break;
       }
-      async = value;
-      async_found = 1;
+      if (status == 1) {
+        if (found && async != value) {
+          valid = 0;
+          break;
+        }
+        found = 1;
+        async = value;
+      }
     }
-    if (is_pml)
-      result->pml_verified = 1;
-    if (is_coll)
-      result->coll_verified = 1;
-    if (is_dynamic)
-      result->fixed_rules_verified = value == 0;
+    valid = valid && found;
+    result->effective_async_progress = valid ? async : -1;
   }
   if (MPI_T_finalize() != MPI_SUCCESS)
     valid = 0;
-  if (valid) {
-    result->effective_async_progress = async_found ? async : -1;
-  } else {
+  if (!valid) {
     result->effective_async_progress = -1;
     result->pml_verified = result->coll_verified =
         result->fixed_rules_verified = 0;
