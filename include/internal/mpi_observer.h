@@ -174,6 +174,9 @@ bool peak_mpi_observer_cost_snapshot(PeakMpiObserver *observer,
  * Variable definitions use bounded numbered parts, never hot-path allocation. */
 PeakMpiObserverStatus peak_mpi_observer_object_add(PeakMpiObserver *observer,
     const PeakMpiObserverObject *definition, uint64_t *uid);
+/* Acquire-loaded count of complete immutable definitions in the append-only
+ * slab. Zero for NULL; each UID through this prefix is published and readable. */
+size_t peak_mpi_observer_object_count(const PeakMpiObserver *observer);
 const PeakMpiObserverObject *peak_mpi_observer_object_get(
     const PeakMpiObserver *observer, uint64_t uid);
 

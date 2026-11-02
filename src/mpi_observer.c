@@ -322,6 +322,10 @@ PeakMpiObserverStatus peak_mpi_observer_object_add(PeakMpiObserver *o,
     return PEAK_MPI_OBSERVER_OK;
 }
 
+size_t peak_mpi_observer_object_count(const PeakMpiObserver *o) {
+    return o ? atomic_load_explicit(&o->object_count, memory_order_acquire) : 0;
+}
+
 const PeakMpiObserverObject *peak_mpi_observer_object_get(const PeakMpiObserver *o,
                                                          uint64_t uid) {
     if (!o || !uid || uid > atomic_load_explicit(&o->object_count, memory_order_acquire))

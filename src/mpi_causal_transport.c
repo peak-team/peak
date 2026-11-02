@@ -28,8 +28,8 @@ struct PeakMpiCausalTransport {
   size_t cap, stride, head, count, send_index, send_at, slot;
   unsigned char *queue, *raw_peers, *decode_peers;
   size_t *lengths;
-  uint64_t next_seq, requested_nonce, *accepted, *incarnations, *raw_prefixes,
-      *decode_prefixes, *capture_remaining;
+  uint64_t next_object_uid, next_seq, requested_nonce, *accepted, *incarnations,
+      *raw_prefixes, *decode_prefixes, *capture_remaining;
   Peer *peers;
   size_t peer_n, peer_cursor;
   PeakMpiCausalRaw raw;
@@ -531,6 +531,27 @@ static void capture(PeakMpiCausalTransport *t, PeakMpiObserver *o,
                                   ? state.published - state.consumed
                                   : 0;
   }
+  /* Definitions live in an independent append-only slab. Runtime object
+   * creation does not consume a producer-ring record. Freeze producer heads
+   * first: every definition referenced by this batch was published before
+   * those heads, so it can be delivered before any dependent event. */
+  size_t object_limit = peak_mpi_observer_object_count(o);
+  if (!t->next_object_uid)
+    t->next_object_uid = 1;
+  while (t->next_object_uid <= object_limit) {
+    const PeakMpiObserverObject *definition =
+        peak_mpi_observer_object_get(o, t->next_object_uid);
+    if (*budget < 256 || (!local && t->count == t->c.queue_frames))
+      return;
+    int accepted = local ? (!t->sink.object ||
+                            t->sink.object(t->sink.context, t->c.rank,
+                                           t->c.incarnation, definition))
+                         : enqueue(t, OBJECT, definition);
+    if (!accepted)
+      return;
+    t->next_object_uid++;
+    *budget -= 256;
+  }
   while (*budget >= 256 && (t->held || empty < t->c.slots)) {
     const PeakMpiObserverObject *obj;
     int ok;
@@ -548,6 +569,9 @@ static void capture(PeakMpiCausalTransport *t, PeakMpiObserver *o,
       t->held = 1;
       t->object_done = 0;
     }
+    if (t->record.kind == PEAK_MPI_OBSERVER_EVENT_OBJECT &&
+        t->record.op_uid < t->next_object_uid)
+      t->object_done = 1;
     if (t->record.kind == PEAK_MPI_OBSERVER_EVENT_OBJECT && !t->object_done) {
       obj = peak_mpi_observer_object_get(o, t->record.op_uid);
       if (!obj) {
