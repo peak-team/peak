@@ -123,7 +123,7 @@ static void make_stale(PeakMpiPolicy *p) {
         maximum(p->g, (double)(p->count_hint ? p->count_hint : 1));
     p->baseline_valid = 0;
 }
-static int raw_compatible(const Member *m, const PeakMpiPolicySample *s) {
+static int raw_stream_compatible(const Member *m, const PeakMpiPolicySample *s) {
     if (!m->have_raw) return 1;
     if (s->generation == m->raw.generation) return raw_equal(s, &m->raw);
     if (s->generation > m->raw.generation) return follows(s, &m->raw);
@@ -138,7 +138,7 @@ static double coverage_age(const PeakMpiPolicy *p, double now) {
     if (!p->have_cut) return age;
     for (size_t i=0; i<p->count; ++i) {
         const Member *m = &p->members[i];
-        if (m->have_raw && m->have_covered) {
+        if (m->have_raw && m->have_covered && m->raw.elapsed > m->covered.elapsed) {
             double member_age = age_add(m->raw.age_seconds, now-m->raw_received_at);
             member_age = age_add(member_age, m->raw.elapsed-m->covered.elapsed);
             age = maximum(age, member_age);
@@ -193,7 +193,7 @@ PeakMpiPolicyResult peak_mpi_policy_record_raw(PeakMpiPolicy *p,
     if (index == SIZE_MAX) return bad_cut(p, PEAK_MPI_POLICY_BAD_IDENTITY);
     Member *m = &p->members[index];
     if (m->have_raw && s->generation < m->raw.generation) return PEAK_MPI_POLICY_IGNORED;
-    if (!sample_valid(s) || !raw_compatible(m, s)) return bad_cut(p, PEAK_MPI_POLICY_BAD_CUT);
+    if (!sample_valid(s) || !raw_stream_compatible(m, s)) return bad_cut(p, PEAK_MPI_POLICY_BAD_CUT);
     if (!apply_raw(m, s, now)) return PEAK_MPI_POLICY_IGNORED;
     return bump(p) ? PEAK_MPI_POLICY_OK : PEAK_MPI_POLICY_CAPACITY;
 }
@@ -228,7 +228,7 @@ PeakMpiPolicyResult peak_mpi_policy_submit_cut(PeakMpiPolicy *p,
         size_t index = find_member(p, s->member);
         if (index == SIZE_MAX) return bad_cut(p, PEAK_MPI_POLICY_BAD_IDENTITY);
         Member *m = &p->members[index];
-        if (m->seen == p->seen || !sample_valid(s) || !raw_compatible(m, s) ||
+        if (m->seen == p->seen || !sample_valid(s) ||
             (m->have_covered && !follows(s, &m->covered)))
             return bad_cut(p, PEAK_MPI_POLICY_BAD_CUT);
         m->seen = p->seen; p->scratch[i] = index;
@@ -237,8 +237,6 @@ PeakMpiPolicyResult peak_mpi_policy_submit_cut(PeakMpiPolicy *p,
         if (p->baseline_valid && s->control_generation != m->baseline_control_generation)
             mixed = 1;
     }
-    for (size_t i=0; i<c->sample_count; ++i)
-        (void)apply_raw(&p->members[p->scratch[i]], &c->samples[i], now);
     p->last_input_generation = c->generation; p->have_input_generation = 1;
     int policy_change = c->policy_generation != p->policy_generation;
     p->policy_generation = c->policy_generation;
@@ -250,15 +248,14 @@ PeakMpiPolicyResult peak_mpi_policy_submit_cut(PeakMpiPolicy *p,
         make_stale(p); p->baseline_valid = 0;
         return bump(p) ? PEAK_MPI_POLICY_OK : PEAK_MPI_POLICY_CAPACITY;
     }
-    if (!p->active) {
-        /* Submitting a cut cannot invent an actual communication edge. */
-        return bump(p) ? PEAK_MPI_POLICY_OK : PEAK_MPI_POLICY_CAPACITY;
-    }
+    /* Retain a valid local cut's actual history without inventing an actual
+     * communication edge or activating global policy. */
     if (p->mode == PEAK_MPI_POLICY_STALE) {
         p->mode = PEAK_MPI_POLICY_COMPLETE; p->reason = PEAK_MPI_POLICY_NO_REASON;
         p->baseline_valid = 0;
     }
-    if (p->mode != PEAK_MPI_POLICY_COARSE) {
+    if (!p->active) p->baseline_valid = 0;
+    else if (p->mode != PEAK_MPI_POLICY_COARSE) {
         if (mixed || policy_change) p->baseline_valid = 0;
         else if (!p->baseline_valid || now-p->baseline_at >= p->config.min_observation_seconds) {
             if (p->baseline_valid) {
@@ -392,16 +389,14 @@ PeakMpiPolicyResult peak_mpi_policy_feedback(PeakMpiPolicy *p,
     double coarse_sum = 0;
     for (size_t i=0; i<p->count; ++i) {
         const Member *m = &p->members[i];
-        if (m->have_raw) f->received_raw_sum += m->raw.L;
+        if (m->have_raw || m->have_covered)
+            f->received_raw_sum += maximum(m->have_raw ? m->raw.L : 0,
+                m->have_covered ? m->covered.L : 0);
         else f->received_raw_complete = f->tails_complete = 0;
         if (!m->have_covered) { f->risk_known = f->tails_complete = 0; continue; }
         coarse_sum += m->covered.L; f->T_safe = minimum(f->T_safe, m->covered.elapsed);
-        if (m->have_raw) {
-            double tail = m->raw.L-m->covered.L;
-            double raw_age = age_add(m->raw.age_seconds, now-m->raw_received_at);
-            if (tail < 0 || raw_age > 3*p->config.heartbeat_max_seconds) f->tails_complete = 0;
-            else f->U_tail += tail;
-        }
+        if (m->have_raw && m->raw.L > m->covered.L)
+            f->U_tail += m->raw.L-m->covered.L;
     }
     if (!isfinite(f->T_safe)) { f->T_safe = 0; f->risk_known = 0; }
     f->risk = p->mode == PEAK_MPI_POLICY_COARSE ? coarse_sum : p->F;
@@ -411,8 +406,7 @@ PeakMpiPolicyResult peak_mpi_policy_feedback(PeakMpiPolicy *p,
         f->L_cut = m->covered.L; f->P_cut = m->covered.P; f->D_cut = m->covered.D;
         f->local_elapsed_at_cut = m->covered.elapsed;
     }
-    if (m->have_raw) f->local_latest_L = m->raw.L;
-    else f->local_latest_L = f->L_cut;
+    f->local_latest_L = maximum(m->have_raw ? m->raw.L : 0, f->L_cut);
     if (!isfinite(f->received_raw_sum) || !isfinite(coarse_sum) || !isfinite(f->U_tail)) {
         coarse(p, PEAK_MPI_POLICY_RESOURCE_LIMIT); (void)bump(p);
         f->mode = p->mode; f->reason = p->reason; f->g = p->g; f->generation = p->revision;
@@ -475,7 +469,18 @@ PeakMpiPolicyResult peak_mpi_policy_receiver_rebind(PeakMpiPolicyReceiver *r,
     r->last_now = now; r->cohort = cohort; r->known_member_count = count;
     r->membership_complete = !!membership_complete; r->active = 1;
     r->have_feedback = r->feedback_invalid = 0; r->last_generation = 0; r->created_at = now;
+    r->membership_hint_pending = 0;
     if (r->permanent_coarse) r->conservative_g = maximum(r->conservative_g, (double)count);
+    return PEAK_MPI_POLICY_OK;
+}
+PeakMpiPolicyResult peak_mpi_policy_receiver_note_membership_hint(PeakMpiPolicyReceiver *r,
+    size_t count, double now) {
+    if (!r || !clock_valid(now, r->last_now) || !count) return PEAK_MPI_POLICY_INVALID;
+    r->last_now = now;
+    if (count <= r->known_member_count) return PEAK_MPI_POLICY_IGNORED;
+    r->membership_hint_pending |= r->have_feedback;
+    r->known_member_count = count; r->membership_complete = 0; r->active = 1;
+    r->conservative_g = maximum(r->conservative_g, (double)count);
     return PEAK_MPI_POLICY_OK;
 }
 PeakMpiPolicyResult peak_mpi_policy_receiver_accept(PeakMpiPolicyReceiver *r,
@@ -488,19 +493,32 @@ PeakMpiPolicyResult peak_mpi_policy_receiver_accept(PeakMpiPolicyReceiver *r,
     if (f->mode == PEAK_MPI_POLICY_LOCAL) return PEAK_MPI_POLICY_IGNORED;
     if (!feedback_valid(f) || f->q != r->config.q ||
         f->policy_generation < r->config.policy_generation ||
-        (r->have_feedback && (f->event_cut < r->feedback.event_cut ||
+        (r->have_history && (f->event_cut < r->feedback.event_cut ||
          f->L_cut < r->feedback.L_cut || f->P_cut < r->feedback.P_cut ||
+         f->local_latest_L < r->feedback.local_latest_L ||
          f->local_elapsed_at_cut < r->feedback.local_elapsed_at_cut ||
          f->control_generation < r->feedback.control_generation ||
-         f->policy_generation < r->feedback.policy_generation ||
-         (f->membership_complete && f->member_count < r->known_member_count) ||
-         (f->membership_complete && r->feedback.membership_complete &&
-          f->member_count != r->feedback.member_count)))) {
+         f->policy_generation < r->feedback.policy_generation))) {
+        r->active = r->feedback_invalid = 1;
+        return PEAK_MPI_POLICY_INVALID;
+    }
+    if (r->membership_hint_pending && f->membership_complete) {
+        /* Obsolete membership is not confirmation, but a validated sticky
+         * coarse signal must survive discovery of additional participants. */
+        if (f->mode == PEAK_MPI_POLICY_COARSE) {
+            r->permanent_coarse = 1;
+            if (!r->coarse_reason) r->coarse_reason = f->reason;
+        }
+        return PEAK_MPI_POLICY_IGNORED;
+    }
+    if (f->membership_complete && (f->member_count < r->known_member_count ||
+        (r->have_feedback && r->feedback.membership_complete &&
+         f->member_count != r->feedback.member_count))) {
         r->active = r->feedback_invalid = 1;
         return PEAK_MPI_POLICY_INVALID;
     }
     r->feedback = *f; r->last_generation = f->generation; r->received_at = now;
-    r->have_feedback = r->active = 1; r->feedback_invalid = 0;
+    r->have_history = r->have_feedback = r->active = 1; r->feedback_invalid = 0;
     if (r->known_member_count < f->member_count) r->known_member_count = f->member_count;
     r->membership_complete = !!f->membership_complete;
     if (f->mode == PEAK_MPI_POLICY_COARSE) {

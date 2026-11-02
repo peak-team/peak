@@ -97,7 +97,8 @@ PeakMpiObserver *peak_mpi_observer_create(const PeakMpiObserverConfig *c) {
     o->objects = calloc(c->object_capacity, sizeof(*o->objects));
     if (!o->slots || !o->records || !o->objects) goto fail;
     memset(o->slots, 0, c->slots * sizeof(*o->slots));
-    memset(o->records, 0, c->slots * c->records_per_slot * sizeof(*o->records));
+    /* Record storage is first touched by the producer's complete copy before
+     * release publication; inactive slots need no eager page initialization. */
     if (pthread_mutex_init(&o->object_mutex, NULL)) goto fail;
     if (pthread_mutex_init(&o->feedback_mutex, NULL)) {
         pthread_mutex_destroy(&o->object_mutex);

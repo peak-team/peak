@@ -116,8 +116,10 @@ typedef struct {
 PeakMpiObserver *peak_mpi_observer_create(const PeakMpiObserverConfig *config);
 void peak_mpi_observer_destroy(PeakMpiObserver *observer);
 
-/* Activation means actual interprocess communication was observed. It does not
- * open a connection or certify a native adapter. It cannot clear a fault. */
+/* Activation enables local recording, including state that precedes the first
+ * remote exchange. It neither proves remote communication/contract completeness
+ * nor opens a connection. Network/global policy use a separate actual-remote-
+ * communication gate. Activation cannot clear a fault. */
 void peak_mpi_observer_activate(PeakMpiObserver *observer);
 bool peak_mpi_observer_active(const PeakMpiObserver *observer);
 void peak_mpi_observer_fail(PeakMpiObserver *observer,

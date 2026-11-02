@@ -62,6 +62,9 @@ typedef struct {
 
 typedef struct {
     PeakMpiPolicyMemberId member;
+    /* generation belongs to this sample's stream. RAW heartbeat generations
+     * and covered GROUP generations are independent namespaces. Cut.generation
+     * deduplicates covered submissions; only record_raw compares RAW IDs. */
     uint64_t generation, event_cut, control_generation;
     double L, P, D, elapsed, age_seconds;
     int mixed_control;
@@ -91,9 +94,11 @@ typedef struct {
     size_t member_count; /* Exact when membership_complete; otherwise a lower bound. */
     double q, g, L_cut, P_cut, D_cut, local_elapsed_at_cut;
     double F, risk, U_tail, T_safe, local_latest_L;
-    /* received_raw_sum is only a partial diagnostic unless its complete flag
-     * is set. risk/U_tail/T_safe must likewise be gated by their validity
-     * flags; zero-filled unknown payload fields never establish zero cost. */
+    /* received_raw_sum sums each member's latest known actual L: the maximum
+     * of a received RAW cost and a covered cost, never their sum. It is only a
+     * partial diagnostic unless its complete flag is set. risk/U_tail/T_safe
+     * must likewise be gated by validity flags; zero-filled unknown payload
+     * fields never establish zero cost. */
     double received_raw_sum, age_seconds, oldest_unresolved_age;
     uint64_t lost_events;
     /* Fine coverage means one complete prefix/frontier/backlog cut. Coarse
@@ -119,6 +124,9 @@ PeakMpiPolicy *peak_mpi_policy_create(const PeakMpiPolicyConfig *config,
 void peak_mpi_policy_free(PeakMpiPolicy *policy);
 PeakMpiPolicyResult peak_mpi_policy_record_raw(PeakMpiPolicy *policy,
     PeakMpiPolicyCohortKey cohort, const PeakMpiPolicySample *sample, double now);
+/* Covered samples retain their own actual cost/elapsed observations and do
+ * not overwrite the RAW stream. A fresh covered cut supplies a zero-tail
+ * basis even without RAW, or when its actual L is ahead of older RAW data. */
 PeakMpiPolicyResult peak_mpi_policy_submit_cut(PeakMpiPolicy *policy,
     const PeakMpiPolicyCut *cut, double now);
 /* Merge requires disjoint same-job cohorts and a new epoch greater than both
@@ -143,6 +151,7 @@ typedef struct {
     size_t known_member_count;
     uint64_t last_generation;
     int active, have_feedback, membership_complete, permanent_coarse;
+    int have_history, membership_hint_pending;
     int feedback_invalid;
     PeakMpiPolicyReason coarse_reason;
 } PeakMpiPolicyReceiver;
@@ -170,6 +179,14 @@ PeakMpiPolicyResult peak_mpi_policy_receiver_init(PeakMpiPolicyReceiver *receive
 PeakMpiPolicyResult peak_mpi_policy_receiver_rebind(PeakMpiPolicyReceiver *receiver,
     PeakMpiPolicyCohortKey cohort, size_t known_member_count,
     int membership_complete, double now);
+/* A strictly larger locally observed lower bound tightens g and invalidates
+ * global membership/headroom, without inventing an epoch or resetting any
+ * raw history/packet generation. Older/equal hints are ignored. Once this key
+ * had feedback, its complete tuples cannot confirm the growth: a new backend
+ * epoch plus covered feedback is required. Before the first feedback, an
+ * initial matching-key complete tuple may confirm a sufficient bound. */
+PeakMpiPolicyResult peak_mpi_policy_receiver_note_membership_hint(PeakMpiPolicyReceiver *receiver,
+    size_t known_member_lower_bound, double now);
 PeakMpiPolicyResult peak_mpi_policy_receiver_accept(PeakMpiPolicyReceiver *receiver,
     const PeakMpiPolicyFeedback *feedback, double now);
 /* A local sticky capture/contract failure must tighten the next heartbeat
