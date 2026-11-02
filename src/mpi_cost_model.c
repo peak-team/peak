@@ -418,8 +418,10 @@ static void search_start(PeakMpiCostModel *m, uint32_t i)
     m->search_candidate = i;
     m->search_edge = NONE;
     m->queue_head = 0; m->queue_tail = 1;
-    m->queue[0] = e->target;
-    m->nodes[e->target].search_stamp = m->search_stamp;
+    /* G has target -> source exactly when reversed G has source -> target.
+     * Searching predecessors avoids unrelated already-parsed future branches. */
+    m->queue[0] = e->source;
+    m->nodes[e->source].search_stamp = m->search_stamp;
     if (e->source == e->target) {
         e->retained = false; ++m->stats.excluded_candidates;
     } else {
@@ -432,25 +434,25 @@ static void search_step(PeakMpiCostModel *m)
     CostEdge *candidate = &m->edges[m->search_candidate];
     if (m->search_edge != NONE) {
         CostEdge *e = &m->edges[m->search_edge];
-        m->search_edge = e->out_next;
+        m->search_edge = e->in_next;
         bool guaranteed = e->kind == PEAK_MPI_COST_GUARANTEED ||
                           (e->kind == PEAK_MPI_COST_SLACK_INPUT &&
                            m->nodes[e->target].defined &&
                            m->nodes[e->target].spec.kind == PEAK_MPI_COST_COLLECTIVE &&
                            m->nodes[e->target].group_identity_valid);
         if (e->active && guaranteed) {
-            CostNode *n = &m->nodes[e->target];
-            if (e->target == candidate->source) {
+            CostNode *n = &m->nodes[e->source];
+            if (e->source == candidate->target) {
                 candidate->retained = false; ++m->stats.excluded_candidates;
                 m->phase = FILTER_SCAN;
             } else if (n->search_stamp != m->search_stamp) {
                 n->search_stamp = m->search_stamp;
-                m->queue[m->queue_tail++] = e->target;
+                m->queue[m->queue_tail++] = e->source;
             }
         }
     } else if (m->queue_head < m->queue_tail) {
         uint32_t i = m->queue[m->queue_head++];
-        m->search_edge = m->nodes[i].out;
+        m->search_edge = m->nodes[i].in;
     } else {
         candidate->retained = true; ++m->stats.retained_candidates;
         m->phase = FILTER_SCAN;
