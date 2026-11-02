@@ -43,7 +43,8 @@ typedef enum {
     PEAK_MPI_POLICY_IGNORED,
     PEAK_MPI_POLICY_INVALID,
     PEAK_MPI_POLICY_CAPACITY,
-    PEAK_MPI_POLICY_NOT_MEMBER
+    PEAK_MPI_POLICY_NOT_MEMBER,
+    PEAK_MPI_POLICY_BUDGET
 } PeakMpiPolicyResult;
 
 enum {
@@ -139,8 +140,24 @@ PeakMpiPolicyResult peak_mpi_policy_mark_coarse(PeakMpiPolicy *policy,
 PeakMpiPolicyResult peak_mpi_policy_set_membership_known(PeakMpiPolicy *policy,
     int complete, double now);
 PeakMpiPolicyResult peak_mpi_policy_tick(PeakMpiPolicy *policy, double now);
+/* Single-member convenience query is O(n); do not call once per transport
+ * peer. The batch API below aggregates one cohort once. */
 PeakMpiPolicyResult peak_mpi_policy_feedback(PeakMpiPolicy *policy,
     PeakMpiPolicyMemberId member, double now, PeakMpiPolicyFeedback *feedback);
+/* O(1) admission cost for n stored members: one common aggregate visit per
+ * member, one constant-time tuple fill per member, plus one state step. */
+size_t peak_mpi_policy_feedback_batch_work(const PeakMpiPolicy *policy);
+/* Single-owner atomic O(n) snapshot; output storage is owned/preallocated by
+ * the backend. No allocation or partial batch. Insufficient work returns
+ * BUDGET and insufficient output capacity returns CAPACITY, with no policy or
+ * tuple mutation and *written=*work_used=0. An admitted batch uses at most the
+ * reported work allowance. Rows are values, independent of later RAW updates;
+ * they include each stored member once in unspecified order. Transport must
+ * cache a completed batch, age its original capture time, and never create a
+ * new generation merely by retransmitting. */
+PeakMpiPolicyResult peak_mpi_policy_feedback_batch(PeakMpiPolicy *policy,
+    double now, PeakMpiPolicyFeedback *feedbacks, size_t feedback_capacity,
+    size_t work_allowance, size_t *written, size_t *work_used);
 
 typedef struct {
     PeakMpiPolicyConfig config;

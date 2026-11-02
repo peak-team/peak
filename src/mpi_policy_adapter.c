@@ -366,29 +366,29 @@ PeakMpiPolicyResult peak_mpi_policy_tick(PeakMpiPolicy *p, double now) {
     return PEAK_MPI_POLICY_OK;
 }
 
-PeakMpiPolicyResult peak_mpi_policy_feedback(PeakMpiPolicy *p,
-    PeakMpiPolicyMemberId id, double now, PeakMpiPolicyFeedback *f) {
-    if (!p || !f) return PEAK_MPI_POLICY_INVALID;
-    PeakMpiPolicyResult result = peak_mpi_policy_tick(p, now);
-    if (result != PEAK_MPI_POLICY_OK) return result;
-    size_t index = find_member(p, id);
-    if (index == SIZE_MAX) return PEAK_MPI_POLICY_NOT_MEMBER;
+/* One cohort scan. Age, risk, actual-cost basis and tails are independent
+ * accumulations in the same member order as the single-member API. */
+static PeakMpiPolicyResult feedback_common(PeakMpiPolicy *p, double now,
+    PeakMpiPolicyFeedback *f) {
+    if (!clock_valid(now, p->last_now)) return PEAK_MPI_POLICY_INVALID;
+    p->last_now = now;
     memset(f, 0, sizeof(*f));
-    f->cohort = p->cohort; f->member = id; f->generation = p->revision;
-    f->policy_generation = p->policy_generation; f->mode = p->mode; f->reason = p->reason;
-    f->member_count = p->count_hint; f->q = p->config.q; f->g = p->g; f->F = p->F;
     f->membership_complete = p->membership_complete; f->lost_events = p->lost_events;
     f->oldest_unresolved_age = p->oldest_unresolved_age;
-    f->rate_baseline_valid = p->baseline_valid;
     f->coverage_complete = p->have_cut && p->membership_complete;
     f->risk_known = f->coverage_complete;
     f->received_raw_complete = p->membership_complete;
     f->tails_complete = f->coverage_complete;
-    f->age_seconds = coverage_age(p, now);
+    f->age_seconds = p->have_cut ? age_add(p->cut_age, now-p->cut_received_at) : now-p->created_at;
     f->T_safe = INFINITY;
     double coarse_sum = 0;
     for (size_t i=0; i<p->count; ++i) {
         const Member *m = &p->members[i];
+        if (p->have_cut && m->have_raw && m->have_covered && m->raw.elapsed > m->covered.elapsed) {
+            double member_age = age_add(m->raw.age_seconds, now-m->raw_received_at);
+            member_age = age_add(member_age, m->raw.elapsed-m->covered.elapsed);
+            f->age_seconds = maximum(f->age_seconds, member_age);
+        }
         if (m->have_raw || m->have_covered)
             f->received_raw_sum += maximum(m->have_raw ? m->raw.L : 0,
                 m->have_covered ? m->covered.L : 0);
@@ -399,20 +399,74 @@ PeakMpiPolicyResult peak_mpi_policy_feedback(PeakMpiPolicy *p,
             f->U_tail += m->raw.L-m->covered.L;
     }
     if (!isfinite(f->T_safe)) { f->T_safe = 0; f->risk_known = 0; }
-    f->risk = p->mode == PEAK_MPI_POLICY_COARSE ? coarse_sum : p->F;
-    const Member *m = &p->members[index];
-    if (m->have_covered) {
-        f->event_cut = m->covered.event_cut; f->control_generation = m->covered.control_generation;
-        f->L_cut = m->covered.L; f->P_cut = m->covered.P; f->D_cut = m->covered.D;
-        f->local_elapsed_at_cut = m->covered.elapsed;
+    /* Fold tick's age transition into this scan; batch admission therefore
+     * charges no hidden coverage_age(n) pass. */
+    if (p->active && p->mode != PEAK_MPI_POLICY_COARSE && p->mode != PEAK_MPI_POLICY_STALE &&
+        f->age_seconds > 3*p->config.heartbeat_max_seconds) {
+        make_stale(p);
+        if (!bump(p)) return PEAK_MPI_POLICY_CAPACITY;
     }
-    f->local_latest_L = maximum(m->have_raw ? m->raw.L : 0, f->L_cut);
+    f->cohort = p->cohort; f->generation = p->revision;
+    f->policy_generation = p->policy_generation; f->mode = p->mode; f->reason = p->reason;
+    f->member_count = p->count_hint; f->q = p->config.q; f->g = p->g; f->F = p->F;
+    f->rate_baseline_valid = p->baseline_valid;
+    f->risk = p->mode == PEAK_MPI_POLICY_COARSE ? coarse_sum : p->F;
     if (!isfinite(f->received_raw_sum) || !isfinite(coarse_sum) || !isfinite(f->U_tail)) {
         coarse(p, PEAK_MPI_POLICY_RESOURCE_LIMIT); (void)bump(p);
         f->mode = p->mode; f->reason = p->reason; f->g = p->g; f->generation = p->revision;
         f->risk_known = f->tails_complete = f->received_raw_complete = 0;
         f->received_raw_sum = f->risk = f->U_tail = 0;
     }
+    return PEAK_MPI_POLICY_OK;
+}
+
+/* Constant work: no cohort lookup, scan, policy mutation or retained pointer. */
+static void feedback_member(const Member *m, const PeakMpiPolicyFeedback *common,
+    PeakMpiPolicyFeedback *f) {
+    memcpy(f, common, sizeof(*f));
+    f->member = m->id;
+    if (m->have_covered) {
+        f->event_cut = m->covered.event_cut; f->control_generation = m->covered.control_generation;
+        f->L_cut = m->covered.L; f->P_cut = m->covered.P; f->D_cut = m->covered.D;
+        f->local_elapsed_at_cut = m->covered.elapsed;
+    }
+    f->local_latest_L = maximum(m->have_raw ? m->raw.L : 0, f->L_cut);
+}
+
+PeakMpiPolicyResult peak_mpi_policy_feedback(PeakMpiPolicy *p,
+    PeakMpiPolicyMemberId id, double now, PeakMpiPolicyFeedback *f) {
+    if (!p || !f) return PEAK_MPI_POLICY_INVALID;
+    PeakMpiPolicyResult result = peak_mpi_policy_tick(p, now);
+    if (result != PEAK_MPI_POLICY_OK) return result;
+    size_t index = find_member(p, id);
+    if (index == SIZE_MAX) return PEAK_MPI_POLICY_NOT_MEMBER;
+    PeakMpiPolicyFeedback common;
+    result = feedback_common(p, now, &common);
+    if (result == PEAK_MPI_POLICY_OK) feedback_member(&p->members[index], &common, f);
+    return result;
+}
+
+size_t peak_mpi_policy_feedback_batch_work(const PeakMpiPolicy *p) {
+    /* create bounds capacity by SIZE_MAX/4, so this cannot overflow. */
+    return p ? 1+2*p->count : 0;
+}
+PeakMpiPolicyResult peak_mpi_policy_feedback_batch(PeakMpiPolicy *p,
+    double now, PeakMpiPolicyFeedback *out, size_t capacity, size_t allowance,
+    size_t *written, size_t *used) {
+    if (written) *written = 0;
+    if (used) *used = 0;
+    if (!p || !written || !used || !clock_valid(now, p->last_now))
+        return PEAK_MPI_POLICY_INVALID;
+    if (capacity < p->count) return PEAK_MPI_POLICY_CAPACITY;
+    if (p->count && !out) return PEAK_MPI_POLICY_INVALID;
+    size_t required = peak_mpi_policy_feedback_batch_work(p);
+    if (allowance < required) return PEAK_MPI_POLICY_BUDGET;
+    PeakMpiPolicyFeedback common;
+    PeakMpiPolicyResult result = feedback_common(p, now, &common);
+    *used = 1+p->count;
+    if (result != PEAK_MPI_POLICY_OK) return result;
+    for (size_t i=0; i<p->count; ++i) feedback_member(&p->members[i], &common, &out[i]);
+    *written = p->count; *used = required;
     return PEAK_MPI_POLICY_OK;
 }
 
