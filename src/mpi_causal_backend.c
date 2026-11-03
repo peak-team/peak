@@ -27,6 +27,7 @@ typedef struct {
 } Context;
 typedef struct {
   unsigned rank;
+  int legacy_resolved, legacy_wait;
   int used, ended, completed, matched, sealed, retired, send_matched,
       collective_built;
   uint64_t order, match_nonce, candidate_epoch, visible_nonce, self_nonce,
@@ -80,6 +81,7 @@ typedef struct {
   double verify_L, verify_P, verify_elapsed, verify_received;
   uint64_t verify_control;
   double L, P, elapsed, received_at, covered_at, last_L, last_P;
+  uint64_t last_L_cut, last_P_cut;
   PeakMpiCostRef continuation, covered_ref;
   int have_continuation, have_raw, active, coarse, unknown, have_prefix;
   PeakMpiPolicyReason reason;
@@ -91,10 +93,19 @@ typedef struct {
   PeakMpiPolicySample covered;
   uint64_t parsed_index, covered_index, processed_sum;
   double covered_tail;
+  PeakMpiCausalRecovery recovery;
+  uint64_t uid_floor, acknowledged_loss, recovery_comm, feedback_epoch;
   size_t cut_head, cut_tail;
 } Rank;
 struct PeakMpiCausalService {
   PeakMpiCausalServiceConfig config;
+  PeakMpiCausalRecovery recovery, recovery_candidate;
+  uint64_t recovery_context;
+  unsigned recovery_reset, recovery_rank, recovery_prepare, recovery_source;
+  size_t recovery_cursor;
+  int approximate, hard_fault, recovery_needed, recovery_incomplete,
+      recovery_restart;
+  double recovery_g, recovery_H;
   PeakMpiCausalTransport *transport;
   PeakMpiCostModel *model;
   PeakMpiCausalBatches *batches;
@@ -176,6 +187,12 @@ static unsigned root(PeakMpiCausalService *s, unsigned r) {
 static void coarse(PeakMpiCausalService *s, unsigned r,
                    PeakMpiPolicyReason reason, uint64_t lost) {
   Rank *a = &s->ranks[r];
+  if (reason != PEAK_MPI_POLICY_EVENT_LOSS || !a->recovery.loss)
+    s->hard_fault = 1;
+  if (!a->coarse &&
+      (!s->recovery.state || s->recovery.state == PEAK_MPI_RECOVERY_ACK))
+    s->recovery_g =
+        s->feedback_valid && s->feedback_valid[r] ? s->feedback_cache[r].g : 1;
   a->coarse = 1;
   a->reason = reason;
   a->lost += lost;
@@ -529,6 +546,16 @@ int peak_mpi_causal_service_ingest_raw(PeakMpiCausalService *s, unsigned r,
     coarse(s, r, PEAK_MPI_POLICY_BAD_CUT, 0);
     return 1;
   }
+  if (s->approximate && raw->recovery.epoch < s->recovery.epoch)
+    return 1;
+  if (s->recovery_reset && raw->recovery.loss > a->recovery.loss)
+    s->recovery_restart = 1;
+  a->recovery = raw->recovery;
+  if (a->recovery.fault_mask &
+      ~(UINT64_C(1) << PEAK_MPI_OBSERVER_REASON_RING_OVERFLOW))
+    s->hard_fault = 1;
+  if (a->recovery.loss > a->acknowledged_loss)
+    s->recovery_needed = 1;
   a->raw_generation = raw->generation;
   a->echoed_nonce = raw->watermark_nonce;
   a->idle = raw->idle_cut;
@@ -553,7 +580,11 @@ int peak_mpi_causal_service_ingest_raw(PeakMpiCausalService *s, unsigned r,
   raw_to_policy(s, r);
   if (raw->unknown_members)
     peak_mpi_policy_set_membership_known(s->ranks[root(s, r)].policy, 0, now);
-  if (raw->coarse_reason != PEAK_MPI_OBSERVER_REASON_NONE || raw->lost_events) {
+  if ((raw->coarse_reason != PEAK_MPI_OBSERVER_REASON_NONE &&
+       !(raw->coarse_reason == PEAK_MPI_OBSERVER_REASON_RING_OVERFLOW &&
+         raw->recovery.epoch == s->recovery.epoch &&
+         raw->lost_events <= a->acknowledged_loss)) ||
+      raw->lost_events > a->acknowledged_loss) {
     PeakMpiPolicyReason why =
         raw->coarse_reason == PEAK_MPI_OBSERVER_REASON_CAPABILITY
             ? PEAK_MPI_POLICY_MISSING_CONTRACT
@@ -567,7 +598,13 @@ static int advance(PeakMpiCausalService *s, unsigned r,
                    const PeakMpiObserverRecord *rec, PeakMpiCostRef *out) {
   Rank *a = &s->ranks[r];
   double L = sec(rec->L_cut), P = sec(rec->P_cut);
-  if (!node(s, r, L - a->last_L, P - a->last_P, rec, out))
+  if (rec->L_cut < a->last_L_cut || rec->P_cut < a->last_P_cut ||
+      rec->P_cut - a->last_P_cut > rec->L_cut - a->last_L_cut) {
+    coarse(s, r, PEAK_MPI_POLICY_BAD_CUT, 0);
+    return 0;
+  }
+  if (!node(s, r, sec(rec->L_cut - a->last_L_cut),
+            sec(rec->P_cut - a->last_P_cut), rec, out))
     return 0;
   int thread_edge = 0;
   if (rec->phase == PEAK_MPI_CAUSAL_CALL_BEGIN && rec->input_ref) {
@@ -580,6 +617,8 @@ static int advance(PeakMpiCausalService *s, unsigned r,
     return 0;
   a->last_L = L;
   a->last_P = P;
+  a->last_L_cut = rec->L_cut;
+  a->last_P_cut = rec->P_cut;
   a->continuation = *out;
   a->have_continuation = 1;
   return 1;
@@ -598,6 +637,37 @@ static void seal_output(PeakMpiCausalService *s, Operation *o) {
     o->sealed = 1;
   }
 }
+static void legacy_resolve(PeakMpiCausalService *s, Operation *o) {
+  double bound = 0;
+  for (unsigned r = 0; r < s->config.world_size; r++)
+    bound += s->ranks[r].L;
+  /* This is an ownerless paid-history upper anchor, never another raw owner. */
+  PeakMpiCostRef ref;
+  if (!reserve(s, o->rank, &ref))
+    return;
+  double inside = fmax(0, sec(o->end.L_cut) - sec(o->begin.L_cut));
+  PeakMpiCostNodeSpec spec = {PEAK_MPI_COST_EVENT,
+                              o->rank,
+                              PEAK_MPI_COST_NO_OWNER,
+                              fmax(0, bound - inside),
+                              0,
+                              0,
+                              0,
+                              0};
+  good(s, o->rank, peak_mpi_cost_model_define_node(s->model, ref, &spec));
+  good(s, o->rank, peak_mpi_cost_model_seal(s->model, ref));
+  edge(s, o->rank, ref, output(o), PEAK_MPI_COST_PROGRESS, 0);
+  o->legacy_resolved = 1;
+  if (o->begin.operation == PEAK_MPI_CAUSAL_SENDRECV)
+    o->send_matched = 1;
+  if (recv_op(o->begin.operation) || probe_op(o->begin.operation)) {
+    o->matched = o->candidate_done = 1;
+    peak_mpi_causal_match_index_remove_role(s->matching,
+                                            PEAK_MPI_CAUSAL_MATCH_RECEIVE,
+                                            (size_t)(o - s->operations));
+  }
+  seal_output(s, o);
+}
 int peak_mpi_causal_service_ingest_record(PeakMpiCausalService *s, unsigned r,
                                           const PeakMpiObserverRecord *rec) {
   if (!s || !s->ranks || !rec || r >= s->config.world_size)
@@ -613,11 +683,24 @@ int peak_mpi_causal_service_ingest_record(PeakMpiCausalService *s, unsigned r,
     return 1;
   }
   uint64_t *seq = &a->sequence[rec->thread_uid - 1];
+  if (a->uid_floor && rec->kind != PEAK_MPI_OBSERVER_EVENT_OBJECT &&
+      rec->op_uid < a->uid_floor) {
+    if (rec->sequence > *seq) {
+      *seq = rec->sequence;
+      uint64_t *done = &a->processed[rec->thread_uid - 1];
+      if (rec->sequence > *done) {
+        a->processed_sum += rec->sequence - *done;
+        *done = rec->sequence;
+      }
+    }
+    return 1;
+  }
   if (rec->sequence <= *seq) {
     s->stats.duplicates++;
     return 1;
   }
   if (rec->sequence != *seq + 1) {
+    s->hard_fault = 1;
     coarse(s, r, PEAK_MPI_POLICY_EVENT_LOSS, rec->sequence - *seq - 1);
     *seq = rec->sequence;
     return 1;
@@ -770,10 +853,11 @@ static void analysis_wake(PeakMpiCausalService *s, Operation *o) {
       analysis_enqueue(s, o, 0);
     return;
   }
-  if (o->end.actual_source < 0)
+  int source =
+      send_op(o->begin.operation) ? o->begin.peer : o->end.actual_source;
+  if (source < 0 || (unsigned)source >= s->config.world_size)
     return;
-  Rank *remote = &s->ranks[(unsigned)o->end.actual_source],
-       *local = &s->ranks[o->rank];
+  Rank *remote = &s->ranks[(unsigned)source], *local = &s->ranks[o->rank];
   if (remote->verified_nonce >= o->match_nonce &&
       local->verified_nonce >= o->self_nonce)
     analysis_enqueue(s, o, 0);
@@ -931,6 +1015,27 @@ static int parse_record(PeakMpiCausalService *s, unsigned r,
       coarse(s, r, PEAK_MPI_POLICY_MISSING_CONTRACT, 0);
     return 1;
   }
+  if (s->approximate && rec->phase == PEAK_MPI_CAUSAL_REQUEST_COMPLETE &&
+      (rec->flags & PEAK_MPI_CAUSAL_LEGACY_INPUT)) {
+    Operation *wait = find_op(s, r, rec->batch_uid);
+    if (wait) {
+      wait->observed_count++;
+      double bound = s->ranks[r].last_L;
+      for (unsigned other = 0; other < s->config.world_size; other++)
+        if (other != r)
+          bound += s->ranks[other].L;
+      PeakMpiCostRef ref;
+      if (reserve(s, r, &ref)) {
+        PeakMpiCostNodeSpec spec = {
+            PEAK_MPI_COST_EVENT, r, PEAK_MPI_COST_NO_OWNER, bound, 0, 0, 0, 0};
+        good(s, r, peak_mpi_cost_model_define_node(s->model, ref, &spec));
+        good(s, r, peak_mpi_cost_model_seal(s->model, ref));
+        edge(s, r, ref, wait->exit, PEAK_MPI_COST_PROGRESS, 0);
+      }
+    } else
+      coarse(s, r, PEAK_MPI_POLICY_BAD_IDENTITY, 0);
+    return 1;
+  }
   Operation *o = find_op(s, r, rec->op_uid);
   if (!o) {
     coarse(s, r, PEAK_MPI_POLICY_BAD_IDENTITY, 0);
@@ -988,6 +1093,7 @@ static int parse_record(PeakMpiCausalService *s, unsigned r,
       seal_output(s, o);
     }
     if (recv_op(o->begin.operation) ||
+        (s->approximate && send_op(o->begin.operation)) ||
         (o->begin.flags & PEAK_MPI_CAUSAL_COLLECTIVE))
       analysis_enqueue(s, o, 0);
     return 1;
@@ -1021,18 +1127,21 @@ static int parse_record(PeakMpiCausalService *s, unsigned r,
   a->anchor[rec->thread_uid - 1] = rec->op_uid;
   o->completed |=
       o->immediate || !(o->begin.flags & PEAK_MPI_CAUSAL_NONBLOCKING);
-  double L = s->building_concurrent ? a->last_L : sec(rec->L_cut),
-         P = s->building_concurrent ? a->last_P : sec(rec->P_cut);
+  uint64_t Lcut = s->building_concurrent ? a->last_L_cut : rec->L_cut;
+  uint64_t Pcut = s->building_concurrent ? a->last_P_cut : rec->P_cut;
+  double L = sec(Lcut), P = sec(Pcut);
   PeakMpiCostOwnerRef own = PEAK_MPI_COST_NO_OWNER;
-  if (L < a->last_L || P < a->last_P || P - a->last_P > L - a->last_L + 1e-12) {
+  if (Lcut < a->last_L_cut || Pcut < a->last_P_cut ||
+      Pcut - a->last_P_cut > Lcut - a->last_L_cut) {
     coarse(s, r, PEAK_MPI_POLICY_BAD_CUT, 0);
     return 1;
   }
-  if (L > a->last_L || P > a->last_P) {
+  if (Lcut > a->last_L_cut || Pcut > a->last_P_cut) {
     if (!good(s, r, peak_mpi_cost_model_reserve_owner(s->model, &own)) ||
         !good(s, r,
-              peak_mpi_cost_model_define_owner(s->model, own, r, L - a->last_L,
-                                               P - a->last_P)))
+              peak_mpi_cost_model_define_owner(s->model, own, r,
+                                               sec(Lcut - a->last_L_cut),
+                                               sec(Pcut - a->last_P_cut))))
       return 1;
   }
   PeakMpiCostNodeSpec spec = {PEAK_MPI_COST_EVENT, r, own, 0, 0, 0, 0, 0};
@@ -1053,6 +1162,8 @@ static int parse_record(PeakMpiCausalService *s, unsigned r,
   if (!s->building_concurrent) {
     a->last_L = L;
     a->last_P = P;
+    a->last_L_cut = Lcut;
+    a->last_P_cut = Pcut;
     a->continuation = o->exit;
     a->have_continuation = 1;
   }
@@ -1080,7 +1191,8 @@ static int parse_record(PeakMpiCausalService *s, unsigned r,
              o->begin.operation == PEAK_MPI_CAUSAL_RSEND) {
     seal_output(s, o);
   }
-  if ((o->begin.flags & PEAK_MPI_CAUSAL_COLLECTIVE) ||
+  if ((s->approximate && send_op(o->begin.operation)) ||
+      (o->begin.flags & PEAK_MPI_CAUSAL_COLLECTIVE) ||
       ((recv_op(o->begin.operation) || probe_op(o->begin.operation)) &&
        o->completed))
     analysis_enqueue(s, o, 0);
@@ -1176,6 +1288,36 @@ static void matcher_work(PeakMpiCausalService *s, size_t budget) {
         s->task_stage = TASK_COLLECTIVE_SCAN;
         continue;
       }
+      if (s->approximate && send_op(o->begin.operation) &&
+          !recv_op(o->begin.operation)) {
+        if (!o->ended || !o->completed || o->send_matched ||
+            o->legacy_resolved ||
+            ((o->begin.flags & PEAK_MPI_CAUSAL_NONBLOCKING) && !o->immediate &&
+             !o->result_defined))
+          continue;
+        int peer = o->begin.peer;
+        if (peer < 0 || (unsigned)peer >= s->config.world_size)
+          continue;
+        Rank *remote = &s->ranks[peer], *local = &s->ranks[o->rank];
+        if (!o->match_nonce)
+          o->match_nonce = ++remote->requested_nonce;
+        if (!o->self_nonce)
+          o->self_nonce = ++local->requested_nonce;
+        if (remote->verified_nonce < o->match_nonce ||
+            local->verified_nonce < o->self_nonce) {
+          o->analysis_waiting = 1;
+          continue;
+        }
+        if (!o->legacy_wait) {
+          o->legacy_wait = 1;
+          o->match_nonce = ++remote->requested_nonce;
+          o->self_nonce = ++local->requested_nonce;
+          o->analysis_waiting = 1;
+          continue;
+        }
+        legacy_resolve(s, o);
+        continue;
+      }
       if (!o->ended || !o->completed ||
           (!recv_op(o->begin.operation) && !probe_op(o->begin.operation)))
         continue;
@@ -1228,8 +1370,11 @@ static void matcher_work(PeakMpiCausalService *s, size_t budget) {
         o->self_epoch = local->verified_nonce;
       if (o->begin.operation == PEAK_MPI_CAUSAL_MRECV) {
         Operation *p = find_op(s, o->rank, o->begin.progress_begin);
-        if (!p || !p->matched)
+        if (!p || !p->matched) {
+          if (s->approximate)
+            legacy_resolve(s, o);
           continue;
+        }
         if (p->peer_op != SIZE_MAX)
           s->task_bound = p->peer_op;
         else {
@@ -1249,6 +1394,11 @@ static void matcher_work(PeakMpiCausalService *s, size_t budget) {
     if (s->task_stage == TASK_MESSAGES) {
       if (s->task_cursor == SIZE_MAX) {
         if (!s->task_count || !s->task_ready) {
+          if (s->approximate && !s->task_count) {
+            legacy_resolve(s, o);
+            s->task_stage = 0;
+            continue;
+          }
           o->analysis_waiting = 1;
           s->task_stage = 0;
           continue;
@@ -1375,11 +1525,13 @@ static void matcher_work(PeakMpiCausalService *s, size_t budget) {
                 : o->group_index;
         if (join > send->consumer_index)
           send->consumer_index = join;
-        if (send->begin.operation == PEAK_MPI_CAUSAL_SEND ||
-            send->begin.operation == PEAK_MPI_CAUSAL_SENDRECV)
+        if (!send->legacy_resolved &&
+            (send->begin.operation == PEAK_MPI_CAUSAL_SEND ||
+             send->begin.operation == PEAK_MPI_CAUSAL_SENDRECV))
           edge(s, send->rank, o->entry, output(send),
                PEAK_MPI_COST_SEND_REVERSE, 0);
-        else if (send->begin.operation == PEAK_MPI_CAUSAL_SSEND)
+        else if (!send->legacy_resolved &&
+                 send->begin.operation == PEAK_MPI_CAUSAL_SSEND)
           edge(s, send->rank, o->entry, output(send),
                s->task_ambiguous ? PEAK_MPI_COST_PROGRESS
                                  : PEAK_MPI_COST_GUARANTEED,
@@ -1583,7 +1735,7 @@ static int branch_live_at_cut(PeakMpiCausalService *s, Operation *o) {
   if ((o->begin.flags & PEAK_MPI_CAUSAL_NONBLOCKING) && !o->immediate &&
       (!o->completed || o->completion_index > r->covered_index))
     return 1;
-  if (send_op(o->begin.operation) &&
+  if (send_op(o->begin.operation) && !o->legacy_resolved &&
       (!o->send_matched ||
        o->consumer_index > s->ranks[o->consumer_rank].covered_index))
     return 1;
@@ -2110,8 +2262,15 @@ static void parse_batches(PeakMpiCausalService *s, size_t budget) {
       parse_record(s, rank, &rec);
       s->group_start = a->continuation;
       if (s->plan.concurrent) {
-        if (!node(s, rank, sec(s->plan.end->L_cut) - sec(s->plan.begin->L_cut),
-                  sec(s->plan.end->P_cut) - sec(s->plan.begin->P_cut), NULL,
+        if (s->plan.end->L_cut < s->plan.begin->L_cut ||
+            s->plan.end->P_cut < s->plan.begin->P_cut ||
+            s->plan.end->P_cut - s->plan.begin->P_cut >
+                s->plan.end->L_cut - s->plan.begin->L_cut) {
+          coarse(s, rank, PEAK_MPI_POLICY_BAD_CUT, 0);
+          return;
+        }
+        if (!node(s, rank, sec(s->plan.end->L_cut - s->plan.begin->L_cut),
+                  sec(s->plan.end->P_cut - s->plan.begin->P_cut), NULL,
                   &s->group_cost))
           return;
         s->building_concurrent = 1;
@@ -2123,6 +2282,8 @@ static void parse_batches(PeakMpiCausalService *s, size_t budget) {
         a->have_continuation = 1;
         a->last_L = sec(rec.L_cut);
         a->last_P = sec(rec.P_cut);
+        a->last_L_cut = rec.L_cut;
+        a->last_P_cut = rec.P_cut;
         s->building_concurrent = 0;
       }
       parse_record(s, rank, &rec);
@@ -2195,6 +2356,10 @@ static size_t prepare_feedback_cache(PeakMpiCausalService *s,
       s->feedback_cache[member] = *f;
       s->feedback_captured[member] = s->now;
       s->feedback_valid[member] = 1;
+      s->ranks[member].feedback_epoch =
+          s->recovery.state == PEAK_MPI_RECOVERY_ACK && !s->recovery_reset
+              ? s->recovery.epoch
+              : 0;
       used++;
     }
     s->cache_root++;
@@ -2204,6 +2369,287 @@ static size_t prepare_feedback_cache(PeakMpiCausalService *s,
     s->cache_dirty = 0;
   }
   return used;
+}
+static uint64_t recovery_local_comm(PeakMpiCausalService *s, unsigned rank) {
+  return s->ranks[rank].recovery_comm;
+}
+static int recovery_eligible(uint64_t operation) {
+  return operation == PEAK_MPI_CAUSAL_BARRIER ||
+         operation == PEAK_MPI_CAUSAL_ALLREDUCE ||
+         operation == PEAK_MPI_CAUSAL_ALLGATHER ||
+         operation == PEAK_MPI_CAUSAL_ALLTOALL ||
+         operation == PEAK_MPI_CAUSAL_REDUCE_SCATTER;
+}
+static int recovery_work(PeakMpiCausalService *s, size_t budget, size_t *used) {
+  *used = 0;
+  if (s->hard_fault)
+    return s->recovery_reset != 0 || s->recovery_incomplete;
+  if (s->recovery_restart) {
+    s->recovery_restart = 0;
+    s->recovery_incomplete = 1;
+    s->recovery_reset = s->recovery_prepare = s->recovery_rank = 0;
+    s->recovery.state = PEAK_MPI_RECOVERY_NONE;
+    s->recovery_cursor = 0;
+  }
+  if (!s->recovery_needed)
+    return 0;
+  /* Query preparation visits each rank/immutable communicator once. The cached
+   * native intracomm size plus validated world member IDs establishes global
+   * participation; no repeated quadratic membership walk is needed. */
+  while ((!s->recovery.state || s->recovery.state == PEAK_MPI_RECOVERY_ACK ||
+          s->recovery_prepare) &&
+         *used < budget) {
+    ++*used;
+    if (!s->recovery_prepare) {
+      if (s->recovery_rank == s->config.world_size) {
+        s->recovery_rank = 0;
+        return 1;
+      }
+      unsigned r = s->recovery_rank++;
+      Rank *a = &s->ranks[r];
+      if (a->recovery.loss <= a->acknowledged_loss)
+        continue;
+      if (!a->recovery.comm || !a->recovery.ordinal ||
+          !recovery_eligible(a->recovery.operation)) {
+        s->recovery_rank = 0;
+        return 1;
+      }
+      s->recovery_candidate = a->recovery;
+      s->recovery_source = r;
+      s->recovery_prepare = 1;
+      s->recovery_cursor = 0;
+    } else if (s->recovery_prepare == 1) {
+      if (s->recovery_cursor == s->comm_count) {
+        s->recovery_prepare = s->recovery_rank = 0;
+        return 1;
+      }
+      size_t at = s->recovery_cursor++;
+      Comm *c = &s->comms[at];
+      if (s->comm_ranks[at] == s->recovery_source &&
+          c->uid == s->recovery_candidate.comm && c->canonical &&
+          c->size == (int)s->config.world_size) {
+        s->recovery_context = c->canonical;
+        s->recovery_prepare = 2;
+        s->recovery_rank = 0;
+      }
+    } else if (s->recovery_prepare == 2) {
+      if (s->recovery_rank < s->config.world_size)
+        s->ranks[s->recovery_rank++].recovery_comm = 0;
+      else {
+        s->recovery_prepare = 3;
+        s->recovery_cursor = 0;
+      }
+    } else if (s->recovery_prepare == 3) {
+      if (s->recovery_cursor < s->comm_count) {
+        size_t at = s->recovery_cursor++;
+        Comm *c = &s->comms[at];
+        if (c->canonical == s->recovery_context &&
+            c->size == (int)s->config.world_size)
+          s->ranks[s->comm_ranks[at]].recovery_comm = c->uid;
+      } else {
+        s->recovery_prepare = 4;
+        s->recovery_rank = 0;
+      }
+    } else if (s->recovery_rank < s->config.world_size) {
+      if (!s->ranks[s->recovery_rank++].recovery_comm) {
+        s->recovery_prepare = 3;
+        s->recovery_cursor = 0;
+        return 1;
+      }
+    } else {
+      s->recovery.epoch = s->recovery.epoch ? s->recovery.epoch + 1 : 2;
+      s->recovery.state = PEAK_MPI_RECOVERY_QUERY;
+      s->recovery.ordinal = s->recovery_candidate.ordinal;
+      s->recovery.operation = s->recovery_candidate.operation;
+      s->recovery_prepare = s->recovery_rank = 0;
+    }
+  }
+  if (s->recovery.state != PEAK_MPI_RECOVERY_QUERY)
+    return 1;
+  if (!s->recovery_reset) {
+    while (s->recovery_rank < s->config.world_size && *used < budget) {
+      ++*used;
+      Rank *a = &s->ranks[s->recovery_rank];
+      if (a->recovery.epoch != s->recovery.epoch ||
+          a->recovery.state != PEAK_MPI_RECOVERY_READY ||
+          a->recovery.ordinal < s->recovery.ordinal ||
+          a->recovery.comm != a->recovery_comm) {
+        s->recovery_rank = 0;
+        return 1;
+      }
+      if (!isfinite(a->recovery.L) || !isfinite(a->recovery.P) ||
+          !isfinite(a->recovery.elapsed) || a->recovery.P < 0 ||
+          a->recovery.P > a->recovery.L || a->recovery.elapsed < 0 ||
+          !a->recovery.uid_floor) {
+        coarse(s, s->recovery_rank, PEAK_MPI_POLICY_BAD_CUT, 0);
+        return 1;
+      }
+      ++s->recovery_rank;
+    }
+    if (s->recovery_rank != s->config.world_size || budget - *used < 1)
+      return 1;
+    ++*used;
+    s->recovery_reset = 1;
+    s->recovery_rank = 0;
+    s->recovery_cursor = 0;
+    s->model_running = s->plan_active = s->visibility_rank = 0;
+    s->pub_stage = s->gc_stage = s->task_stage = 0;
+    s->graph_pending = 0;
+    s->analysis_head = s->analysis_tail = SIZE_MAX;
+    peak_mpi_cost_model_reset_begin(s->model);
+    peak_mpi_causal_batches_reset_begin(s->batches);
+  }
+  while (s->recovery_reset && *used < budget) {
+    size_t left = budget - *used, spent = 0;
+    if (s->recovery_reset == 1) {
+      int done = peak_mpi_cost_model_reset_work(s->model, left, &spent);
+      *used += spent;
+      if (!done)
+        break;
+      s->recovery_reset = 2;
+    } else if (s->recovery_reset == 2) {
+      int done = peak_mpi_causal_batches_reset_work(s->batches, left, &spent);
+      *used += spent;
+      if (!done)
+        break;
+      s->recovery_reset = 3;
+    } else if (s->recovery_reset == 3) {
+      ++*used;
+      if (s->operation_count) {
+        size_t slot = s->active[s->operation_count - 1];
+        Operation *o = &s->operations[slot];
+        if (o->dep_head != SIZE_MAX) {
+          size_t d = o->dep_head;
+          o->dep_head = s->deps[d].next;
+          s->free_deps[s->free_dep_count++] = d;
+          continue;
+        }
+        peak_mpi_causal_match_index_remove_all(s->matching, slot);
+        index_remove(s, slot);
+        o->used = 0;
+        s->free_ops[s->free_count++] = slot;
+        --s->operation_count;
+      } else {
+        s->recovery_reset = 4;
+        s->recovery_cursor = 0;
+      }
+    } else if (s->recovery_reset == 4) {
+      ++*used;
+      if (s->recovery_cursor < s->buffer_index_capacity)
+        s->buffer_index[s->recovery_cursor++] = 0;
+      else {
+        s->buffer_count = s->node_count = 0;
+        s->recovery_reset = 5;
+      }
+    } else if (s->recovery_reset == 5) {
+      ++*used;
+      if (s->recovery_rank < s->config.world_size) {
+        Rank *a = &s->ranks[s->recovery_rank];
+        if (a->cut_head != SIZE_MAX) {
+          size_t at = a->cut_head;
+          a->cut_head = s->cuts[at].next;
+          s->free_cuts[s->free_cut_count++] = at;
+        } else
+          ++s->recovery_rank;
+      } else {
+        s->recovery_H = 0;
+        s->recovery_reset = 6;
+        s->recovery_rank = 0;
+      }
+    } else if (s->recovery_reset == 6) {
+      ++*used;
+      if (s->recovery_rank < s->config.world_size)
+        s->recovery_H += s->ranks[s->recovery_rank++].recovery.L;
+      else {
+        s->recovery_reset = 7;
+        s->recovery_rank = 0;
+      }
+    } else if (s->recovery_reset == 7) {
+      if (s->recovery_rank == s->config.world_size) {
+        ++*used;
+        s->approximate = 1;
+        s->recovery_needed = s->recovery_incomplete = 0;
+        s->recovery.state = PEAK_MPI_RECOVERY_ACK;
+        s->recovery_reset = s->recovery_rank = 0;
+        s->engine_phase = 0;
+        s->parse_window_open = s->parse_finish_only = 0;
+        s->cache_dirty = 1;
+        continue;
+      }
+      ++*used;
+      Rank *a = &s->ranks[s->recovery_rank];
+      a->last_L_cut = (uint64_t)(a->recovery.L * 1e9);
+      a->last_P_cut = (uint64_t)(a->recovery.P * 1e9);
+      a->last_L = sec(a->last_L_cut);
+      a->last_P = sec(a->last_P_cut);
+      a->uid_floor = a->recovery.uid_floor;
+      a->acknowledged_loss = a->recovery.loss;
+      a->coarse = 0;
+      a->reason = PEAK_MPI_POLICY_NO_REASON;
+      a->cut_head = a->cut_tail = SIZE_MAX;
+      a->covered.generation = 0;
+      a->covered_index = a->parsed_index = 0;
+      a->processed_sum = 0;
+      a->verify_active = a->verify_stage = a->has_verified = 0;
+      s->recovery_cursor = 0;
+      s->recovery_reset = 8;
+    } else if (s->recovery_reset == 8) {
+      ++*used;
+      Rank *a = &s->ranks[s->recovery_rank];
+      if (s->recovery_cursor < s->config.slots) {
+        size_t j = s->recovery_cursor++;
+        a->sequence[j] = a->processed[j] = a->prefix[j];
+        a->processed_sum += a->prefix[j];
+        a->anchor[j] = 0;
+      } else
+        s->recovery_reset = 9;
+    } else if (s->recovery_reset == 9) {
+      ++*used;
+      Rank *a = &s->ranks[s->recovery_rank];
+      if (!reserve(s, s->recovery_rank, &a->continuation))
+        return 1;
+      a->have_continuation = 1;
+      s->recovery_reset = 10;
+    } else if (s->recovery_reset == 10) {
+      ++*used;
+      unsigned r = s->recovery_rank;
+      Rank *a = &s->ranks[r];
+      PeakMpiCostNodeSpec spec = {PEAK_MPI_COST_EVENT,
+                                  r,
+                                  PEAK_MPI_COST_NO_OWNER,
+                                  s->recovery_H,
+                                  0,
+                                  0,
+                                  0,
+                                  0};
+      if (!good(s, r,
+                peak_mpi_cost_model_define_node(s->model, a->continuation,
+                                                &spec)))
+        return 1;
+      s->recovery_reset = 11;
+    } else if (s->recovery_reset == 11) {
+      ++*used;
+      unsigned r = s->recovery_rank;
+      Rank *a = &s->ranks[r];
+      if (!good(s, r, peak_mpi_cost_model_seal(s->model, a->continuation)))
+        return 1;
+      peak_mpi_cost_model_reset_base(s->model, r, a->last_L, a->last_P);
+      peak_mpi_policy_recover_begin(a->policy, s->now, s->recovery_g);
+      s->recovery_reset = 12;
+    } else {
+      Rank *a = &s->ranks[s->recovery_rank];
+      int done = peak_mpi_policy_recover_work(a->policy, left, &spent);
+      *used += spent;
+      if (!done)
+        break;
+      if (!spent)
+        ++*used;
+      ++s->recovery_rank;
+      s->recovery_reset = 7;
+    }
+  }
+
+  return s->recovery.state != PEAK_MPI_RECOVERY_ACK;
 }
 static uint64_t sink_nonce(void *v, unsigned r) {
   PeakMpiCausalService *s = v;
@@ -2227,6 +2673,25 @@ static int sink_feedback(void *v, unsigned rank, double now,
       !s->feedback_valid[rank])
     return 0;
   *out = s->feedback_cache[rank];
+  if (s->recovery.state) {
+    out->recovery = s->recovery;
+    if (out->recovery.state == PEAK_MPI_RECOVERY_ACK &&
+        s->ranks[rank].feedback_epoch != s->recovery.epoch)
+      out->recovery.state = PEAK_MPI_RECOVERY_QUERY;
+    out->recovery.comm = recovery_local_comm(s, rank);
+    out->generation += s->recovery.epoch * 4 + s->recovery.state;
+  }
+  out->recovery.loss = 0;
+  for (unsigned r = 0; r < s->config.world_size; r++)
+    out->recovery.loss += s->ranks[r].recovery.loss;
+  out->recovery.fault_mask =
+      s->hard_fault ? UINT64_C(1) << PEAK_MPI_OBSERVER_REASON_METADATA : 0;
+  if (s->approximate) {
+    out->approximate = 1;
+    if (out->mode == PEAK_MPI_POLICY_COMPLETE)
+      out->mode = PEAK_MPI_POLICY_APPROX;
+    out->coverage_complete = out->risk_known = out->tails_complete = 0;
+  }
   double age = fmax(0, now - s->feedback_captured[rank]);
   out->age_seconds += age;
   if (out->oldest_unresolved_age > 0)
@@ -2235,6 +2700,7 @@ static int sink_feedback(void *v, unsigned rank, double now,
 }
 static void sink_fault(void *v, unsigned r, PeakMpiPolicyReason reason) {
   PeakMpiCausalService *s = v;
+  s->hard_fault = 1;
   if (!s->ranks) {
     s->local_fault = reason;
     s->stats.unavailable = 1;
@@ -2421,7 +2887,14 @@ void peak_mpi_causal_service_tick(PeakMpiCausalService *s,
   }
   peak_mpi_causal_transport_tick(s->transport, capture, &local_raw, now, bytes);
   if (s->config.rank == s->config.owner_rank) {
-    size_t left = work, used = prepare_feedback_cache(s, left);
+    size_t recovery_used = 0;
+    int recovering = recovery_work(s, work, &recovery_used);
+    if (recovering) {
+      recovery_used += prepare_feedback_cache(s, work - recovery_used);
+      s->last_tick_work = recovery_used;
+      goto accounting;
+    }
+    size_t left = work - recovery_used, used = prepare_feedback_cache(s, left);
     int parsed_this_tick = 0;
     left -= used;
     enum {
@@ -2552,11 +3025,11 @@ void peak_mpi_causal_service_tick(PeakMpiCausalService *s,
     }
     s->last_tick_work = work - left;
   }
-  {
-    size_t pending = peak_mpi_causal_batches_pending(s->batches);
-    if (pending > s->stats.pending_peak)
-      s->stats.pending_peak = pending;
-  }
+accounting: {
+  size_t pending = peak_mpi_causal_batches_pending(s->batches);
+  if (pending > s->stats.pending_peak)
+    s->stats.pending_peak = pending;
+}
   clock_gettime(CLOCK_THREAD_CPUTIME_ID, &end);
   s->stats.observer_cpu_seconds += (double)(end.tv_sec - begin.tv_sec) +
                                    (double)(end.tv_nsec - begin.tv_nsec) * 1e-9;

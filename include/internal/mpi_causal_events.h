@@ -2,6 +2,7 @@
 #define PEAK_MPI_CAUSAL_EVENTS_H
 
 #include "internal/mpi_causal_protocol.h"
+#include "internal/mpi_causal_recovery.h"
 #include "internal/mpi_progress_contract.h"
 #include <stddef.h>
 
@@ -27,6 +28,13 @@ int peak_mpi_causal_runtime_enabled(void);
 /* Sticky-coarse retains cached communicator/actual peer discovery only. New
  * wildcard requests or untracked activations mark membership unknown. */
 int peak_mpi_causal_runtime_capture_enabled(void);
+int peak_mpi_causal_runtime_metadata_enabled(void);
+uint64_t peak_mpi_causal_runtime_capture_epoch(void);
+int peak_mpi_causal_events_recovery(PeakMpiCausalRecovery *recovery);
+void peak_mpi_causal_events_recovery_adopt(uint64_t epoch);
+uint64_t peak_mpi_causal_runtime_loss_generation(void);
+uint64_t peak_mpi_causal_runtime_operation_floor(void);
+int peak_mpi_causal_runtime_world_size(void);
 typedef enum {
   PEAK_MPI_CAUSAL_WORK_LOOKUP,
   PEAK_MPI_CAUSAL_WORK_POLL,

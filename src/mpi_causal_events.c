@@ -18,12 +18,14 @@
 typedef struct {
   MPI_Comm handle;
   uint64_t uid, generation, ordinal, creation_ordinal;
+  unsigned recovery_operation;
   int size, rank, inter, notified, retired;
   unsigned references, active_collectives;
   int32_t *members;
 } Comm;
 typedef struct {
   MPI_Request handle;
+  uint64_t graph_epoch;
   uint64_t uid, generation, activation, start_uid, comm_uid, ordinal,
       lineage_ordinal;
   unsigned flags;
@@ -42,7 +44,7 @@ typedef struct {
   int size, occupied, supported_family;
 } Type;
 typedef struct {
-  uint64_t generation, previous;
+  uint64_t generation, previous, capture_epoch;
   PeakMpiObserverRecord begin;
   Request *requests;
   MPI_Status *statuses;
@@ -65,6 +67,20 @@ static Type types[TYPE_CAP];
 static Message messages[MESSAGE_CAP];
 static int32_t *comm_members;
 static int world_rank, world_size;
+#define RECOVERY_COMM_CAP 4096u
+typedef struct {
+  uint64_t ordinal, ticket;
+} RecoveryWitness;
+static RecoveryWitness recovery_witnesses[RECOVERY_COMM_CAP];
+static _Thread_local Context *current_call;
+static void submit_event(PeakMpiObserverRecord *r, int actual) {
+  if (current_call && current_call->observing &&
+      (!current_call->capture_epoch ||
+       current_call->capture_epoch != peak_mpi_causal_runtime_capture_epoch()))
+    return;
+  peak_mpi_causal_runtime_submit(r, actual);
+}
+static uint64_t group_capture_epoch = 1;
 static uint64_t object_uid = 2, request_generation, buffer_generation;
 static uint64_t group_uid, previous_group;
 static uint64_t observed_open_requests, observed_open_buffered;
@@ -176,7 +192,7 @@ static int normalized_tag(int tag) {
   return tag == MPI_ANY_TAG ? PEAK_MPI_CAUSAL_ANY_TAG : tag;
 }
 static int type_nonzero(MPI_Datatype type) {
-  if (!peak_mpi_causal_runtime_capture_enabled())
+  if (!peak_mpi_causal_runtime_metadata_enabled())
     return 0;
   int yes = 0;
   unsigned inspected = 0;
@@ -240,7 +256,7 @@ static int datatype_family(MPI_Datatype type, unsigned depth, int *named) {
 static int validate_type(MPI_Datatype type) {
   if (contract.profile !=
           PEAK_MPI_PROGRESS_OMPI_5_0_5_UCX_1_17_RC_PROTO2_HOST_OBSERVED ||
-      !peak_mpi_causal_runtime_capture_enabled())
+      !peak_mpi_causal_runtime_metadata_enabled())
     return 1;
   unsigned inspected = 0;
   int supported = 0;
@@ -261,7 +277,7 @@ static int validate_type(MPI_Datatype type) {
 static void remember_type(MPI_Datatype type) {
   if (type == MPI_DATATYPE_NULL)
     return;
-  if (!peak_mpi_causal_runtime_capture_enabled())
+  if (!peak_mpi_causal_runtime_metadata_enabled())
     return;
   int size = -1;
   double cold_begin = cold_cpu_seconds();
@@ -444,11 +460,19 @@ static void define_comm(MPI_Comm handle, uint64_t parent_uid, uint64_t ordinal,
 }
 
 static void publish_begin(Context *c) {
+  if (!c || !c->capture_epoch ||
+      c->capture_epoch != peak_mpi_causal_runtime_capture_epoch() ||
+      !peak_mpi_causal_runtime_capture_enabled())
+    return;
   if (!c || c->emitted)
     return;
   PeakMpiObserverRecord group;
   int emit_group = 0;
   pthread_mutex_lock(&metadata);
+  if (c->capture_epoch != group_capture_epoch) {
+    pthread_mutex_unlock(&metadata);
+    return;
+  }
   if (group_published == UINT32_MAX)
     fail(PEAK_MPI_OBSERVER_REASON_OBJECT_CAPACITY);
   else
@@ -460,18 +484,25 @@ static void publish_begin(Context *c) {
   }
   pthread_mutex_unlock(&metadata);
   if (emit_group)
-    peak_mpi_causal_runtime_submit(&group, 0);
-  peak_mpi_causal_runtime_submit(&c->begin, 0);
+    submit_event(&group, 0);
+  submit_event(&c->begin, 0);
   c->emitted = 1;
 }
 static Context *begin_call(PeakMpiCausalOperation op, const Comm *comm,
                            unsigned flags, int peer, int tag, int root,
                            int deferred) {
-  if (!peak_mpi_causal_runtime_capture_enabled())
+  if (!peak_mpi_causal_runtime_metadata_enabled())
     return NULL;
   Context *c = context();
   if (!c)
     return NULL;
+  uint64_t epoch = peak_mpi_causal_runtime_capture_enabled()
+                       ? peak_mpi_causal_runtime_capture_epoch()
+                       : 0;
+  if (c->capture_epoch != epoch)
+    c->previous = 0;
+  c->capture_epoch = epoch;
+  current_call = c;
   c->count = 0;
   c->emitted = 0;
   c->observing = 1;
@@ -480,7 +511,7 @@ static Context *begin_call(PeakMpiCausalOperation op, const Comm *comm,
   r->kind = PEAK_MPI_OBSERVER_EVENT_START;
   r->operation = (uint32_t)op;
   r->phase = PEAK_MPI_CAUSAL_CALL_BEGIN;
-  r->op_uid = peak_mpi_causal_runtime_operation_id();
+  r->op_uid = 0; /* allocated together with its group under metadata below */
   r->input_ref = c->previous;
   r->communicator_uid = comm ? comm->uid : 0;
   r->peer = peer;
@@ -492,6 +523,15 @@ static Context *begin_call(PeakMpiCausalOperation op, const Comm *comm,
   if (op == PEAK_MPI_CAUSAL_BSEND)
     r->flags |= PEAK_MPI_CAUSAL_BUFFERED;
   pthread_mutex_lock(&metadata);
+  uint64_t locked_epoch = peak_mpi_causal_runtime_capture_enabled()
+                              ? peak_mpi_causal_runtime_capture_epoch()
+                              : 0;
+  if (c->capture_epoch != locked_epoch) {
+    c->previous = 0;
+    r->input_ref = 0;
+  }
+  c->capture_epoch = locked_epoch;
+  r->op_uid = peak_mpi_causal_runtime_operation_id();
   if (op == PEAK_MPI_CAUSAL_BSEND || op == PEAK_MPI_CAUSAL_BUFFER_DETACH)
     r->progress_begin = buffer_generation;
   if (contract.observed_buffer_detach && op == PEAK_MPI_CAUSAL_BSEND)
@@ -502,6 +542,15 @@ static Context *begin_call(PeakMpiCausalOperation op, const Comm *comm,
    * orders cost-group cuts without claiming MPI order between threads. */
   peak_mpi_causal_runtime_boundary(r);
   r->flags |= PEAK_MPI_CAUSAL_CUT_PRECAPTURED;
+  if (!c->capture_epoch) {
+    pthread_mutex_unlock(&metadata);
+    return c;
+  }
+  if (group_capture_epoch != c->capture_epoch) {
+    group_capture_epoch = c->capture_epoch;
+    group_active = group_emitted = group_published = 0;
+    previous_group = 0;
+  }
   if (!group_active) {
     group_uid = peak_mpi_causal_runtime_operation_id();
     group_emitted = 0;
@@ -527,6 +576,24 @@ static void end_call(Context *c, int rc, PeakMpiObserverRecord *details,
                      int actual, unsigned completed) {
   if (!c)
     return;
+  if (!c->capture_epoch ||
+      c->capture_epoch != peak_mpi_causal_runtime_capture_epoch() ||
+      !peak_mpi_causal_runtime_capture_enabled()) {
+    if (rc == MPI_SUCCESS &&
+        c->begin.operation == PEAK_MPI_CAUSAL_BUFFER_DETACH &&
+        contract.observed_buffer_detach) {
+      pthread_mutex_lock(&metadata);
+      uint64_t closed = c->detach_open_snapshot;
+      observed_open_buffered = observed_open_buffered >= closed
+                                   ? observed_open_buffered - closed
+                                   : 0;
+      pthread_mutex_unlock(&metadata);
+    }
+    c->observing = 0;
+    if (current_call == c)
+      current_call = NULL;
+    return;
+  }
   if (!c->emitted)
     publish_begin(c);
   PeakMpiObserverRecord r = c->begin;
@@ -553,7 +620,7 @@ static void end_call(Context *c, int rc, PeakMpiObserverRecord *details,
         &contract, (PeakMpiCausalOperation)r.operation, r.flags, 0, &scope);
     r.progress_scope = scope;
   }
-  peak_mpi_causal_runtime_submit(&r, actual);
+  submit_event(&r, actual);
   c->previous = r.op_uid;
   PeakMpiObserverRecord end;
   int emit_end = 0;
@@ -563,6 +630,13 @@ static void end_call(Context *c, int rc, PeakMpiObserverRecord *details,
     uint64_t closed = c->detach_open_snapshot;
     observed_open_buffered =
         observed_open_buffered >= closed ? observed_open_buffered - closed : 0;
+  }
+  if (c->capture_epoch != group_capture_epoch) {
+    pthread_mutex_unlock(&metadata);
+    c->observing = 0;
+    if (current_call == c)
+      current_call = NULL;
+    return;
   }
   if (group_active == 1) {
     previous_group = group_uid;
@@ -583,16 +657,33 @@ static void end_call(Context *c, int rc, PeakMpiObserverRecord *details,
     --group_active;
   pthread_mutex_unlock(&metadata);
   if (emit_end)
-    peak_mpi_causal_runtime_submit(&end, actual);
+    submit_event(&end, actual);
   c->observing = 0;
+  if (current_call == c)
+    current_call = NULL;
 }
 static void poll_empty(Context *c) {
   peak_mpi_causal_runtime_observer_work(PEAK_MPI_CAUSAL_WORK_POLL, 1);
   if (!c)
     return;
+  if (!c->capture_epoch ||
+      c->capture_epoch != peak_mpi_causal_runtime_capture_epoch() ||
+      !peak_mpi_causal_runtime_capture_enabled()) {
+    c->observing = 0;
+    if (current_call == c)
+      current_call = NULL;
+    return;
+  }
   PeakMpiObserverRecord end;
   int emit = 0;
   pthread_mutex_lock(&metadata);
+  if (c->capture_epoch != group_capture_epoch) {
+    pthread_mutex_unlock(&metadata);
+    c->observing = 0;
+    if (current_call == c)
+      current_call = NULL;
+    return;
+  }
   if (group_active == 1) {
     if (group_emitted) {
       previous_group = group_uid;
@@ -612,7 +703,7 @@ static void poll_empty(Context *c) {
     --group_active;
   pthread_mutex_unlock(&metadata);
   if (emit)
-    peak_mpi_causal_runtime_submit(&end, 0);
+    submit_event(&end, 0);
   c->observing = 0;
 }
 
@@ -1054,7 +1145,7 @@ static int request_index(MPI_Request handle) {
   return -1;
 }
 static int snapshot_request(MPI_Request handle, Request *out) {
-  if (!peak_mpi_causal_runtime_capture_enabled()) {
+  if (!peak_mpi_causal_runtime_metadata_enabled()) {
     memset(out, 0, sizeof(*out));
     if (handle != MPI_REQUEST_NULL)
       peak_mpi_causal_runtime_note_peer(-1);
@@ -1090,7 +1181,7 @@ static void install_request(MPI_Request handle, const Comm *comm,
                             unsigned flags, int peer, int tag, int root,
                             uint64_t ordinal, uint64_t start, int persistent,
                             PeakMpiObserverRecord *details) {
-  if (!peak_mpi_causal_runtime_capture_enabled())
+  if (!peak_mpi_causal_runtime_metadata_enabled())
     return;
   if (handle == MPI_REQUEST_NULL) {
     details->flags |= PEAK_MPI_CAUSAL_INACTIVE_REQUEST;
@@ -1118,6 +1209,8 @@ static void install_request(MPI_Request handle, const Comm *comm,
   r->generation = ++request_generation;
   r->activation = persistent ? 0 : 1;
   r->start_uid = start;
+  r->graph_epoch =
+      current_call && current_call->observing ? current_call->capture_epoch : 0;
   r->comm_uid = comm->uid;
   r->ordinal = ordinal;
   r->comm_slot = comm_slot;
@@ -1186,6 +1279,9 @@ static unsigned complete_request(Context *c, const Request *old,
     r.operation = old->operation;
     r.op_uid = old->start_uid;
     r.batch_uid = c ? c->begin.op_uid : 0;
+    int legacy = c && c->capture_epoch && old->graph_epoch != c->capture_epoch;
+    if (legacy)
+      r.op_uid = c->begin.op_uid;
     r.request_uid = old->uid;
     r.request_generation = old->generation;
     r.activation = old->activation;
@@ -1195,6 +1291,8 @@ static unsigned complete_request(Context *c, const Request *old,
     r.tag = old->tag;
     r.root = old->root;
     r.flags = old->flags | PEAK_MPI_CAUSAL_STATUS_OBSERVED;
+    if (legacy)
+      r.flags |= PEAK_MPI_CAUSAL_LEGACY_INPUT;
     r.flags |=
         reclaim ? PEAK_MPI_CAUSAL_RECLAIMED : PEAK_MPI_CAUSAL_STATUS_ONLY;
     if (reclaim && old->persistent)
@@ -1217,14 +1315,15 @@ static unsigned complete_request(Context *c, const Request *old,
         error == MPI_SUCCESS && !cancelled)
       actual = receive_status(&comms[slot], status, &r);
     if (c)
-      peak_mpi_causal_runtime_submit(&r, actual);
+      submit_event(&r, actual);
     if (error != MPI_SUCCESS)
       fail(PEAK_MPI_OBSERVER_REASON_CAPABILITY);
     if (old->operation == PEAK_MPI_CAUSAL_COMM_IDUP &&
         old->idup_comm != MPI_COMM_NULL && error == MPI_SUCCESS)
       define_comm(old->idup_comm, old->comm_uid, old->lineage_ordinal,
                   PEAK_MPI_CAUSAL_COMM_IDUP_CREATED, 0);
-  } else if (c && old->observed && reclaim && old->start_uid) {
+  } else if (c && old->observed && reclaim && old->start_uid &&
+             old->graph_epoch == c->capture_epoch) {
     PeakMpiObserverRecord r = {0};
     r.kind = PEAK_MPI_OBSERVER_EVENT_LOCAL_COST;
     r.phase = PEAK_MPI_CAUSAL_REQUEST_RETIRED;
@@ -1236,7 +1335,7 @@ static unsigned complete_request(Context *c, const Request *old,
     r.flags = old->flags | PEAK_MPI_CAUSAL_RECLAIMED;
     if (old->persistent)
       r.flags |= PEAK_MPI_CAUSAL_INACTIVE_REQUEST;
-    peak_mpi_causal_runtime_submit(&r, 0);
+    submit_event(&r, 0);
   }
   pthread_mutex_lock(&metadata);
   int i = request_index(old->handle);
@@ -1394,7 +1493,7 @@ static int wrap_Irecv(Fn_Irecv real, void *buf, int count, MPI_Datatype type,
     peer = world_peer(&m, source);
     note_peer(peer);
     if (peer == PEAK_MPI_CAUSAL_ANY_SOURCE &&
-        !peak_mpi_causal_runtime_capture_enabled())
+        !peak_mpi_causal_runtime_metadata_enabled())
       peak_mpi_causal_runtime_note_peer(-1);
     record_capability(PEAK_MPI_CAUSAL_RECV, PEAK_MPI_CAUSAL_NONBLOCKING,
                       actual_peer(peer));
@@ -1535,7 +1634,7 @@ FORWARD_BOTH(Test, (MPI_Request * request, int *flag, MPI_Status *status),
 
 static Context *prepare_many(int count, MPI_Request array[],
                              PeakMpiCausalOperation op, int deferred) {
-  if (!peak_mpi_causal_runtime_capture_enabled()) {
+  if (!peak_mpi_causal_runtime_metadata_enabled()) {
     if (count > 0)
       peak_mpi_causal_runtime_note_peer(-1);
     return NULL;
@@ -1820,7 +1919,7 @@ FORWARD_BOTH(Request_free, (MPI_Request * request), request)
       validate_type(type);                                                     \
     int rc;                                                                    \
     NATIVE(rc, real(buf, count, type, dest, tag, comm, request));              \
-    if (known && peak_mpi_causal_runtime_capture_enabled() &&                  \
+    if (known && peak_mpi_causal_runtime_metadata_enabled() &&                 \
         rc == MPI_SUCCESS && request) {                                        \
       PeakMpiObserverRecord d = {0};                                           \
       install_request(                                                         \
@@ -1857,8 +1956,8 @@ static int wrap_Recv_init(Fn_Recv_init real, void *buf, int count,
     validate_type(type);
   int rc;
   NATIVE(rc, real(buf, count, type, source, tag, comm, request));
-  if (known && peak_mpi_causal_runtime_capture_enabled() && rc == MPI_SUCCESS &&
-      request) {
+  if (known && peak_mpi_causal_runtime_metadata_enabled() &&
+      rc == MPI_SUCCESS && request) {
     PeakMpiObserverRecord d = {0};
     install_request(*request, &m, slot, PEAK_MPI_CAUSAL_RECV,
                     PEAK_MPI_CAUSAL_NONBLOCKING | PEAK_MPI_CAUSAL_PERSISTENT |
@@ -1894,6 +1993,7 @@ static unsigned activate_requests(Context *c, unsigned count) {
       requests[i].observed = 0;
       requests[i].cancelled = 0;
       requests[i].start_uid = start;
+      requests[i].graph_epoch = c->capture_epoch;
       ++requests[i].activation;
       if (contract.observed_p2p_completion) {
         if (requests[i].flags & PEAK_MPI_CAUSAL_BUFFERED)
@@ -1926,7 +2026,7 @@ static unsigned activate_requests(Context *c, unsigned count) {
       r.progress_begin = buffer_generation;
       pthread_mutex_unlock(&metadata);
     }
-    peak_mpi_causal_runtime_submit(&r, actual_peer(old->peer));
+    submit_event(&r, actual_peer(old->peer));
   }
   return actual;
 }
@@ -1937,7 +2037,7 @@ static int wrap_Start(Fn_Start real, MPI_Request *request) {
                    ? prepare_many(1, request, PEAK_MPI_CAUSAL_START, 0)
                    : NULL;
   unsigned actual = c ? activate_requests(c, 1) : 0;
-  if (observe && !peak_mpi_causal_runtime_capture_enabled())
+  if (observe && !peak_mpi_causal_runtime_metadata_enabled())
     peak_mpi_causal_runtime_note_peer(-1);
   int rc;
   NATIVE(rc, real(request));
@@ -1956,7 +2056,7 @@ static int wrap_Startall(Fn_Startall real, int count, MPI_Request array[]) {
   Context *c =
       observe ? prepare_many(count, array, PEAK_MPI_CAUSAL_START, 0) : NULL;
   unsigned actual = c ? activate_requests(c, (unsigned)count) : 0;
-  if (observe && count > 0 && !peak_mpi_causal_runtime_capture_enabled())
+  if (observe && count > 0 && !peak_mpi_causal_runtime_metadata_enabled())
     peak_mpi_causal_runtime_note_peer(-1);
   int rc;
   NATIVE(rc, real(count, array));
@@ -2138,7 +2238,7 @@ FORWARD_BOTH(Improbe,
 
 static int take_message(MPI_Message handle, Message *out, Comm *comm,
                         unsigned *slot) {
-  if (!peak_mpi_causal_runtime_capture_enabled())
+  if (!peak_mpi_causal_runtime_metadata_enabled())
     return 0;
   int found = 0;
   pthread_mutex_lock(&metadata);
@@ -2296,6 +2396,13 @@ static Context *collective_begin(PeakMpiCausalOperation op, MPI_Comm handle,
   int overlap = comms[*slot].active_collectives++ != 0;
   int no_open = !observed_open_requests && !observed_open_buffered;
   pthread_mutex_unlock(&metadata);
+  comm->ordinal = ordinal;
+  comm->recovery_operation = 0;
+  if (qualified && !overlap && !comm->inter &&
+      !(flags &
+        (PEAK_MPI_CAUSAL_NONBLOCKING | PEAK_MPI_CAUSAL_VARIABLE_COUNT)) &&
+      comm->size == peak_mpi_causal_runtime_world_size())
+    comm->recovery_operation = (unsigned)op;
   if (overlap)
     fail(PEAK_MPI_OBSERVER_REASON_IDENTITY);
   flags |= PEAK_MPI_CAUSAL_COLLECTIVE;
@@ -2340,6 +2447,17 @@ static void collective_end(Context *c, Comm *comm, unsigned slot, int rc,
   }
   if (comm->uid) {
     pthread_mutex_lock(&metadata);
+    if (rc == MPI_SUCCESS && comm->recovery_operation &&
+        comm->uid <= RECOVERY_COMM_CAP) {
+      uint64_t loss = peak_mpi_causal_runtime_loss_generation();
+      if (loss > UINT64_MAX >> 8)
+        fail(PEAK_MPI_OBSERVER_REASON_SEQUENCE_LIMIT);
+      else {
+        RecoveryWitness *w = &recovery_witnesses[comm->uid - 1];
+        w->ordinal = comm->ordinal;
+        w->ticket = (loss << 8) | comm->recovery_operation;
+      }
+    }
     if (comms[slot].active_collectives)
       --comms[slot].active_collectives;
     pthread_mutex_unlock(&metadata);
@@ -2347,7 +2465,7 @@ static void collective_end(Context *c, Comm *comm, unsigned slot, int rc,
   }
 }
 static int positive_counts(const int counts[], int n) {
-  if (!peak_mpi_causal_runtime_capture_enabled() || !counts)
+  if (!peak_mpi_causal_runtime_metadata_enabled() || !counts)
     return 0;
   int positive = 1, inspected = 0;
   for (int i = 0; i < n; ++i) {
@@ -2362,7 +2480,7 @@ static int positive_counts(const int counts[], int n) {
   return positive;
 }
 static int comm_size_cached(MPI_Comm handle) {
-  if (!peak_mpi_causal_runtime_capture_enabled())
+  if (!peak_mpi_causal_runtime_metadata_enabled())
     return 0;
   pthread_mutex_lock(&metadata);
   int i = comm_index(handle);
@@ -2372,7 +2490,7 @@ static int comm_size_cached(MPI_Comm handle) {
 }
 
 static int root_is_local(MPI_Comm comm, int root) {
-  if (!peak_mpi_causal_runtime_capture_enabled())
+  if (!peak_mpi_causal_runtime_metadata_enabled())
     return 0;
   pthread_mutex_lock(&metadata);
   int i = comm_index(comm);
@@ -2815,6 +2933,8 @@ static int wrap_Alltoallv(Fn_Alltoallv real, const void *sendbuf,
           (positive_counts(sendcounts, comm_size_cached(comm)) &&
            type_nonzero(sendtype)))),
         -1, &m, &slot);
+  /* This variable-count family is not an epoch recovery witness. */
+  m.recovery_operation = 0;
   uint64_t started = collective_timer(c);
   int rc;
   NATIVE(rc, real(sendbuf, sendcounts, sdispls, sendtype, recvbuf, recvcounts,
@@ -2888,6 +3008,8 @@ static int wrap_Reduce_scatter(Fn_Reduce_scatter real, const void *sendbuf,
                          (positive_counts(recvcounts, comm_size_cached(comm)) &&
                           type_nonzero(type)),
                          -1, &m, &slot);
+  /* This variable-count family is not an epoch recovery witness. */
+  m.recovery_operation = 0;
   uint64_t started = collective_timer(c);
   int rc;
   NATIVE(rc, real(sendbuf, recvbuf, recvcounts, type, op, comm));
@@ -4059,7 +4181,7 @@ static int wrap_Irecv_c(Fn_Irecv_c real, void *buf, MPI_Count count,
     peer = world_peer(&m, source);
     note_peer(peer);
     if (peer == PEAK_MPI_CAUSAL_ANY_SOURCE &&
-        !peak_mpi_causal_runtime_capture_enabled())
+        !peak_mpi_causal_runtime_metadata_enabled())
       peak_mpi_causal_runtime_note_peer(-1);
     record_capability(PEAK_MPI_CAUSAL_RECV, PEAK_MPI_CAUSAL_NONBLOCKING,
                       actual_peer(peer));
@@ -4158,8 +4280,8 @@ static int wrap_Recv_init_c(Fn_Recv_init_c real, void *buf, MPI_Count count,
     validate_type(type);
   int rc;
   NATIVE(rc, real(buf, count, type, source, tag, comm, request));
-  if (known && peak_mpi_causal_runtime_capture_enabled() && rc == MPI_SUCCESS &&
-      request) {
+  if (known && peak_mpi_causal_runtime_metadata_enabled() &&
+      rc == MPI_SUCCESS && request) {
     PeakMpiObserverRecord d = {0};
     install_request(*request, &m, slot, PEAK_MPI_CAUSAL_RECV,
                     PEAK_MPI_CAUSAL_NONBLOCKING | PEAK_MPI_CAUSAL_PERSISTENT |
@@ -5296,3 +5418,41 @@ PUBLIC_COARSE(Comm_spawn_multiple,
               if (get_comm(comm, &m, &slot, 1)) put_comm(slot);
               peak_mpi_causal_runtime_note_peer(-1))
 PUBLIC_COARSE_UNKNOWN(Comm_join, (int fd, MPI_Comm *intercomm), (fd, intercomm))
+
+int peak_mpi_causal_events_recovery(PeakMpiCausalRecovery *r) {
+  if (pthread_mutex_trylock(&metadata))
+    return 0;
+  int ok = 0;
+  if (r->state == PEAK_MPI_RECOVERY_QUERY) {
+    uint64_t loss = peak_mpi_causal_runtime_loss_generation();
+    if (r->comm && r->comm <= RECOVERY_COMM_CAP &&
+        recovery_witnesses[r->comm - 1].ordinal >= r->ordinal &&
+        (recovery_witnesses[r->comm - 1].ticket >> 8) == loss) {
+      r->loss = loss;
+      r->state = PEAK_MPI_RECOVERY_READY;
+      r->uid_floor = peak_mpi_causal_runtime_operation_floor();
+      ok = 1;
+    }
+  } else {
+    uint64_t first = UINT64_MAX;
+    for (unsigned i = 0; i < RECOVERY_COMM_CAP; i++) {
+      RecoveryWitness *w = &recovery_witnesses[i];
+      if (w->ordinal && (w->ticket >> 8) == r->loss && w->ordinal < first) {
+        first = w->ordinal;
+        r->comm = i + 1;
+        r->ordinal = w->ordinal;
+        r->operation = w->ticket & 255;
+        ok = 1;
+      }
+    }
+  }
+  pthread_mutex_unlock(&metadata);
+  return ok;
+}
+void peak_mpi_causal_events_recovery_adopt(uint64_t epoch) {
+  pthread_mutex_lock(&metadata);
+  group_capture_epoch = epoch;
+  group_active = group_emitted = group_published = 0;
+  group_uid = previous_group = 0;
+  pthread_mutex_unlock(&metadata);
+}

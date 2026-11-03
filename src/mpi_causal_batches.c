@@ -53,6 +53,8 @@ struct PeakMpiCausalBatches {
   size_t ready_head, ready_tail, current, plan_count;
   size_t cursor, parent_cursor, retire, retire_operation, retire_epoch;
   int state, compact_plan;
+  unsigned reset_stage;
+  size_t reset_cursor;
   unsigned error_rank;
   uint64_t error_uid;
 };
@@ -691,4 +693,68 @@ int peak_mpi_causal_batches_prefix_clear(const PeakMpiCausalBatches *b,
   }
   *cursor = b->retire_epoch * base + pos;
   return -1;
+}
+
+void peak_mpi_causal_batches_reset_begin(PeakMpiCausalBatches *b) {
+  if (b) {
+    b->reset_stage = 1;
+    b->reset_cursor = 0;
+  }
+}
+int peak_mpi_causal_batches_reset_work(PeakMpiCausalBatches *b, size_t budget,
+                                       size_t *used) {
+  *used = 0;
+  while (b->reset_stage && *used < budget) {
+    ++*used;
+    size_t i = b->reset_cursor++;
+    if (b->reset_stage == 1) {
+      if (i < b->capacity) {
+        b->entries[i].free_next = b->operations[i].free_next =
+            i + 1 < b->capacity ? i + 1 : NONE;
+      } else {
+        b->reset_stage++;
+        b->reset_cursor = 0;
+      }
+    } else if (b->reset_stage == 2) {
+      if (i < b->group_capacity)
+        b->groups[i].free_next = i + 1 < b->group_capacity ? i + 1 : NONE;
+      else {
+        b->reset_stage++;
+        b->reset_cursor = 0;
+      }
+    } else if (b->reset_stage == 3) {
+      if (i < b->operation_index_capacity)
+        b->operation_index[i] = 0;
+      else {
+        b->reset_stage++;
+        b->reset_cursor = 0;
+      }
+    } else if (b->reset_stage == 4) {
+      if (i < b->group_index_capacity)
+        b->group_index[i] = 0;
+      else {
+        b->reset_stage++;
+        b->reset_cursor = 0;
+      }
+    } else if (b->reset_stage == 5) {
+      if (i < b->world * b->slots) {
+        b->slot_head[i] = b->slot_tail[i] = NONE;
+      } else {
+        b->reset_stage++;
+        b->reset_cursor = 0;
+      }
+    } else if (i < b->world) {
+      b->last[i] = 0;
+      b->rank_next[i] = NONE;
+    } else {
+      b->free_entry = b->free_operation = b->free_group = 0;
+      b->pending = 0;
+      b->ready_head = b->ready_tail = b->current = NONE;
+      b->plan_count = 0;
+      b->state = IDLE;
+      b->compact_plan = 0;
+      b->reset_stage = 0;
+    }
+  }
+  return !b->reset_stage;
 }

@@ -2,6 +2,7 @@
 #define PEAK_MPI_CAUSAL_BACKEND_H
 
 #include "internal/mpi_causal_protocol.h"
+#include "internal/mpi_causal_recovery.h"
 #include "internal/mpi_cost_model.h"
 #include "internal/mpi_policy_adapter.h"
 
@@ -23,6 +24,7 @@ typedef struct {
 } PeakMpiCausalServiceConfig;
 
 typedef struct {
+  PeakMpiCausalRecovery recovery;
   uint64_t generation, incarnation, control_generation;
   uint64_t watermark_nonce;
   uint64_t idle_group_uid;

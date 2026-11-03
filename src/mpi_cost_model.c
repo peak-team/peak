@@ -81,6 +81,8 @@ struct PeakMpiCostModel {
     uint32_t group_node, group_edge, group_inputs;
     bool group_unknown;
     uint64_t search_stamp, group_stamp;
+    unsigned reset_stage;
+    uint32_t reset_cursor;
     CostPhase phase;
     bool graph_dirty, frontier_dirty, frontier_valid, pending, all_closed;
     double frontier;
@@ -1041,4 +1043,73 @@ PeakMpiCostStatus peak_mpi_cost_model_raw(const PeakMpiCostModel *m, uint32_t ra
 void peak_mpi_cost_model_stats(const PeakMpiCostModel *m, PeakMpiCostStats *out)
 {
     if (m && out) *out = m->stats;
+}
+
+/* Epoch reset reuses active-ID/free lists: no allocation or capacity sweep. */
+void peak_mpi_cost_model_reset_begin(PeakMpiCostModel *m) {
+    if (!m)
+        return;
+    m->phase = IDLE;
+    m->reset_stage = 1;
+    m->reset_cursor = 0;
+}
+int peak_mpi_cost_model_reset_work(PeakMpiCostModel *m, size_t budget,
+                                   size_t *used) {
+    *used = 0;
+    while (m->reset_stage && *used < budget) {
+        ++*used;
+        if (m->reset_stage == 1) {
+            if (m->stats.active_branches)
+                release_branch(m, m->branch_ids[m->stats.active_branches - 1]);
+            else
+                m->reset_stage = 2;
+        } else if (m->reset_stage == 2) {
+            if (m->stats.active_edges)
+                remove_edge(m, m->edge_ids[m->stats.active_edges - 1]);
+            else
+                m->reset_stage = 3;
+        } else if (m->reset_stage == 3) {
+            if (m->stats.active_nodes) {
+                uint32_t i = m->node_ids[--m->stats.active_nodes];
+                CostNode *n = &m->nodes[i];
+                if (n->settled)
+                    --m->stats.settled_nodes;
+                n->active = false;
+                n->free_next = m->free_node;
+                m->free_node = i;
+            } else
+                m->reset_stage = 4;
+        } else if (m->reset_stage == 4) {
+            if (m->stats.active_owners) {
+                uint32_t i = m->owner_ids[--m->stats.active_owners];
+                CostOwner *o = &m->owners[i];
+                o->active = false;
+                o->free_next = m->free_owner;
+                m->free_owner = i;
+            } else
+                m->reset_stage = 5;
+        } else if (m->reset_cursor < m->config.max_ranks) {
+            CostRank *r = &m->ranks[m->reset_cursor++];
+            r->continuation_known = r->raw_known = false;
+        } else {
+            m->stats.settled_nodes = 0;
+            m->continuation_count = 0;
+            m->stats.coarse = false;
+            m->stats.reason = PEAK_MPI_COST_REASON_NONE;
+            m->graph_dirty = m->frontier_dirty = true;
+            m->frontier_valid = false;
+            m->pending = false;
+            m->gc_phase = m->gc_cursor = 0;
+            m->reset_stage = 0;
+            m->last_result = PEAK_MPI_COST_PENDING;
+        }
+    }
+    return !m->reset_stage;
+}
+void peak_mpi_cost_model_reset_base(PeakMpiCostModel *m, uint32_t rank,
+                                    double L, double P) {
+    if (m && rank < m->config.max_ranks) {
+        m->ranks[rank].accounted_L = L;
+        m->ranks[rank].accounted_P = P;
+    }
 }

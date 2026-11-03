@@ -19,6 +19,7 @@ struct PeakMpiPolicy {
     Member *members;
     size_t *index, *scratch;
     size_t count, count_hint, index_capacity;
+    size_t recovery_cursor;
     PeakMpiPolicyMode mode;
     PeakMpiPolicyReason reason;
     double g, F, created_at, last_now, cut_received_at, cut_age;
@@ -105,7 +106,10 @@ static int bump(PeakMpiPolicy *p) {
     return 1;
 }
 static void coarse(PeakMpiPolicy *p, PeakMpiPolicyReason reason) {
-    if (p->mode != PEAK_MPI_POLICY_COARSE) p->reason = reason;
+    if (p->mode != PEAK_MPI_POLICY_COARSE ||
+        (p->reason == PEAK_MPI_POLICY_EVENT_LOSS &&
+         reason != PEAK_MPI_POLICY_EVENT_LOSS))
+        p->reason = reason;
     p->mode = PEAK_MPI_POLICY_COARSE;
     p->g = p->membership_complete ? (double)(p->count ? p->count : 1) :
         maximum(p->g, (double)(p->count_hint ? p->count_hint : 1));
@@ -185,6 +189,36 @@ PeakMpiPolicy *peak_mpi_policy_create(const PeakMpiPolicyConfig *c,
         p->members[i].id = ids[i]; insert_member(p, i);
     }
     return p;
+}
+void peak_mpi_policy_recover_begin(PeakMpiPolicy *p, double now, double g) {
+    if (!p || (p->mode == PEAK_MPI_POLICY_COARSE &&
+               p->reason != PEAK_MPI_POLICY_EVENT_LOSS))
+        return;
+    p->mode = PEAK_MPI_POLICY_COMPLETE;
+    p->reason = PEAK_MPI_POLICY_NO_REASON;
+    p->have_cut = p->baseline_valid = 0;
+    p->last_now = now;
+    p->g = clamp_g(g, p->count);
+    p->cut_received_at = p->pressure_received_at = now;
+    p->cut_age = p->pressure_age = 0;
+    p->recovery_cursor = 0;
+    (void)bump(p);
+}
+int peak_mpi_policy_recover_work(PeakMpiPolicy *p, size_t budget,
+                                 size_t *used) {
+    *used = 0;
+    while (p->recovery_cursor < p->count && *used < budget) {
+        p->members[p->recovery_cursor++].have_covered = 0;
+        ++*used;
+    }
+    return p->recovery_cursor == p->count;
+}
+void peak_mpi_policy_recover(PeakMpiPolicy *p, double now, double g) {
+    if (!p)
+        return;
+    peak_mpi_policy_recover_begin(p, now, g);
+    size_t used = 0;
+    (void)peak_mpi_policy_recover_work(p, SIZE_MAX, &used);
 }
 void peak_mpi_policy_free(PeakMpiPolicy *p) {
     if (!p) return;
@@ -482,27 +516,38 @@ PeakMpiPolicyResult peak_mpi_policy_feedback_batch(PeakMpiPolicy *p,
 }
 
 static int feedback_valid(const PeakMpiPolicyFeedback *f) {
-    if (!(f->mode >= PEAK_MPI_POLICY_LOCAL && f->mode <= PEAK_MPI_POLICY_COARSE &&
-        f->reason >= PEAK_MPI_POLICY_NO_REASON && f->reason <= PEAK_MPI_POLICY_BAD_CUT &&
-        f->member_count && isfinite(f->q) && f->q > 0 && f->q < 1 &&
-        (!f->membership_complete || f->member_count > 1 || f->mode == PEAK_MPI_POLICY_LOCAL) &&
-        isfinite(f->g) && f->g >= 1 &&
-        (!f->membership_complete || f->g <= (double)f->member_count) &&
-        (!f->membership_complete || f->mode != PEAK_MPI_POLICY_COARSE ||
-            f->g == (double)f->member_count) &&
-        (!f->membership_complete || f->mode != PEAK_MPI_POLICY_STALE ||
-            f->g == (double)f->member_count) &&
-        nonnegative(f->L_cut) && nonnegative(f->P_cut) && f->P_cut <= f->L_cut &&
-        nonnegative(f->D_cut) && nonnegative(f->local_elapsed_at_cut) &&
-        nonnegative(f->F) && nonnegative(f->risk) && nonnegative(f->U_tail) &&
-        nonnegative(f->T_safe) && nonnegative(f->local_latest_L) && f->local_latest_L >= f->L_cut &&
-        nonnegative(f->received_raw_sum) && nonnegative(f->age_seconds) &&
-        nonnegative(f->oldest_unresolved_age) &&
-        (!f->coverage_complete || (f->membership_complete &&
-            f->T_safe <= f->local_elapsed_at_cut)) &&
-        (!f->received_raw_complete || f->membership_complete) &&
-        (!f->risk_known || f->coverage_complete) &&
-        (!f->tails_complete || (f->coverage_complete && f->received_raw_complete)))) return 0;
+    if (f->mode == PEAK_MPI_POLICY_APPROX &&
+        (!f->approximate || !f->recovery.epoch || f->coverage_complete ||
+         f->risk_known || f->tails_complete))
+        return 0;
+    if (!(f->mode >= PEAK_MPI_POLICY_LOCAL &&
+          f->mode <= PEAK_MPI_POLICY_APPROX &&
+          f->reason >= PEAK_MPI_POLICY_NO_REASON &&
+          f->reason <= PEAK_MPI_POLICY_BAD_CUT && f->member_count &&
+          isfinite(f->q) && f->q > 0 && f->q < 1 &&
+          (!f->membership_complete || f->member_count > 1 ||
+           f->mode == PEAK_MPI_POLICY_LOCAL) &&
+          isfinite(f->g) && f->g >= 1 &&
+          (!f->membership_complete || f->g <= (double)f->member_count) &&
+          (!f->membership_complete || f->mode != PEAK_MPI_POLICY_COARSE ||
+           f->g == (double)f->member_count) &&
+          (!f->membership_complete || f->mode != PEAK_MPI_POLICY_STALE ||
+           f->g == (double)f->member_count) &&
+          nonnegative(f->L_cut) && nonnegative(f->P_cut) &&
+          f->P_cut <= f->L_cut && nonnegative(f->D_cut) &&
+          nonnegative(f->local_elapsed_at_cut) && nonnegative(f->F) &&
+          nonnegative(f->risk) && nonnegative(f->U_tail) &&
+          nonnegative(f->T_safe) && nonnegative(f->local_latest_L) &&
+          f->local_latest_L >= f->L_cut && nonnegative(f->received_raw_sum) &&
+          nonnegative(f->age_seconds) &&
+          nonnegative(f->oldest_unresolved_age) &&
+          (!f->coverage_complete ||
+           (f->membership_complete && f->T_safe <= f->local_elapsed_at_cut)) &&
+          (!f->received_raw_complete || f->membership_complete) &&
+          (!f->risk_known || f->coverage_complete) &&
+          (!f->tails_complete ||
+           (f->coverage_complete && f->received_raw_complete))))
+        return 0;
     /* These are canonical same-value invariants, not comparisons between
      * separately accumulated floating-point totals. A finite fixed epsilon
      * cannot bound F versus raw history without the model's path-operation
@@ -548,6 +593,16 @@ PeakMpiPolicyResult peak_mpi_policy_receiver_note_membership_hint(PeakMpiPolicyR
     r->conservative_g = maximum(r->conservative_g, (double)count);
     return PEAK_MPI_POLICY_OK;
 }
+int peak_mpi_policy_receiver_recover(PeakMpiPolicyReceiver *r, double now) {
+    if (!r ||
+        (r->permanent_coarse && r->coarse_reason != PEAK_MPI_POLICY_EVENT_LOSS))
+        return 0;
+    r->permanent_coarse = r->feedback_invalid = 0;
+    r->coarse_reason = PEAK_MPI_POLICY_NO_REASON;
+    r->have_feedback = 0;
+    r->created_at = r->last_now = now;
+    return 1;
+}
 PeakMpiPolicyResult peak_mpi_policy_receiver_accept(PeakMpiPolicyReceiver *r,
     const PeakMpiPolicyFeedback *f, double now) {
     if (!r || !f || !clock_valid(now, r->last_now)) return PEAK_MPI_POLICY_INVALID;
@@ -572,7 +627,10 @@ PeakMpiPolicyResult peak_mpi_policy_receiver_accept(PeakMpiPolicyReceiver *r,
          * coarse signal must survive discovery of additional participants. */
         if (f->mode == PEAK_MPI_POLICY_COARSE) {
             r->permanent_coarse = 1;
-            if (!r->coarse_reason) r->coarse_reason = f->reason;
+            if (!r->coarse_reason ||
+                (r->coarse_reason == PEAK_MPI_POLICY_EVENT_LOSS &&
+                 f->reason != PEAK_MPI_POLICY_EVENT_LOSS))
+                r->coarse_reason = f->reason;
         }
         return PEAK_MPI_POLICY_IGNORED;
     }
@@ -588,7 +646,10 @@ PeakMpiPolicyResult peak_mpi_policy_receiver_accept(PeakMpiPolicyReceiver *r,
     r->membership_complete = !!f->membership_complete;
     if (f->mode == PEAK_MPI_POLICY_COARSE) {
         r->permanent_coarse = 1;
-        if (!r->coarse_reason) r->coarse_reason = f->reason;
+        if (!r->coarse_reason ||
+            (r->coarse_reason == PEAK_MPI_POLICY_EVENT_LOSS &&
+             f->reason != PEAK_MPI_POLICY_EVENT_LOSS))
+            r->coarse_reason = f->reason;
     }
     r->conservative_g = maximum(r->conservative_g, f->g);
     return PEAK_MPI_POLICY_OK;
@@ -599,7 +660,9 @@ PeakMpiPolicyResult peak_mpi_policy_receiver_mark_coarse(PeakMpiPolicyReceiver *
         reason < PEAK_MPI_POLICY_MISSING_CONTRACT || reason > PEAK_MPI_POLICY_BAD_CUT)
         return PEAK_MPI_POLICY_INVALID;
     r->last_now = now; r->active = 1; r->permanent_coarse = 1;
-    if (!r->coarse_reason) r->coarse_reason = reason;
+    if (!r->coarse_reason || (r->coarse_reason == PEAK_MPI_POLICY_EVENT_LOSS &&
+                              reason != PEAK_MPI_POLICY_EVENT_LOSS))
+        r->coarse_reason = reason;
     r->conservative_g = maximum(r->conservative_g,
         (double)(r->known_member_count ? r->known_member_count : 1));
     return PEAK_MPI_POLICY_OK;
@@ -645,11 +708,18 @@ PeakMpiPolicyResult peak_mpi_policy_receiver_snapshot(PeakMpiPolicyReceiver *r,
         d->global_available = fresh && matching_mode &&
             d->mode != PEAK_MPI_POLICY_STALE && r->membership_complete &&
             f->coverage_complete && f->risk_known && f->tails_complete;
-        if (r->have_feedback && f->coverage_complete &&
+        if (r->have_feedback && (f->coverage_complete || f->approximate) &&
             d->mode != PEAK_MPI_POLICY_COARSE && L >= f->L_cut)
             d->local_D_estimate = f->D_cut+(L-f->L_cut);
         else d->local_D_estimate = NAN;
         if (!isfinite(d->local_D_estimate)) d->local_D_estimate = NAN;
+        if (fresh && matching_mode && !r->permanent_coarse &&
+            d->mode == PEAK_MPI_POLICY_APPROX && f->approximate &&
+            r->membership_complete) {
+            d->available_headroom = local_headroom;
+            d->headroom_known = 1;
+            d->reattach_relaxation = local_headroom > 0;
+        }
         /* A finer tuple received after permanent coarse cannot establish a
          * coarse raw-sum risk; wait for another explicitly coarse tuple. */
         if (d->global_available && matching_mode && f->risk_known && f->tails_complete &&

@@ -123,6 +123,11 @@ typedef struct {
 
 PeakMpiCostModel *peak_mpi_cost_model_create(const PeakMpiCostConfig *config);
 void peak_mpi_cost_model_destroy(PeakMpiCostModel *model);
+void peak_mpi_cost_model_reset_begin(PeakMpiCostModel *model);
+int peak_mpi_cost_model_reset_work(PeakMpiCostModel *model, size_t budget,
+                                   size_t *used);
+void peak_mpi_cost_model_reset_base(PeakMpiCostModel *model, uint32_t rank,
+                                    double L, double P);
 PeakMpiCostStatus peak_mpi_cost_model_reserve_owner(PeakMpiCostModel *, PeakMpiCostOwnerRef *);
 PeakMpiCostStatus peak_mpi_cost_model_define_owner(PeakMpiCostModel *, PeakMpiCostOwnerRef,
                                                 uint32_t rank, double delta_L, double delta_P);

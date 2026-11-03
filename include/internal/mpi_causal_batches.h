@@ -19,6 +19,9 @@ PeakMpiCausalBatches *
 peak_mpi_causal_batches_create_with_slots(size_t world, size_t slots,
                                           size_t capacity);
 void peak_mpi_causal_batches_destroy(PeakMpiCausalBatches *);
+void peak_mpi_causal_batches_reset_begin(PeakMpiCausalBatches *);
+int peak_mpi_causal_batches_reset_work(PeakMpiCausalBatches *, size_t,
+                                       size_t *);
 int peak_mpi_causal_batches_ingest(PeakMpiCausalBatches *, unsigned rank,
                                    const PeakMpiObserverRecord *);
 /* Every plan-list and retirement transition uses one work unit; metadata

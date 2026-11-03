@@ -1,5 +1,6 @@
 #ifndef PEAK_MPI_POLICY_ADAPTER_H
 #define PEAK_MPI_POLICY_ADAPTER_H
+#include "internal/mpi_causal_recovery.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -24,7 +25,8 @@ typedef enum {
     PEAK_MPI_POLICY_LOCAL = 0,
     PEAK_MPI_POLICY_COMPLETE,
     PEAK_MPI_POLICY_STALE,
-    PEAK_MPI_POLICY_COARSE
+    PEAK_MPI_POLICY_COARSE,
+    PEAK_MPI_POLICY_APPROX
 } PeakMpiPolicyMode;
 
 typedef enum {
@@ -87,6 +89,8 @@ typedef struct {
 } PeakMpiPolicyCut;
 
 typedef struct {
+    PeakMpiCausalRecovery recovery;
+    int approximate;
     PeakMpiPolicyCohortKey cohort;
     PeakMpiPolicyMemberId member;
     uint64_t generation, event_cut, control_generation, policy_generation;
@@ -111,6 +115,9 @@ typedef struct {
 } PeakMpiPolicyFeedback;
 
 typedef struct PeakMpiPolicy PeakMpiPolicy;
+void peak_mpi_policy_recover(PeakMpiPolicy *policy, double now, double g);
+void peak_mpi_policy_recover_begin(PeakMpiPolicy *, double now, double g);
+int peak_mpi_policy_recover_work(PeakMpiPolicy *, size_t budget, size_t *used);
 
 /* Members must be the actual communication-connected cohort, not an inferred
  * world/peer-list replacement for dependency analysis. Unknown membership is
@@ -220,6 +227,9 @@ PeakMpiPolicyResult peak_mpi_policy_receiver_mark_coarse(PeakMpiPolicyReceiver *
 PeakMpiPolicyResult peak_mpi_policy_receiver_snapshot(PeakMpiPolicyReceiver *receiver,
     double now, double local_elapsed_now, double local_L_now,
     double existing_local_headroom, PeakMpiPolicyDecision *decision);
+
+int peak_mpi_policy_receiver_recover(PeakMpiPolicyReceiver *receiver,
+                                     double now);
 
 #ifdef __cplusplus
 }

@@ -32,12 +32,17 @@ static double origin, startup, activation_start;
 static _Atomic double control_cost, management_cost;
 static _Atomic uint64_t control_generation;
 static double boundary_price, boundary_slot_price, emit_price;
-static double mode_seconds[4], previous_tick, exceeded_seconds,
+static double mode_seconds[5], previous_tick, exceeded_seconds,
     maximum_feedback_age;
 static uint64_t age_histogram[64], age_samples;
 static PeakMpiPolicyDecision last_decision;
 static PeakMpiPolicyFeedback last_feedback;
 static PeakMpiCausalWorkPrices work_prices;
+static _Atomic int fine_paused;
+static _Atomic uint64_t capture_epoch = 1;
+static uint64_t handled_loss;
+static PeakMpiCausalRecovery local_recovery;
+static uint64_t *recovery_prefixes;
 static int finalizing, service_configuration_reported;
 static int heartbeat_enabled = 1, hook_controller_enabled;
 static _Thread_local size_t local_slot = SIZE_MAX;
@@ -80,10 +85,26 @@ int peak_mpi_causal_runtime_enabled(void) {
   return atomic_load_explicit(&ready, memory_order_acquire);
 }
 int peak_mpi_causal_runtime_capture_enabled(void) {
-  return heartbeat_enabled && peak_mpi_causal_runtime_enabled() &&
+  return !atomic_load_explicit(&fine_paused, memory_order_acquire) &&
+         heartbeat_enabled && peak_mpi_causal_runtime_enabled() &&
          peak_mpi_observer_coarse_reason(capture) ==
              PEAK_MPI_OBSERVER_REASON_NONE;
 }
+int peak_mpi_causal_runtime_metadata_enabled(void) {
+  uint64_t mask = peak_mpi_observer_fault_mask(capture);
+  return heartbeat_enabled && peak_mpi_causal_runtime_enabled() &&
+         !(mask & ~(UINT64_C(1) << PEAK_MPI_OBSERVER_REASON_RING_OVERFLOW));
+}
+uint64_t peak_mpi_causal_runtime_loss_generation(void) {
+  return peak_mpi_observer_loss_generation(capture);
+}
+uint64_t peak_mpi_causal_runtime_capture_epoch(void) {
+  return atomic_load_explicit(&capture_epoch, memory_order_acquire);
+}
+uint64_t peak_mpi_causal_runtime_operation_floor(void) {
+  return atomic_load_explicit(&next_operation, memory_order_acquire);
+}
+int peak_mpi_causal_runtime_world_size(void) { return world_size; }
 int peak_mpi_causal_runtime_prepare(size_t n, double q, double hb, double ema) {
   if (!peak_mpi_causal_runtime_requested())
     return 0;
@@ -110,7 +131,8 @@ int peak_mpi_causal_runtime_prepare(size_t n, double q, double hb, double ema) {
   PeakMpiObserverConfig c = {n, 256, 4096, incarnation};
   capture = peak_mpi_observer_create(&c);
   slot_prefixes = calloc(n, sizeof(*slot_prefixes));
-  if (!capture || !slot_prefixes) {
+  recovery_prefixes = calloc(n, sizeof *recovery_prefixes);
+  if (!capture || !slot_prefixes || !recovery_prefixes) {
     fprintf(stderr,
             "[peak mpi causal] unavailable: fixed capture allocation failed\n");
     return 0;
@@ -245,10 +267,12 @@ void peak_mpi_causal_runtime_boundary(PeakMpiObserverRecord *r) {
     r->progress_end = ns(clock_seconds() - origin);
 }
 void peak_mpi_causal_runtime_submit(PeakMpiObserverRecord *r, int remote) {
-  if (!peak_mpi_causal_runtime_enabled() || !get_producer())
+  if (!peak_mpi_causal_runtime_enabled())
     return;
   if (remote)
     atomic_store_explicit(&active, 1, memory_order_relaxed);
+  if (!peak_mpi_causal_runtime_capture_enabled() || !get_producer())
+    return;
   peak_mpi_observer_activate(capture);
   peak_mpi_causal_cost_observer_add(producer.slot, emit_price);
   if (!(r->flags & PEAK_MPI_CAUSAL_CUT_PRECAPTURED))
@@ -353,6 +377,11 @@ void peak_mpi_causal_runtime_mpi_initialized(void) {
 static void latch_capture_coarse(void) {
   if (!receiver.permanent_coarse)
     return;
+  if (receiver.coarse_reason == PEAK_MPI_POLICY_EVENT_LOSS &&
+      (peak_mpi_observer_fault_mask(capture) ==
+           (UINT64_C(1) << PEAK_MPI_OBSERVER_REASON_RING_OVERFLOW) ||
+       (last_feedback.recovery.loss && !last_feedback.recovery.fault_mask)))
+    return;
   PeakMpiObserverReason reason;
   switch (receiver.coarse_reason) {
   case PEAK_MPI_POLICY_MISSING_CONTRACT:
@@ -378,7 +407,10 @@ static void freeze_raw(PeakMpiCausalRaw *raw) {
   for (size_t i = 0; i < slots; i++) {
     PeakMpiObserverSlotState state;
     if (peak_mpi_observer_slot_state(capture, i, &state)) {
-      slot_prefixes[i] = state.published;
+      slot_prefixes[i] =
+          atomic_load_explicit(&capture_epoch, memory_order_relaxed) > 1
+              ? state.last_attempt_sequence
+              : state.published;
       raw->lost_events += state.lost;
     }
   }
@@ -401,6 +433,15 @@ void peak_mpi_causal_runtime_tick(double now, double elapsed, double C,
   atomic_store_explicit(&control_generation, generation, memory_order_relaxed);
   if (!atomic_load_explicit(&backend_ready, memory_order_acquire))
     return;
+  uint64_t notified = peak_mpi_observer_loss_generation(capture);
+  if (notified != handled_loss) {
+    handled_loss = notified;
+    uint64_t pending_epoch = local_recovery.epoch;
+    memset(&local_recovery, 0, sizeof local_recovery);
+    uint64_t current =
+        atomic_load_explicit(&capture_epoch, memory_order_relaxed);
+    local_recovery.epoch = pending_epoch > current ? pending_epoch : current;
+  }
   int enabled = atomic_load_explicit(&active, memory_order_relaxed);
   size_t known_count = 1;
   for (int i = 0; i < world_size; i++)
@@ -454,6 +495,20 @@ void peak_mpi_causal_runtime_tick(double now, double elapsed, double C,
       .watermark_nonce = watermark_nonce};
   if (!peak_mpi_causal_events_idle_cut(freeze_idle_raw, &raw))
     freeze_raw(&raw);
+  if (local_recovery.state == PEAK_MPI_RECOVERY_READY &&
+      local_recovery.loss != peak_mpi_observer_loss_generation(capture)) {
+    uint64_t epoch = local_recovery.epoch;
+    memset(&local_recovery, 0, sizeof local_recovery);
+    local_recovery.epoch = epoch;
+  }
+  raw.recovery = local_recovery;
+  raw.recovery.loss = raw.lost_events;
+  raw.recovery.fault_mask = peak_mpi_observer_fault_mask(capture);
+  if (local_recovery.state == PEAK_MPI_RECOVERY_READY) {
+    memcpy(slot_prefixes, recovery_prefixes, slots * sizeof *slot_prefixes);
+  } else if (raw.recovery.loss && raw.recovery.state != PEAK_MPI_RECOVERY_ACK) {
+    (void)peak_mpi_causal_events_recovery(&raw.recovery);
+  }
   double L = raw.L;
 
   peak_mpi_causal_service_tick(service, capture, &raw, now, 65536, observer_work_budget);
@@ -468,6 +523,49 @@ void peak_mpi_causal_runtime_tick(double now, double elapsed, double C,
         now);
   PeakMpiPolicyFeedback f;
   if (peak_mpi_causal_service_feedback(service, &f)) {
+    uint64_t hard = peak_mpi_observer_fault_mask(capture) &
+                    ~(UINT64_C(1) << PEAK_MPI_OBSERVER_REASON_RING_OVERFLOW);
+    if (receiver.permanent_coarse &&
+        receiver.coarse_reason != PEAK_MPI_POLICY_EVENT_LOSS)
+      hard |= UINT64_C(1) << PEAK_MPI_OBSERVER_REASON_METADATA;
+    if (!hard && f.recovery.state == PEAK_MPI_RECOVERY_QUERY &&
+        f.recovery.epoch >
+            atomic_load_explicit(&capture_epoch, memory_order_relaxed)) {
+      if (local_recovery.epoch != f.recovery.epoch ||
+          local_recovery.state != PEAK_MPI_RECOVERY_READY) {
+        PeakMpiCausalRecovery candidate = f.recovery;
+        atomic_store_explicit(&fine_paused, 1, memory_order_release);
+        if (peak_mpi_causal_events_recovery(&candidate)) {
+          peak_mpi_causal_runtime_cost_snapshot(&candidate.L, &candidate.P);
+          candidate.elapsed = clock_seconds() - origin;
+          for (size_t i = 0; i < slots; i++) {
+            PeakMpiObserverSlotState st;
+            peak_mpi_observer_slot_state(capture, i, &st);
+            recovery_prefixes[i] = st.last_attempt_sequence;
+          }
+          local_recovery = candidate;
+        }
+      }
+    } else if (!hard && f.recovery.state == PEAK_MPI_RECOVERY_ACK &&
+               local_recovery.state == PEAK_MPI_RECOVERY_READY &&
+               f.recovery.epoch == local_recovery.epoch) {
+      uint64_t mask = peak_mpi_observer_fault_mask(capture);
+      int resumed = mask ? peak_mpi_observer_recover_generation(
+                               capture, local_recovery.loss)
+                         : 1;
+      if (!mask)
+        peak_mpi_observer_discard(capture);
+      if (resumed) {
+        peak_mpi_causal_events_recovery_adopt(f.recovery.epoch);
+        atomic_store_explicit(&capture_epoch, f.recovery.epoch,
+                              memory_order_release);
+        local_recovery.state = PEAK_MPI_RECOVERY_ACK;
+        atomic_store_explicit(&fine_paused, 0, memory_order_release);
+        peak_mpi_policy_receiver_recover(&receiver, now);
+        reason = peak_mpi_observer_coarse_reason(capture);
+      }
+    }
+
     if (memcmp(&f.cohort, &receiver.cohort, sizeof(f.cohort)))
       peak_mpi_policy_receiver_rebind(&receiver, f.cohort, f.member_count,
                                       f.membership_complete, now);
@@ -520,6 +618,13 @@ void peak_mpi_causal_runtime_report(void) {
   if (!peak_mpi_causal_runtime_enabled())
     return;
   const PeakMpiProgressContract *contract = peak_mpi_causal_events_contract();
+  fprintf(stderr,
+          "[peak mpi causal recovery] rank=%d epoch=%llu quality=%s "
+          "lost_history=%llu state=%llu\n",
+          rank_id, (unsigned long long)local_recovery.epoch,
+          last_feedback.approximate ? "approx" : "original",
+          (unsigned long long)last_feedback.lost_events,
+          (unsigned long long)local_recovery.state);
   fprintf(stderr,
           "[peak mpi causal contract] rank=%d reason=%s profile=%s fabrics=%s "
           "ofi_provider=%s fi_provider=%s async_setting=%s effective_async=%d "
@@ -592,14 +697,16 @@ void peak_mpi_causal_runtime_report(void) {
       rank_id, age_p50, age_p95, age_p99,
       age_samples ? maximum_feedback_age : NAN, (unsigned long long)age_samples,
       last_feedback.oldest_unresolved_age);
-  static const char *mode_names[] = {"local", "complete", "stale", "coarse"};
+  static const char *mode_names[] = {"local", "complete", "stale", "coarse",
+                                     "approx"};
   fprintf(stderr,
           "[peak mpi causal feedback] rank=%d mode=%s global_control=%s "
           "policy_reason=%u "
           "covered=%llu age=%.9g g=%.9g D=%.9g risk=%.9g risk_known=%d "
           "covered_complete=%d covered_local_L_minus_D=%.9g "
           "local_seconds=%.9g fine_seconds=%.9g stale_seconds=%.9g "
-          "coarse_seconds=%.9g estimated_budget_exceeded_seconds=%.9g\n",
+          "coarse_seconds=%.9g approximate_seconds=%.9g approximate_D=%.9g "
+          "estimated_budget_exceeded_seconds=%.9g\n",
           rank_id, mode_names[last_decision.mode],
           last_decision.global_available ? "available" : "unavailable",
           (unsigned)last_decision.reason,
@@ -616,6 +723,8 @@ void peak_mpi_causal_runtime_report(void) {
               ? last_feedback.L_cut - last_feedback.D_cut
               : NAN,
           mode_seconds[0], mode_seconds[1], mode_seconds[2], mode_seconds[3],
+          mode_seconds[4],
+          last_feedback.approximate ? last_feedback.D_cut : NAN,
           exceeded_seconds);
   fprintf(
       stderr,

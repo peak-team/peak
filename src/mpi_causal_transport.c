@@ -11,7 +11,7 @@
 #include <unistd.h>
 
 #define HDR 40u
-#define MAGIC UINT32_C(0x504d4331)
+#define MAGIC UINT32_C(0x504d4332)
 enum { SEND_BATCH_FRAMES = 16 };
 enum { HELLO = 1, RECORD, OBJECT, RAW, ACK, FEEDBACK, WMRQ };
 typedef struct {
@@ -121,6 +121,26 @@ static void record_decode(const unsigned char *p, PeakMpiObserverRecord *r) {
 #undef D64
 #undef D32
 }
+#define REC64(X)                                                               \
+  X(epoch)                                                                     \
+  X(state) X(comm) X(ordinal) X(operation) X(uid_floor) X(loss) X(fault_mask)
+static void recovery_encode(unsigned char **p, const PeakMpiCausalRecovery *r) {
+#define E(f) p64(p, r->f);
+  REC64(E)
+#undef E
+  pd(p, r->L);
+  pd(p, r->P);
+  pd(p, r->elapsed);
+}
+static void recovery_decode(const unsigned char **p, PeakMpiCausalRecovery *r) {
+#define D(f) r->f = g64(p);
+  REC64(D)
+#undef D
+  r->L = gd(p);
+  r->P = gd(p);
+  r->elapsed = gd(p);
+}
+#define RECOVERY_BYTES 88u
 #define F64(X)                                                                 \
   X(cohort.job_incarnation)                                                    \
   X(cohort.cohort_id)                                                          \
@@ -161,6 +181,8 @@ static size_t feedback_encode(unsigned char *b,
 #define E(f) p32(&p, (uint32_t)r->f);
   FI(E)
 #undef E
+  recovery_encode(&p, &r->recovery);
+  p32(&p, (uint32_t)r->approximate);
   return (size_t)(p - b);
 }
 static void feedback_decode(const unsigned char *p, PeakMpiPolicyFeedback *r) {
@@ -175,6 +197,8 @@ static void feedback_decode(const unsigned char *p, PeakMpiPolicyFeedback *r) {
 #define D(f) r->f = g32(&p);
   FI(D)
 #undef D
+  recovery_decode(&p, &r->recovery);
+  r->approximate = (int)g32(&p);
 }
 static size_t object_encode(unsigned char *b, const PeakMpiObserverObject *o) {
   unsigned char *p = b;
@@ -252,13 +276,14 @@ static size_t raw_encode(unsigned char *b, const PeakMpiCausalRaw *r) {
   p32(&p, (uint32_t)r->slot_count);
   for (i = 0; i < r->slot_count; ++i)
     p64(&p, r->slot_prefixes[i]);
+  recovery_encode(&p, &r->recovery);
   return (size_t)(p - b);
 }
 static int raw_decode(const unsigned char *p, size_t n, PeakMpiCausalRaw *r,
                       unsigned char *peers, unsigned world, uint64_t *prefixes,
                       size_t slots) {
   size_t i;
-  if (n < 104)
+  if (n < 104 + RECOVERY_BYTES)
     return 0;
   memset(r, 0, sizeof(*r));
   r->generation = g64(&p);
@@ -277,18 +302,19 @@ static int raw_decode(const unsigned char *p, size_t n, PeakMpiCausalRaw *r,
   r->coarse_reason = g32(&p);
   r->lost_events = g64(&p);
   r->peer_count = g32(&p);
-  if (r->peer_count != world || n < 104 + r->peer_count)
+  if (r->peer_count != world || n < 104 + RECOVERY_BYTES + r->peer_count)
     return 0;
   memcpy(peers, p, r->peer_count);
   r->known_peers = peers;
   p += r->peer_count;
   r->slot_count = g32(&p);
   if ((r->slot_count && r->slot_count != slots) ||
-      n != 104 + r->peer_count + 8 * r->slot_count)
+      n != 104 + RECOVERY_BYTES + r->peer_count + 8 * r->slot_count)
     return 0;
   for (i = 0; i < r->slot_count; ++i)
     prefixes[i] = g64(&p);
   r->slot_prefixes = prefixes;
+  recovery_decode(&p, &r->recovery);
   return 1;
 }
 static size_t frame(PeakMpiCausalTransport *t, unsigned char *b, unsigned type,
@@ -922,7 +948,7 @@ static void client_tick(PeakMpiCausalTransport *t, double now, size_t *budget) {
       uint64_t nonce = g64(&q);
       if (nonce > t->requested_nonce)
         t->requested_nonce = nonce;
-    } else if (type == FEEDBACK && n == 232) {
+    } else if (type == FEEDBACK && n == 232 + RECOVERY_BYTES + 4) {
       feedback_decode(q, &t->feedback);
       t->have_feedback = 1;
       t->stats.feedbacks++;
@@ -959,6 +985,7 @@ void peak_mpi_causal_transport_tick(PeakMpiCausalTransport *t,
       return;
     }
     if (!t->raw_seen || raw->generation != t->raw.generation ||
+        memcmp(&raw->recovery, &t->raw.recovery, sizeof raw->recovery) != 0 ||
         raw->watermark_nonce != t->raw.watermark_nonce ||
         raw->idle_group_uid != t->raw.idle_group_uid ||
         raw->idle_cut != t->raw.idle_cut ||

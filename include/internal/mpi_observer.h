@@ -11,11 +11,19 @@ extern "C" {
 
 /* Local capture ABI, not an MPI capability claim or a portable wire encoding.
  * Adapters must supply complete identities/progress scope or call fail(). */
+#define PEAK_MPI_OBSERVER_RECOVERY_API 1
+
 #define PEAK_MPI_OBSERVER_RECORD_BYTES 256u
 #define PEAK_MPI_OBSERVER_FEEDBACK_BYTES 512u
 #define PEAK_MPI_OBSERVER_OBJECT_BYTES 128u
 
 typedef struct PeakMpiObserver PeakMpiObserver;
+int peak_mpi_observer_recover(PeakMpiObserver *observer);
+int peak_mpi_observer_recover_generation(PeakMpiObserver *,
+                                         uint64_t generation);
+void peak_mpi_observer_discard(PeakMpiObserver *observer);
+uint64_t peak_mpi_observer_fault_mask(const PeakMpiObserver *observer);
+uint64_t peak_mpi_observer_loss_generation(const PeakMpiObserver *observer);
 
 typedef enum {
     PEAK_MPI_OBSERVER_OK = 0,

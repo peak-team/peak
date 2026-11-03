@@ -40,6 +40,7 @@ struct PeakMpiObserver {
     bool has_feedback;
     PeakMpiObserverFeedback feedback;
     _Atomic bool active;
+    _Atomic uint64_t fault_mask, loss_generation;
     _Atomic unsigned fault_state; /* 0: none, 1: publishing, 2: immutable */
     PeakMpiObserverFault fault;
 };
@@ -55,6 +56,8 @@ static void *allocate_aligned(size_t size) {
 
 static void fail_at(PeakMpiObserver *o, PeakMpiObserverReason reason,
                     size_t slot, uint64_t generation, uint64_t sequence) {
+    atomic_fetch_or_explicit(&o->fault_mask, UINT64_C(1) << reason,
+                             memory_order_release);
     unsigned expected = 0;
     if (atomic_compare_exchange_strong_explicit(&o->fault_state, &expected, 1,
             memory_order_acq_rel, memory_order_relaxed)) {
@@ -106,6 +109,8 @@ PeakMpiObserver *peak_mpi_observer_create(const PeakMpiObserverConfig *c) {
     }
     atomic_init(&o->object_count, 0);
     atomic_init(&o->active, false);
+    atomic_init(&o->fault_mask, 0);
+    atomic_init(&o->loss_generation, 0);
     atomic_init(&o->fault_state, 0);
     for (size_t i = 0; i < c->slots; ++i) {
         PeakMpiObserverSlot *s = &o->slots[i];
@@ -150,11 +155,63 @@ void peak_mpi_observer_fail(PeakMpiObserver *o, PeakMpiObserverReason reason) {
         fail_at(o, reason, SIZE_MAX, 0, 0);
 }
 
+uint64_t peak_mpi_observer_loss_generation(const PeakMpiObserver *o) {
+    return o ? atomic_load_explicit(&o->loss_generation, memory_order_acquire)
+             : 0;
+}
+uint64_t peak_mpi_observer_fault_mask(const PeakMpiObserver *o) {
+    return o ? atomic_load_explicit(&o->fault_mask, memory_order_acquire) : 0;
+}
 PeakMpiObserverReason peak_mpi_observer_coarse_reason(const PeakMpiObserver *o) {
-    if (!o) return PEAK_MPI_OBSERVER_REASON_METADATA;
-    unsigned state = atomic_load_explicit(&o->fault_state, memory_order_acquire);
-    return state == 0 ? PEAK_MPI_OBSERVER_REASON_NONE :
-           state == 1 ? PEAK_MPI_OBSERVER_REASON_PENDING_FAULT : o->fault.reason;
+    if (!o)
+        return PEAK_MPI_OBSERVER_REASON_NONE;
+    uint64_t mask = peak_mpi_observer_fault_mask(o);
+    uint64_t hard =
+        mask & ~(UINT64_C(1) << PEAK_MPI_OBSERVER_REASON_RING_OVERFLOW);
+    if (hard) {
+        for (unsigned reason = 1;
+             reason < PEAK_MPI_OBSERVER_REASON_PENDING_FAULT; ++reason)
+            if (hard & (UINT64_C(1) << reason))
+                return (PeakMpiObserverReason)reason;
+    }
+    if (mask)
+        return PEAK_MPI_OBSERVER_REASON_RING_OVERFLOW;
+    return PEAK_MPI_OBSERVER_REASON_NONE;
+}
+void peak_mpi_observer_discard(PeakMpiObserver *o) {
+    if (!o)
+        return;
+    for (size_t i = 0; i < o->config.slots; i++) {
+        uint64_t head =
+            atomic_load_explicit(&o->slots[i].head, memory_order_acquire);
+        atomic_store_explicit(&o->slots[i].tail, head, memory_order_release);
+    }
+}
+int peak_mpi_observer_recover_generation(PeakMpiObserver *o,
+                                         uint64_t generation) {
+    if (!o || peak_mpi_observer_loss_generation(o) != generation ||
+        peak_mpi_observer_fault_mask(o) !=
+            (UINT64_C(1) << PEAK_MPI_OBSERVER_REASON_RING_OVERFLOW))
+        return 0;
+    /* Keep first-fault publication immutable forever. Only the separate active
+     * cause mask is acknowledged. A concurrent hard-fault OR defeats the CAS.
+     */
+    peak_mpi_observer_discard(o);
+    uint64_t mask = UINT64_C(1) << PEAK_MPI_OBSERVER_REASON_RING_OVERFLOW;
+    int cleared = atomic_compare_exchange_strong_explicit(
+        &o->fault_mask, &mask, 0, memory_order_acq_rel, memory_order_acquire);
+    if (cleared && peak_mpi_observer_loss_generation(o) != generation) {
+        atomic_fetch_or_explicit(&o->fault_mask,
+                                 UINT64_C(1)
+                                     << PEAK_MPI_OBSERVER_REASON_RING_OVERFLOW,
+                                 memory_order_release);
+        return 0;
+    }
+    return cleared;
+}
+int peak_mpi_observer_recover(PeakMpiObserver *o) {
+    return peak_mpi_observer_recover_generation(
+        o, peak_mpi_observer_loss_generation(o));
 }
 
 bool peak_mpi_observer_fault(const PeakMpiObserver *o, PeakMpiObserverFault *f) {
@@ -215,7 +272,7 @@ PeakMpiObserverStatus peak_mpi_observer_emit(PeakMpiObserver *o,
     if (!r) return PEAK_MPI_OBSERVER_BAD_ARGUMENT;
     if (!atomic_load_explicit(&o->active, memory_order_acquire))
         return PEAK_MPI_OBSERVER_INACTIVE;
-    if (atomic_load_explicit(&o->fault_state, memory_order_acquire))
+    if (peak_mpi_observer_fault_mask(o))
         return PEAK_MPI_OBSERVER_COARSE;
     uint64_t seq = atomic_load_explicit(&s->last_attempt, memory_order_relaxed);
     if (seq == UINT64_MAX) {
@@ -238,6 +295,7 @@ PeakMpiObserverStatus peak_mpi_observer_emit(PeakMpiObserver *o,
     uint64_t tail = atomic_load_explicit(&s->tail, memory_order_acquire);
     if (head - tail >= o->config.records_per_slot) {
         lose_record(s, seq);
+        atomic_fetch_add_explicit(&o->loss_generation, 1, memory_order_release);
         fail_at(o, PEAK_MPI_OBSERVER_REASON_RING_OVERFLOW, p->slot, p->generation, seq);
         return PEAK_MPI_OBSERVER_OVERFLOW;
     }
@@ -302,7 +360,8 @@ overflow:
 PeakMpiObserverStatus peak_mpi_observer_object_add(PeakMpiObserver *o,
     const PeakMpiObserverObject *d, uint64_t *uid) {
     if (!o || !d || !uid || !d->generation) return PEAK_MPI_OBSERVER_BAD_ARGUMENT;
-    if (atomic_load_explicit(&o->fault_state, memory_order_acquire))
+    if (peak_mpi_observer_fault_mask(o) &
+        ~(UINT64_C(1) << PEAK_MPI_OBSERVER_REASON_RING_OVERFLOW))
         return PEAK_MPI_OBSERVER_COARSE;
     if (pthread_mutex_lock(&o->object_mutex)) {
         fail_at(o, PEAK_MPI_OBSERVER_REASON_METADATA, SIZE_MAX, 0, 0);
