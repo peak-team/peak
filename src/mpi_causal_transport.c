@@ -7,10 +7,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #define HDR 40u
 #define MAGIC UINT32_C(0x504d4331)
+enum { SEND_BATCH_FRAMES = 16 };
 enum { HELLO = 1, RECORD, OBJECT, RAW, ACK, FEEDBACK, WMRQ };
 typedef struct {
   int fd, ready, feedback_sent;
@@ -343,6 +345,53 @@ static int write_buf(PeakMpiCausalTransport *t, int fd, unsigned char *b,
     return *at == n;
   }
   if (z < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+    return 0;
+  return -1;
+}
+static int write_queued(PeakMpiCausalTransport *t, int fd, size_t *budget) {
+  /* Gather retained frames without copying or changing their wire boundaries.
+   * Both the vector count and total submitted bytes are bounded. */
+  struct iovec vectors[SEND_BATCH_FRAMES];
+  struct msghdr message = {0};
+  size_t count = 0, remaining = *budget;
+  /* Finish a partial event before inserting pending RAW control, without
+   * beginning another event ahead of that control frame. */
+  size_t limit = t->raw_pending && t->send_at ? 1 : SEND_BATCH_FRAMES;
+  for (size_t j = t->send_index; j < t->count && count < limit && remaining;
+       ++j) {
+    size_t i = (t->head + j) % t->c.queue_frames;
+    size_t offset = j == t->send_index ? t->send_at : 0;
+    size_t bytes = t->lengths[i] - offset;
+    if (bytes > remaining)
+      bytes = remaining;
+    vectors[count].iov_base = t->queue + i * t->cap + offset;
+    vectors[count++].iov_len = bytes;
+    remaining -= bytes;
+  }
+  if (!count)
+    return 0;
+  message.msg_iov = vectors;
+  message.msg_iovlen = count;
+  ssize_t written = sendmsg(fd, &message, MSG_NOSIGNAL);
+  if (written > 0) {
+    size_t bytes = (size_t)written;
+    *budget -= bytes;
+    t->stats.sent_bytes += (uint64_t)bytes;
+    while (bytes) {
+      size_t i = (t->head + t->send_index) % t->c.queue_frames;
+      size_t rest = t->lengths[i] - t->send_at;
+      if (bytes < rest) {
+        t->send_at += bytes;
+        break;
+      }
+      bytes -= rest;
+      t->send_index++;
+      t->send_at = 0;
+    }
+    return 1;
+  }
+  if (written < 0 &&
+      (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
     return 0;
   return -1;
 }
@@ -820,73 +869,78 @@ static void client_tick(PeakMpiCausalTransport *t, double now, size_t *budget) {
       return;
     p->out_n = p->out_at = 0;
   }
-  if (t->send_index < t->count && *budget) {
-    size_t i = (t->head + t->send_index) % t->c.queue_frames;
-    rc = write_buf(t, p->fd, t->queue + i * t->cap, t->lengths[i], &t->send_at,
-                   budget);
+  /* A batch of events must not outrun its ACKs and delay watermark feedback.
+   * Keep the original control framing and shared byte allowance. */
+  for (unsigned frames = 0, reads = 0;
+       frames < SEND_BATCH_FRAMES && reads < 2 * SEND_BATCH_FRAMES && *budget;
+       ++reads) {
+    size_t before = *budget;
+    rc = read_frame(t, p, budget);
     if (rc < 0) {
       close_peer(p);
       return;
     }
-    if (rc) {
-      t->send_index++;
-      t->send_at = 0;
+    if (!rc) {
+      if (before == *budget)
+        break;
+      continue;
     }
-  }
-  rc = read_frame(t, p, budget);
-  if (rc < 0) {
-    close_peer(p);
-    return;
-  }
-  if (!rc)
-    return;
-  q = p->in;
-  (void)g32(&q);
-  type = g32(&q);
-  n = g32(&q);
-  rank = g32(&q);
-  job = g64(&q);
-  inc = g64(&q);
-  seq = g64(&q);
-  if (rank != t->c.owner_rank || job != t->c.job_context ||
-      (t->incarnations[rank] && t->incarnations[rank] != inc)) {
-    fault(t, t->c.rank, PEAK_MPI_POLICY_BAD_IDENTITY);
-    close_peer(p);
-    return;
-  }
-  t->incarnations[rank] = inc;
-  if (type == ACK && !n) {
-    if (seq > t->next_seq) {
+    q = p->in;
+    (void)g32(&q);
+    type = g32(&q);
+    n = g32(&q);
+    rank = g32(&q);
+    job = g64(&q);
+    inc = g64(&q);
+    seq = g64(&q);
+    if (rank != t->c.owner_rank || job != t->c.job_context ||
+        (t->incarnations[rank] && t->incarnations[rank] != inc)) {
       fault(t, t->c.rank, PEAK_MPI_POLICY_BAD_IDENTITY);
       close_peer(p);
       return;
     }
-    while (t->count) {
-      const unsigned char *h = t->queue + t->head * t->cap + 32;
-      uint64_t s = g64(&h);
-      if (s > seq)
-        break;
-      t->head = (t->head + 1) % t->c.queue_frames;
-      t->count--;
-      if (t->send_index)
-        t->send_index--;
-      else
-        t->send_at = 0;
+    t->incarnations[rank] = inc;
+    if (type == ACK && !n) {
+      if (seq > t->next_seq) {
+        fault(t, t->c.rank, PEAK_MPI_POLICY_BAD_IDENTITY);
+        close_peer(p);
+        return;
+      }
+      while (t->count) {
+        const unsigned char *h = t->queue + t->head * t->cap + 32;
+        uint64_t s = g64(&h);
+        if (s > seq)
+          break;
+        t->head = (t->head + 1) % t->c.queue_frames;
+        t->count--;
+        if (t->send_index)
+          t->send_index--;
+        else
+          t->send_at = 0;
+      }
+    } else if (type == WMRQ && n == 8 && !seq) {
+      uint64_t nonce = g64(&q);
+      if (nonce > t->requested_nonce)
+        t->requested_nonce = nonce;
+    } else if (type == FEEDBACK && n == 232) {
+      feedback_decode(q, &t->feedback);
+      t->have_feedback = 1;
+      t->stats.feedbacks++;
+    } else {
+      fault(t, t->c.rank, PEAK_MPI_POLICY_BAD_IDENTITY);
+      close_peer(p);
+      return;
     }
-  } else if (type == WMRQ && n == 8 && !seq) {
-    uint64_t nonce = g64(&q);
-    if (nonce > t->requested_nonce)
-      t->requested_nonce = nonce;
-  } else if (type == FEEDBACK && n == 232) {
-    feedback_decode(q, &t->feedback);
-    t->have_feedback = 1;
-    t->stats.feedbacks++;
-  } else {
-    fault(t, t->c.rank, PEAK_MPI_POLICY_BAD_IDENTITY);
-    close_peer(p);
-    return;
+    reset_input(p);
+    ++frames;
   }
-  reset_input(p);
+  if (t->send_index < t->count && *budget) {
+    rc = write_queued(t, p->fd, budget);
+    if (rc < 0) {
+      close_peer(p);
+      return;
+    }
+  }
 }
 void peak_mpi_causal_transport_tick(PeakMpiCausalTransport *t,
                                     PeakMpiObserver *o,
