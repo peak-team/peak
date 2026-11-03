@@ -59,4 +59,10 @@ int peak_mpi_causal_batches_prefix_clear(const PeakMpiCausalBatches *,
                                          unsigned rank,
                                          const uint64_t *prefixes, size_t slots,
                                          size_t *cursor, size_t *work_budget);
+/* The caller freezes a cumulative list containing every nonzero prefix slot.
+ * Appended slots belong only to a later query. Zero prefixes impose no pending
+ * requirement, so each indexed transition is charged once without zero walks. */
+int peak_mpi_causal_batches_prefix_clear_slots(
+    const PeakMpiCausalBatches *, unsigned rank, const uint64_t *prefixes,
+    const size_t *slots, size_t count, size_t *cursor, size_t *work_budget);
 #endif /* PEAK_MPI_CAUSAL_BATCHES_H */

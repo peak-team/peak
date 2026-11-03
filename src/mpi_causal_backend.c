@@ -76,6 +76,9 @@ typedef struct {
   uint64_t idle_group, verify_group, verify_nonce, verify_generation,
       last_verify_generation;
   size_t verify_cursor;
+  size_t *prefix_slots;
+  unsigned char *prefix_seen;
+  size_t prefix_slot_count, verify_slot_count;
   int idle, verify_active, verify_idle, verify_stage, has_verified;
   size_t visible_cursor, visible_limit, accept_cursor;
   double verify_L, verify_P, verify_elapsed, verify_received;
@@ -115,6 +118,8 @@ struct PeakMpiCausalService {
   int plan_active, building_concurrent;
   PeakMpiCostRef group_start, group_cost;
   Rank *ranks;
+  size_t *prefix_slots;
+  unsigned char *prefix_seen;
   uint64_t *sequences, *anchors, *prefixes, *verify_prefixes,
       *verified_prefixes, *processed;
   unsigned visibility_rank, verify_rank_cursor;
@@ -506,6 +511,17 @@ static uint64_t prefix_sum(const uint64_t *prefix, size_t slots) {
   }
   return sum;
 }
+static uint64_t prefix_sum_slots(const uint64_t *prefix, const size_t *slots,
+                                 size_t count) {
+  uint64_t sum = 0;
+  for (size_t i = 0; i < count; i++) {
+    uint64_t value = prefix[slots[i]];
+    if (UINT64_MAX - sum < value)
+      return UINT64_MAX;
+    sum += value;
+  }
+  return sum;
+}
 static void raw_to_policy(PeakMpiCausalService *s, unsigned r) {
   Rank *a = &s->ranks[r];
   PeakMpiPolicySample p = {
@@ -567,8 +583,18 @@ int peak_mpi_causal_service_ingest_raw(PeakMpiCausalService *s, unsigned r,
   a->received_at = now;
   a->have_raw = 1;
   a->have_prefix = raw->slot_prefixes && raw->slot_count == s->config.slots;
-  if (a->have_prefix)
-    memcpy(a->prefix, raw->slot_prefixes, s->config.slots * sizeof(uint64_t));
+  if (a->have_prefix) {
+    /* The existing RAW prefix copy also discovers slots once. This cumulative
+     * list only appends; an in-flight verifier freezes its earlier length. */
+    for (size_t i = 0; i < s->config.slots; i++) {
+      uint64_t value = raw->slot_prefixes[i];
+      if (value && !a->prefix_seen[i]) {
+        a->prefix_seen[i] = 1;
+        a->prefix_slots[a->prefix_slot_count++] = i;
+      }
+      a->prefix[i] = value;
+    }
+  }
   a->active |= raw->active;
   a->unknown |= raw->unknown_members;
   if (raw->known_peers)
@@ -854,7 +880,9 @@ static void analysis_wake(PeakMpiCausalService *s, Operation *o) {
     return;
   }
   int source =
-      send_op(o->begin.operation) ? o->begin.peer : o->end.actual_source;
+      send_op(o->begin.operation) && !recv_op(o->begin.operation)
+          ? o->begin.peer
+          : o->end.actual_source;
   if (source < 0 || (unsigned)source >= s->config.world_size)
     return;
   Rank *remote = &s->ranks[(unsigned)source], *local = &s->ranks[o->rank];
@@ -2111,12 +2139,17 @@ static void verify_prefixes(PeakMpiCausalService *s, size_t budget) {
         s->last_work_used++;
         continue;
       }
-      /* One coherent frozen tuple. Prefix copy is one fixed O(slots) quantum;
-       * subsequent accepted-prefix, pending-record and visible-operation walks
+      /* One coherent frozen tuple. Copy only its cumulative nonzero slots;
+       * later slot activation cannot alter this frozen membership. Subsequent
+       * accepted-prefix, pending-record and visible-operation walks
        * resume at one transition per work unit. */
-      if (budget < s->config.slots)
+      if (budget < a->prefix_slot_count)
         return;
-      memcpy(a->verify_prefix, a->prefix, s->config.slots * sizeof(uint64_t));
+      a->verify_slot_count = a->prefix_slot_count;
+      for (size_t i = 0; i < a->verify_slot_count; i++) {
+        size_t slot = a->prefix_slots[i];
+        a->verify_prefix[slot] = a->prefix[slot];
+      }
       a->verify_nonce = a->echoed_nonce;
       a->verify_generation = a->raw_generation;
       a->verify_cursor = 0;
@@ -2130,26 +2163,27 @@ static void verify_prefixes(PeakMpiCausalService *s, size_t budget) {
       a->verify_elapsed = a->elapsed;
       a->verify_control = a->control;
       a->verify_received = a->received_at;
-      budget -= s->config.slots;
-      s->last_work_used += s->config.slots;
+      budget -= a->verify_slot_count;
+      s->last_work_used += a->verify_slot_count;
     }
     if (a->verify_stage == 1) {
-      while (budget && a->accept_cursor < s->config.slots) {
-        size_t at = a->accept_cursor;
+      while (budget && a->accept_cursor < a->verify_slot_count) {
+        size_t at = a->prefix_slots[a->accept_cursor];
         budget--;
         s->last_work_used++;
         if (a->sequence[at] < a->verify_prefix[at])
           break;
         a->accept_cursor++;
       }
-      if (a->accept_cursor < s->config.slots)
+      if (a->accept_cursor < a->verify_slot_count)
         continue;
       a->verify_stage = 2;
     }
     if (a->verify_stage == 2) {
       size_t before = budget;
-      int clear = peak_mpi_causal_batches_prefix_clear(
-          s->batches, rank, a->verify_prefix, s->config.slots,
+      int clear = peak_mpi_causal_batches_prefix_clear_slots(
+          s->batches, rank, a->verify_prefix, a->prefix_slots,
+          a->verify_slot_count,
           &a->verify_cursor, &budget);
       s->last_work_used += before - budget;
       if (clear != 1)
@@ -2174,11 +2208,11 @@ static void verify_prefixes(PeakMpiCausalService *s, size_t budget) {
       }
       if (a->visible_cursor < a->visible_limit)
         return;
-      if (a->verify_idle && budget < s->config.slots)
+      if (a->verify_idle && budget < a->verify_slot_count)
         return;
       if (a->verify_idle) {
-        budget -= s->config.slots;
-        s->last_work_used += s->config.slots;
+        budget -= a->verify_slot_count;
+        s->last_work_used += a->verify_slot_count;
       }
       uint64_t *old = a->verified_prefix;
       a->verified_prefix = a->verify_prefix;
@@ -2200,7 +2234,8 @@ static void verify_prefixes(PeakMpiCausalService *s, size_t budget) {
             PeakMpiPolicySample sample = {
                 {rank, s->config.job_context},
                 0,
-                prefix_sum(a->verified_prefix, s->config.slots),
+                prefix_sum_slots(a->verified_prefix, a->prefix_slots,
+                                 a->verify_slot_count),
                 a->verify_control,
                 sec(idle.L_cut),
                 sec(idle.P_cut),
@@ -2733,6 +2768,10 @@ peak_mpi_causal_service_create(const PeakMpiCausalServiceConfig *c) {
   s->epoch = 1;
   s->analysis_head = s->analysis_tail = SIZE_MAX;
   s->ranks = calloc(c->world_size, sizeof *s->ranks);
+  s->prefix_slots =
+      calloc((size_t)c->world_size * c->slots, sizeof *s->prefix_slots);
+  s->prefix_seen =
+      calloc((size_t)c->world_size * c->slots, sizeof *s->prefix_seen);
   s->sequences = calloc((size_t)c->world_size * c->slots, sizeof *s->sequences);
   s->anchors = calloc((size_t)c->world_size * c->slots, sizeof *s->anchors);
   s->prefixes = calloc((size_t)c->world_size * c->slots, sizeof *s->prefixes);
@@ -2784,7 +2823,8 @@ peak_mpi_causal_service_create(const PeakMpiCausalServiceConfig *c) {
   s->matching = peak_mpi_causal_match_index_create(c->max_operations);
   s->batches = peak_mpi_causal_batches_create_with_slots(
       c->world_size, c->slots, c->max_pending_records);
-  if (!s->ranks || !s->sequences || !s->anchors || !s->prefixes ||
+  if (!s->ranks || !s->prefix_slots || !s->prefix_seen || !s->sequences ||
+      !s->anchors || !s->prefixes ||
       !s->verify_prefixes || !s->verified_prefixes || !s->processed ||
       !s->nodes || !s->cuts || !s->free_cuts || !s->index || !s->operations ||
       !s->active || !s->candidates || !s->free_ops || !s->keep || !s->deps ||
@@ -2800,6 +2840,8 @@ peak_mpi_causal_service_create(const PeakMpiCausalServiceConfig *c) {
     a->parent = r;
     a->cohort_size = 1;
     a->key = (PeakMpiPolicyCohortKey){c->job_context, r, 1};
+    a->prefix_slots = s->prefix_slots + (size_t)r * c->slots;
+    a->prefix_seen = s->prefix_seen + (size_t)r * c->slots;
     a->sequence = s->sequences + (size_t)r * c->slots;
     a->anchor = s->anchors + (size_t)r * c->slots;
     a->prefix = s->prefixes + (size_t)r * c->slots;
@@ -2840,6 +2882,8 @@ void peak_mpi_causal_service_destroy(PeakMpiCausalService *s) {
     for (unsigned i = 0; i < s->config.world_size; i++)
       peak_mpi_policy_free(s->ranks[i].policy);
   free(s->ranks);
+  free(s->prefix_slots);
+  free(s->prefix_seen);
   free(s->sequences);
   free(s->anchors);
   free(s->prefixes);

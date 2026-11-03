@@ -695,6 +695,30 @@ int peak_mpi_causal_batches_prefix_clear(const PeakMpiCausalBatches *b,
   return -1;
 }
 
+int peak_mpi_causal_batches_prefix_clear_slots(
+    const PeakMpiCausalBatches *b, unsigned rank, const uint64_t *prefixes,
+    const size_t *slots, size_t count, size_t *cursor, size_t *budget) {
+  if (!b || !b->slots || !prefixes || !slots || !cursor || !budget ||
+      rank >= b->world || count > b->slots)
+    return 0;
+  while (*cursor < count && *budget) {
+    size_t slot = slots[(*cursor)++];
+    (*budget)--;
+    if (slot >= b->slots)
+      return 0;
+    size_t head = b->slot_head[(size_t)rank * b->slots + slot];
+    if (head != NONE && b->entries[head].r.sequence <= prefixes[slot]) {
+      *cursor = 0;
+      return 0;
+    }
+  }
+  if (*cursor == count) {
+    *cursor = 0;
+    return 1;
+  }
+  return -1;
+}
+
 void peak_mpi_causal_batches_reset_begin(PeakMpiCausalBatches *b) {
   if (b) {
     b->reset_stage = 1;

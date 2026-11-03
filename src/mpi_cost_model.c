@@ -54,7 +54,8 @@ typedef struct {
 typedef struct { uint32_t node, edge; } CostFrame;
 typedef enum {
     IDLE, RESET_NODES, RESET_EDGES, RESET_OWNERS, GROUP_SCAN, GROUP_INPUTS,
-    FILTER_SCAN, FILTER_SEARCH,
+    FILTER_SCAN, FILTER_SEARCH, ORDER_SAVE, ORDER_RESET,
+    ORDER_BUILD, ORDER_QUEUE, ORDER_DEPTH,
     DFS_SCAN, DFS_WALK, SCC_SCAN, SCC_WALK, AGG_NODES, CHECK_OWNERS,
     BLOCK_OWNERS, AGG_EDGES, CHECK_GROUPS, QUEUE_COMPONENTS, TOPOLOGY,
     COMMIT_NODES, FRONTIER_RANKS, FRONTIER_BRANCHES, FINISH
@@ -79,7 +80,7 @@ struct PeakMpiCostModel {
     uint32_t gc_phase, gc_cursor;
     uint32_t continuation_count;
     uint32_t group_node, group_edge, group_inputs;
-    bool group_unknown;
+    bool group_unknown, ordering;
     uint64_t search_stamp, group_stamp;
     unsigned reset_stage;
     uint32_t reset_cursor;
@@ -406,6 +407,13 @@ PeakMpiCostStatus peak_mpi_cost_model_seal(PeakMpiCostModel *m, PeakMpiCostRef r
  * incoming graph is no longer needed for settlement of a new prefix. */
 static bool selected(const PeakMpiCostModel *m, const CostEdge *e)
 {
+    /* Use precisely the guarantee predicate of the fallback path search. */
+    if (m->ordering)
+        return e->active && (e->kind == PEAK_MPI_COST_GUARANTEED ||
+               (e->kind == PEAK_MPI_COST_SLACK_INPUT &&
+                m->nodes[e->target].defined &&
+                m->nodes[e->target].spec.kind == PEAK_MPI_COST_COLLECTIVE &&
+                m->nodes[e->target].group_identity_valid));
     return e->active && e->retained && !m->nodes[e->target].settled;
 }
 
@@ -444,10 +452,13 @@ static void search_step(PeakMpiCostModel *m)
                            m->nodes[e->target].group_identity_valid);
         if (e->active && guaranteed) {
             CostNode *n = &m->nodes[e->source];
-            if (e->source == candidate->target) {
+            /* Reaching the target's guaranteed SCC proves the path. A
+             * predecessor below its level cannot lie on such a path. */
+            if (n->component == m->nodes[candidate->target].component) {
                 candidate->retained = false; ++m->stats.excluded_candidates;
                 m->phase = FILTER_SCAN;
-            } else if (n->search_stamp != m->search_stamp) {
+            } else if (n->input_count >= m->nodes[candidate->target].input_count &&
+                       n->search_stamp != m->search_stamp) {
                 n->search_stamp = m->search_stamp;
                 m->queue[m->queue_tail++] = e->source;
             }
@@ -615,7 +626,7 @@ static void run_step(PeakMpiCostModel *m)
                 m->group_unknown = false;
                 m->phase = GROUP_INPUTS;
             }
-        } else { m->phase = FILTER_SCAN; m->cursor = 0; }
+        } else { m->ordering = true; m->phase = DFS_SCAN; m->cursor = 0; }
         break;
     case GROUP_INPUTS:
         if (m->group_edge != NONE) {
@@ -642,9 +653,20 @@ static void run_step(PeakMpiCostModel *m)
     case FILTER_SCAN:
         if (m->cursor < m->stats.active_edges) {
             i = m->edge_ids[m->cursor++];
-            if (m->edges[i].active && m->edges[i].kind == PEAK_MPI_COST_SEND_REVERSE)
-                search_start(m, i);
-        } else { m->phase = DFS_SCAN; m->cursor = 0; }
+            if (m->edges[i].active && m->edges[i].kind == PEAK_MPI_COST_SEND_REVERSE) {
+                CostEdge *e = &m->edges[i];
+                /* A path target -> source strictly increases SCC depth. */
+                uint32_t source = m->nodes[e->source].input_count;
+                uint32_t target = m->nodes[e->target].input_count;
+                if (m->nodes[e->target].component == m->nodes[e->source].component) {
+                    e->retained = false;
+                    ++m->stats.excluded_candidates;
+                } else if (target >= source) {
+                    e->retained = true;
+                    ++m->stats.retained_candidates;
+                } else search_start(m, i);
+            }
+        } else { m->phase = ORDER_RESET; m->cursor = 0; }
         break;
     case FILTER_SEARCH: search_step(m); break;
     case DFS_SCAN:
@@ -671,7 +693,76 @@ static void run_step(PeakMpiCostModel *m)
                 m->scc_current = m->component_count++;
                 scc_push(m, i); m->phase = SCC_WALK;
             }
-        } else { m->phase = AGG_NODES; m->cursor = 0; }
+        } else { m->phase = m->ordering ? ORDER_BUILD : AGG_NODES; m->cursor = 0; }
+        break;
+    /* The guaranteed-only SCC DAG gives an exact necessary path condition.
+     * Its longest-path levels do not depend on arbitrary DFS visitation order.
+     * Reuse component scratch and node input_count until filtering finishes;
+     * ORDER_RESET restores them before the ordinary settlement SCC pass. */
+    case ORDER_BUILD:
+        if (m->cursor < m->stats.active_edges) {
+            uint32_t at = m->edge_ids[m->cursor++];
+            CostEdge *e = &m->edges[at];
+            if (selected(m, e)) {
+                uint32_t source = m->nodes[e->source].component;
+                uint32_t target = m->nodes[e->target].component;
+                if (source != target) {
+                    e->component_next = m->components[source].out;
+                    m->components[source].out = at;
+                    m->components[target].indegree++;
+                }
+            }
+        } else {
+            m->phase = ORDER_QUEUE;
+            m->cursor = 0;
+            m->queue_head = m->queue_tail = 0;
+        }
+        break;
+    case ORDER_QUEUE:
+        if (m->cursor < m->component_count) {
+            uint32_t at = m->cursor++;
+            if (!m->components[at].indegree) m->queue[m->queue_tail++] = at;
+        } else { m->phase = ORDER_DEPTH; m->topology_current = NONE; }
+        break;
+    case ORDER_DEPTH:
+        if (m->topology_current != NONE) {
+            if (m->topology_edge != NONE) {
+                CostEdge *e = &m->edges[m->topology_edge];
+                m->topology_edge = e->component_next;
+                uint32_t target = m->nodes[e->target].component;
+                CostComponent *c = &m->components[target];
+                c->value = fmax(c->value,
+                                m->components[m->topology_current].value + 1);
+                if (!--c->indegree) m->queue[m->queue_tail++] = target;
+            } else m->topology_current = NONE;
+        } else if (m->queue_head < m->queue_tail) {
+            m->topology_current = m->queue[m->queue_head++];
+            m->topology_edge = m->components[m->topology_current].out;
+        } else { m->phase = ORDER_SAVE; m->cursor = 0; }
+        break;
+    case ORDER_SAVE:
+        if (m->cursor < m->stats.active_nodes) {
+            CostNode *n = &m->nodes[m->node_ids[m->cursor++]];
+            n->input_count = (uint32_t)m->components[n->component].value;
+            n->visited = false;
+        } else {
+            m->ordering = false;
+            m->component_count = 0;
+            m->phase = FILTER_SCAN;
+            m->cursor = m->finish_count = 0;
+        }
+        break;
+    case ORDER_RESET:
+        if (m->cursor < m->stats.active_nodes) {
+            uint32_t at = m->cursor++;
+            CostNode *n = &m->nodes[m->node_ids[at]];
+            n->input_count = 0; n->component = NONE;
+            memset(&m->components[at], 0, sizeof(m->components[at]));
+            m->components[at].out = m->components[at].group = NONE;
+            m->components[at].ready = m->components[at].all_slack = true;
+            m->components[at].entries_qualified = true;
+            m->components[at].min_wait = INFINITY;
+        } else { m->phase = DFS_SCAN; m->cursor = 0; }
         break;
     case SCC_WALK: {
         CostFrame *f = &m->stack[m->stack_size - 1u];
@@ -1050,6 +1141,7 @@ void peak_mpi_cost_model_reset_begin(PeakMpiCostModel *m) {
     if (!m)
         return;
     m->phase = IDLE;
+    m->ordering = false;
     m->reset_stage = 1;
     m->reset_cursor = 0;
 }
