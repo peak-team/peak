@@ -87,6 +87,8 @@ typedef struct {
   uint64_t last_L_cut, last_P_cut;
   PeakMpiCostRef continuation, covered_ref;
   int have_continuation, have_raw, active, coarse, unknown, have_prefix;
+  /* Sticky disqualifier: unrelated collectives never enter message lists. */
+  int other_point_to_point;
   PeakMpiPolicyReason reason;
   uint64_t lost;
   PeakMpiPolicy *policy;
@@ -1019,6 +1021,11 @@ static int parse_record(PeakMpiCausalService *s, unsigned r,
     }
 
     if (remote_op(rec)) {
+      if ((send_op(rec->operation) || recv_op(rec->operation) ||
+           probe_op(rec->operation)) &&
+          (rec->operation != PEAK_MPI_CAUSAL_SENDRECV ||
+           (rec->flags & PEAK_MPI_CAUSAL_NONBLOCKING)))
+        a->other_point_to_point = 1;
       if (a->mpi_thread && (a->mpi_thread != rec->thread_uid ||
                             a->mpi_thread_generation != rec->thread_generation))
         a->mpi_thread = UINT64_MAX;
@@ -1413,6 +1420,17 @@ static void matcher_work(PeakMpiCausalService *s, size_t budget) {
       PeakMpiCausalMatchKey key = {o->context,           0,
                                    o->end.actual_source, (int32_t)o->rank,
                                    o->end.actual_tag,    0};
+      for (unsigned k = 0; k < 4; k++) {
+        PeakMpiCausalMatchKey key = {
+            o->context,
+            0,
+            k & 1 ? PEAK_MPI_CAUSAL_ANY_SOURCE : o->end.actual_source,
+            (int32_t)o->rank,
+            k & 2 ? PEAK_MPI_CAUSAL_ANY_TAG : o->end.actual_tag,
+            0};
+        s->task_receive_head[k] = peak_mpi_causal_match_index_first(
+            s->matching, PEAK_MPI_CAUSAL_MATCH_RECEIVE, &key);
+      }
       s->task_cursor = peak_mpi_causal_match_index_first(
           s->matching, PEAK_MPI_CAUSAL_MATCH_SEND, &key);
       s->task_stage = TASK_MESSAGES;
@@ -1434,17 +1452,6 @@ static void matcher_work(PeakMpiCausalService *s, size_t budget) {
         s->task_ambiguous =
             (s->task_count > 1 && !s->task_ordered) || s->task_was_ambiguous;
         s->task_receive_class = 0;
-        for (unsigned k = 0; k < 4; k++) {
-          PeakMpiCausalMatchKey key = {
-              o->context,
-              0,
-              k & 1 ? PEAK_MPI_CAUSAL_ANY_SOURCE : o->end.actual_source,
-              (int32_t)o->rank,
-              k & 2 ? PEAK_MPI_CAUSAL_ANY_TAG : o->end.actual_tag,
-              0};
-          s->task_receive_head[k] = peak_mpi_causal_match_index_first(
-              s->matching, PEAK_MPI_CAUSAL_MATCH_RECEIVE, &key);
-        }
         s->task_cursor = s->task_receive_head[0];
         s->task_stage = TASK_EARLIER;
         continue;
@@ -1468,6 +1475,32 @@ static void matcher_work(PeakMpiCausalService *s, size_t budget) {
         s->task_best = slot;
       s->candidates[s->task_count++] = slot;
       s->task_was_ambiguous |= x->send_ambiguous;
+      /* A single producer/generation containing only blocking Sendrecv P2P
+       * calls has FIFO sends. With no earlier receive in any wildcard class,
+       * its first eligible send is the ordered match; otherwise keep scanning. */
+      if (s->task_count == 1 && !s->task_was_ambiguous && !s->approximate &&
+          o->begin.operation == PEAK_MPI_CAUSAL_SENDRECV &&
+          x->begin.operation == PEAK_MPI_CAUSAL_SENDRECV &&
+          !x->send_ambiguous && !s->ranks[o->rank].other_point_to_point &&
+          !s->ranks[x->rank].other_point_to_point &&
+          s->ranks[o->rank].mpi_thread == o->begin.thread_uid &&
+          s->ranks[o->rank].mpi_thread_generation == o->begin.thread_generation &&
+          s->ranks[x->rank].mpi_thread == x->begin.thread_uid &&
+          s->ranks[x->rank].mpi_thread_generation == x->begin.thread_generation) {
+        int first_receive = 1;
+        for (unsigned k = 0; k < 4; k++) {
+          size_t head = s->task_receive_head[k];
+          if (head != SIZE_MAX) {
+            Operation *prior = &s->operations[head];
+            if (prior->begin.thread_uid != o->begin.thread_uid ||
+                prior->begin.thread_generation != o->begin.thread_generation ||
+                prior->begin.sequence < o->begin.sequence)
+              first_receive = 0;
+          }
+        }
+        if (first_receive)
+          s->task_cursor = SIZE_MAX;
+      }
       if (x->buffer == SIZE_MAX &&
           x->end.progress_scope == PEAK_MPI_OBSERVER_SCOPE_INTERVAL &&
           (x->begin.flags & PEAK_MPI_CAUSAL_NONBLOCKING) && !x->immediate &&
@@ -1492,6 +1525,17 @@ static void matcher_work(PeakMpiCausalService *s, size_t budget) {
           s->matching, PEAK_MPI_CAUSAL_MATCH_RECEIVE, slot);
       Operation *x = &s->operations[slot];
       Operation *send = &s->operations[s->task_best];
+      /* Only one producer/generation makes exact-key insertion order a
+       * per-thread sequence order. Never infer an order between threads. */
+      Rank *local = &s->ranks[o->rank];
+      if (local->mpi_thread == o->begin.thread_uid &&
+          local->mpi_thread_generation == o->begin.thread_generation &&
+          x->begin.thread_uid == o->begin.thread_uid &&
+          x->begin.thread_generation == o->begin.thread_generation &&
+          x->begin.sequence >= o->begin.sequence) {
+        s->task_cursor = SIZE_MAX;
+        continue;
+      }
       if (x == o ||
           (o->begin.operation == PEAK_MPI_CAUSAL_MRECV &&
            x->begin.op_uid == o->begin.progress_begin) ||
