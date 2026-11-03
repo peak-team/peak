@@ -343,7 +343,9 @@ void peak_mpi_causal_runtime_mpi_initialized(void) {
   PeakMpiCausalWorkPrices measured;
   peak_mpi_causal_events_calibrate_work(&measured);
   work_prices = measured;
-  startup += clock_seconds() - initialization_start;
+  /* An enclosing activation span already prices this startup interval. */
+  if (!activation_start)
+    startup += clock_seconds() - initialization_start;
   atomic_store_explicit(&backend_ready, 1, memory_order_release);
 }
 /* A cohort's permanent failure also ends fine production locally. This does

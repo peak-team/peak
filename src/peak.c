@@ -1263,13 +1263,25 @@ peak_mpi_activation_policy_post_init(void)
 
 #ifdef HAVE_MPI
 static void
+peak_initialize_mpi_causal_runtime_if_ready(void)
+{
+    if (peak_mpi_causal_runtime_requested()) {
+        int initialized = 0, finalized = 0;
+        if (PMPI_Initialized(&initialized) == MPI_SUCCESS && initialized &&
+            PMPI_Finalized(&finalized) == MPI_SUCCESS && !finalized)
+            peak_mpi_causal_runtime_mpi_initialized();
+    }
+}
+
+static void
 peak_activate_mpi_service_only_runtime(void)
 {
     atomic_store_explicit(&peak_runtime_owner_pid, getpid(), memory_order_release);
+    peak_mpi_causal_runtime_configure_control(heartbeat_time != 0, FALSE);
+    peak_initialize_mpi_causal_runtime_if_ready();
     peak_main_time = peak_second();
     peak_general_listener_note_runtime_start(peak_main_time);
     peak_mpi_causal_runtime_activation_end();
-    peak_mpi_causal_runtime_configure_control(heartbeat_time != 0, FALSE);
     args = NULL;
 #ifdef PEAK_ENABLE_TEST_HOOKS
     gboolean fail_heartbeat_setup =
@@ -1503,19 +1515,22 @@ peak_activate_runtime(void)
         }
     }
 #endif
+    gboolean heartbeat_controls_hooks = peak_requested_work.cpu &&
+        strict_mutation_active && heartbeat_time != 0;
+#ifdef HAVE_MPI
+    peak_mpi_causal_runtime_configure_control(heartbeat_time != 0,
+                                              heartbeat_controls_hooks);
+    peak_initialize_mpi_causal_runtime_if_ready();
+#endif
     peak_main_time = peak_second();
     peak_general_listener_note_runtime_start(peak_main_time);
 #ifdef HAVE_MPI
     peak_mpi_causal_runtime_activation_end();
 #endif
-    gboolean heartbeat_controls_hooks = peak_requested_work.cpu &&
-        strict_mutation_active && heartbeat_time != 0;
     gboolean start_heartbeat = heartbeat_controls_hooks;
 #ifdef HAVE_MPI
     start_heartbeat = start_heartbeat ||
         (heartbeat_time != 0 && peak_mpi_causal_runtime_requested());
-    peak_mpi_causal_runtime_configure_control(heartbeat_time != 0,
-                                              heartbeat_controls_hooks);
 #endif
     if (start_heartbeat) {
 #ifdef PEAK_ENABLE_TEST_HOOKS
