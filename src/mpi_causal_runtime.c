@@ -25,7 +25,7 @@ static _Atomic unsigned char *peers;
 static unsigned char *peer_snapshot;
 static uint64_t *slot_prefixes;
 static size_t slots;
-static size_t observer_work_budget = 8192;
+static size_t observer_work_budget = 16384;
 static int rank_id, world_size;
 static uint64_t incarnation, raw_generation;
 static double origin, startup, activation_start;
@@ -112,13 +112,13 @@ int peak_mpi_causal_runtime_prepare(size_t n, double q, double hb, double ema) {
   slots = n;
   const char *work_budget_env = getenv("PEAK_MPI_OBSERVER_WORK_BUDGET");
   uint64_t parsed_work_budget;
-  observer_work_budget = 8192;
+  observer_work_budget = 16384;
   if (work_budget_env) {
     if (parse_unsigned(work_budget_env, 1048576, &parsed_work_budget) &&
         parsed_work_budget > 0)
       observer_work_budget = (size_t)parsed_work_budget;
     else
-      fprintf(stderr, "[peak mpi causal] invalid PEAK_MPI_OBSERVER_WORK_BUDGET; using 8192 (valid range 1..1048576)\n");
+      fprintf(stderr, "[peak mpi causal] invalid PEAK_MPI_OBSERVER_WORK_BUDGET; using 16384 (valid range 1..1048576)\n");
   }
   origin = begin;
   if (!peak_mpi_causal_cost_prepare(n)) {
