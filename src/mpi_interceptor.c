@@ -721,3 +721,41 @@ void mpi_interceptor_dettach(int allow_delayed_finalize)
     }
     hook_address = NULL;
 }
+
+/* Public legacy Fortran bindings may initialize without entering the C symbol.
+ * Forward their native ABI unchanged; depth also deduplicates implementations
+ * that in turn call MPI_Init/PMPI_Init. No Fortran handle conversion occurs. */
+#define PEAK_FORTRAN_INIT(name) \
+PEAK_API void name(MPI_Fint *ierr) { \
+    typedef void (*Function)(MPI_Fint *); \
+    static Function function; \
+    if (!function) function=(Function)dlsym(RTLD_NEXT,#name); \
+    peak_mpi_init_wrapper_depth++; \
+    if(function) function(ierr); else if(ierr) *ierr=(MPI_Fint)MPI_ERR_OTHER; \
+    peak_mpi_init_wrapper_depth--; \
+    if(!peak_mpi_init_wrapper_depth) peak_mpi_init_completed(ierr?(int)*ierr:MPI_ERR_OTHER); \
+}
+#define PEAK_FORTRAN_INIT_THREAD(name) \
+PEAK_API void name(MPI_Fint *required,MPI_Fint *provided,MPI_Fint *ierr) { \
+    typedef void (*Function)(MPI_Fint *,MPI_Fint *,MPI_Fint *); \
+    static Function function; \
+    if(!function) function=(Function)dlsym(RTLD_NEXT,#name); \
+    peak_mpi_init_wrapper_depth++; \
+    if(function) function(required,provided,ierr); else if(ierr) *ierr=(MPI_Fint)MPI_ERR_OTHER; \
+    peak_mpi_init_wrapper_depth--; \
+    if(!peak_mpi_init_wrapper_depth) peak_mpi_init_completed(ierr?(int)*ierr:MPI_ERR_OTHER); \
+}
+PEAK_FORTRAN_INIT(mpi_init_)
+PEAK_FORTRAN_INIT(mpi_init__)
+PEAK_FORTRAN_INIT(MPI_INIT)
+PEAK_FORTRAN_INIT(pmpi_init_)
+PEAK_FORTRAN_INIT(pmpi_init__)
+PEAK_FORTRAN_INIT(PMPI_INIT)
+PEAK_FORTRAN_INIT_THREAD(mpi_init_thread_)
+PEAK_FORTRAN_INIT_THREAD(mpi_init_thread__)
+PEAK_FORTRAN_INIT_THREAD(MPI_INIT_THREAD)
+PEAK_FORTRAN_INIT_THREAD(pmpi_init_thread_)
+PEAK_FORTRAN_INIT_THREAD(pmpi_init_thread__)
+PEAK_FORTRAN_INIT_THREAD(PMPI_INIT_THREAD)
+#undef PEAK_FORTRAN_INIT
+#undef PEAK_FORTRAN_INIT_THREAD

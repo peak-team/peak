@@ -1922,7 +1922,7 @@ def check_stop_window_accounting_sidecar(repo_root):
             "spent_ratio" not in per_target_detach,
             "per-target detach must remain cumulative-only and independent of reattach risk")
     require("double projected_global_overhead =\n                MAX(projected_attached_recent_sum,\n                    projected_attached_lifetime_sum)" in global_detach_for_budget and
-            "if (projected_global_overhead >\n                global_target_ratio * peak_global_detach_factor)" in global_detach_for_budget and
+            "if (projected_global_overhead >\n                mpi_q_eff * peak_global_detach_factor)" in global_detach_for_budget and
             "double contribution =\n                        MAX(rate_snapshot[i], ratio_snapshot[i])" in global_detach_for_budget and
             "if (contribution <= 0.0) continue;" in global_detach_for_budget and
             "entries[n_attached].ratio = contribution" in global_detach_for_budget and
@@ -1931,7 +1931,7 @@ def check_stop_window_accounting_sidecar(repo_root):
             "double reduced_recent_sum = projected_attached_recent_sum" in global_detach_for_budget and
             "double reduced_lifetime_sum = projected_attached_lifetime_sum" in global_detach_for_budget and
             "double reduced_global_overhead = projected_global_overhead" in global_detach_for_budget and
-            "if (reduced_global_overhead <= global_target_ratio)" in global_detach_for_budget and
+            "if (reduced_global_overhead <= mpi_q_eff)" in global_detach_for_budget and
             "reduced_recent_sum -= entries[k].rate" in global_detach_for_budget and
             "reduced_lifetime_sum -= entries[k].lifetime" in global_detach_for_budget and
             "reduced_global_overhead =\n                            MAX(reduced_recent_sum, reduced_lifetime_sum)" in global_detach_for_budget and
@@ -1944,7 +1944,7 @@ def check_stop_window_accounting_sidecar(repo_root):
             "local_mpi_ranks" not in global_detach_for_budget,
             "global detach must carry both profile signals and exclude raw and risk control spend")
     require("profile_global_overhead - prev_global_overhead" in adaptive_sleep and
-            "profile_global_overhead / global_target_ratio" in adaptive_sleep and
+            "profile_global_overhead / mpi_q_eff" in adaptive_sleep and
             "recent_rate" not in adaptive_sleep and
             "rate_snapshot" not in adaptive_sleep and
             "risk" not in adaptive_sleep and

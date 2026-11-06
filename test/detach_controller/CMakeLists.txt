@@ -20,6 +20,7 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
     ${PROJECT_SOURCE_DIR}/src/general_listener/report_formatter.c
     ${PROJECT_SOURCE_DIR}/src/general_listener/report_maxima.c
     ${PROJECT_SOURCE_DIR}/src/general_listener/report_model.c
+    ${PROJECT_SOURCE_DIR}/src/general_listener/hook_coverage.c
     ${PROJECT_SOURCE_DIR}/src/general_listener/report_snapshot.c
     ${PROJECT_SOURCE_DIR}/src/general_listener/runtime_config.c
     ${PROJECT_SOURCE_DIR}/src/general_listener/socket_report_transport.c
@@ -36,7 +37,18 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
   )
   if(PEAK_ENABLE_MPI AND MPI_FOUND)
     target_sources(test_detach_listener_shutdown PRIVATE
-      ${PROJECT_SOURCE_DIR}/src/general_listener/mpi_report_transport.c)
+      ${PROJECT_SOURCE_DIR}/src/general_listener/mpi_report_transport.c
+      ${PROJECT_SOURCE_DIR}/src/mpi_cost_model.c
+      ${PROJECT_SOURCE_DIR}/src/mpi_causal_cost.c
+      ${PROJECT_SOURCE_DIR}/src/mpi_causal_runtime.c
+      ${PROJECT_SOURCE_DIR}/src/mpi_causal_events.c
+      ${PROJECT_SOURCE_DIR}/src/mpi_progress_contract.c
+      ${PROJECT_SOURCE_DIR}/src/mpi_causal_batches.c
+      ${PROJECT_SOURCE_DIR}/src/mpi_causal_match_index.c
+      ${PROJECT_SOURCE_DIR}/src/mpi_causal_backend.c
+      ${PROJECT_SOURCE_DIR}/src/mpi_causal_transport.c
+      ${PROJECT_SOURCE_DIR}/src/mpi_observer.c
+      ${PROJECT_SOURCE_DIR}/src/mpi_policy_adapter.c)
   endif()
 endif()
 
