@@ -16,7 +16,9 @@ enum { SEND_BATCH_FRAMES = 16 };
 enum { HELLO = 1, RECORD, OBJECT, RAW, ACK, FEEDBACK, WMRQ };
 typedef struct {
   int fd, ready, feedback_sent;
-  uint64_t feedback_generation, nonce_sent;
+  uint64_t feedback_generation, nonce_sent, pending_ack;
+  unsigned ack_count;
+  int ack_due;
   size_t have, need, out_n, out_at;
   unsigned rank;
   unsigned char *in, *out;
@@ -342,6 +344,9 @@ static void close_peer(Peer *p) {
   p->ready = 0;
   p->feedback_sent = 0;
   p->nonce_sent = 0;
+  p->pending_ack = 0;
+  p->ack_count = 0;
+  p->ack_due = 0;
   p->have = 0;
   p->need = HDR;
   p->out_n = p->out_at = 0;
@@ -698,6 +703,16 @@ static void prepare_control(PeakMpiCausalTransport *t, Peer *p, double now) {
     }
   }
 }
+static void prepare_ack(PeakMpiCausalTransport *t, Peer *p, int force) {
+  if (!p->out_n && p->ack_count &&
+      (force || p->ack_due || p->ack_count >= SEND_BATCH_FRAMES)) {
+    p->out_n = frame(t, p->out, ACK, 0, p->pending_ack);
+    p->out_at = 0;
+    p->pending_ack = 0;
+    p->ack_count = 0;
+    p->ack_due = 0;
+  }
+}
 static void owner_tick(PeakMpiCausalTransport *t, double now, size_t *budget) {
   size_t i, start = t->peer_cursor;
   t->peer_cursor = (t->peer_cursor + 1) % t->peer_n;
@@ -735,9 +750,20 @@ static void owner_tick(PeakMpiCausalTransport *t, double now, size_t *budget) {
     unsigned type, rank;
     uint64_t job, inc, seq;
     size_t n;
-    int rc;
+    int rc, read_idle = 0;
     if (p->fd < 0)
       continue;
+    if (p->out_n) {
+      rc = write_buf(t, p->fd, p->out, p->out_n, &p->out_at, budget);
+      if (rc < 0) {
+        close_peer(p);
+        continue;
+      }
+      if (!rc)
+        continue;
+      p->out_n = p->out_at = 0;
+    }
+    prepare_ack(t, p, 0);
     if (p->out_n) {
       rc = write_buf(t, p->fd, p->out, p->out_n, &p->out_at, budget);
       if (rc < 0) {
@@ -761,7 +787,11 @@ static void owner_tick(PeakMpiCausalTransport *t, double now, size_t *budget) {
         continue;
       p->out_n = p->out_at = 0;
     }
+    /* A zero result can also mean a header/partial-frame read made progress.
+     * Only a turn that consumed no bytes is idle. */
+    size_t before_read = *budget;
     rc = read_frame(t, p, budget);
+    read_idle = !rc && before_read == *budget;
     if (rc < 0) {
       close_peer(p);
       continue;
@@ -819,8 +849,8 @@ static void owner_tick(PeakMpiCausalTransport *t, double now, size_t *budget) {
           continue;
         if (seq > t->accepted[rank])
           t->accepted[rank] = seq;
-        p->out_n = frame(t, p->out, ACK, 0, seq);
-        p->out_at = 0;
+        p->pending_ack = t->accepted[rank];
+        p->ack_count++;
         reset_input(p);
       } else {
         fault(t, rank, PEAK_MPI_POLICY_BAD_IDENTITY);
@@ -829,6 +859,14 @@ static void owner_tick(PeakMpiCausalTransport *t, double now, size_t *budget) {
       }
     }
     prepare_control(t, p, now);
+    if (p->out_n) {
+      rc = write_buf(t, p->fd, p->out, p->out_n, &p->out_at, budget);
+      if (rc < 0)
+        close_peer(p);
+      else if (rc)
+        p->out_n = p->out_at = 0;
+    }
+    prepare_ack(t, p, read_idle);
     if (p->out_n) {
       rc = write_buf(t, p->fd, p->out, p->out_n, &p->out_at, budget);
       if (rc < 0)
@@ -1019,6 +1057,24 @@ void peak_mpi_causal_transport_tick(PeakMpiCausalTransport *t,
       owner_tick(t, now, &budget);
       if (!budget || before == budget)
         break;
+    }
+    /* A bounded end-of-heartbeat tailflush. If the shared allowance is
+     * exhausted, preserve the queued ACK or due flag for the next turn. */
+    for (size_t peer = 0; peer < t->peer_n; peer++) {
+      Peer *p = &t->peers[peer];
+      if (p->fd < 0 || !p->ready)
+        continue;
+      if (p->ack_count) {
+        p->ack_due = 1;
+      }
+      prepare_ack(t, p, 1);
+      if (p->out_n && budget) {
+        int rc = write_buf(t, p->fd, p->out, p->out_n, &p->out_at, &budget);
+        if (rc < 0)
+          close_peer(p);
+        else if (rc)
+          p->out_n = p->out_at = 0;
+      }
     }
     if (raw->active && t->sink.feedback &&
         t->sink.feedback(t->sink.context, t->c.rank, now, &t->feedback)) {

@@ -2973,10 +2973,16 @@ void peak_mpi_causal_service_tick(PeakMpiCausalService *s,
   if (s->local_fault) {
     local_raw.coarse_reason = PEAK_MPI_OBSERVER_REASON_METADATA;
   }
+  /* A cut committed on the previous heartbeat must be visible to this
+   * transport turn. Charge its atomic cache preparation to the same budget. */
+  size_t pre_cache_work = 0;
+  if (s->config.rank == s->config.owner_rank && s->cache_dirty)
+    pre_cache_work = prepare_feedback_cache(s, work);
   peak_mpi_causal_transport_tick(s->transport, capture, &local_raw, now, bytes);
   if (s->config.rank == s->config.owner_rank) {
     size_t recovery_used = 0;
-    int recovering = recovery_work(s, work, &recovery_used);
+    int recovering = recovery_work(s, work - pre_cache_work, &recovery_used);
+    recovery_used += pre_cache_work;
     if (recovering) {
       recovery_used += prepare_feedback_cache(s, work - recovery_used);
       s->last_tick_work = recovery_used;
