@@ -5820,7 +5820,7 @@ void* peak_heartbeat_monitor(void* arg) {
 #ifdef HAVE_MPI
             if (mpi_feedback_active) {
                 reattach_budget_ok = reattach_budget_ok && mpi_decision.reattach_relaxation && mpi_decision.headroom_known;
-                if (reattach_budget_ok) headroom_seconds = MIN(headroom_seconds, mpi_decision.global_headroom);
+                if (reattach_budget_ok) headroom_seconds = MIN(headroom_seconds, mpi_decision.available_headroom);
             }
 #endif
             double mpi_future_rate = MAX(projected_attached_recent_sum, projected_attached_lifetime_sum);
