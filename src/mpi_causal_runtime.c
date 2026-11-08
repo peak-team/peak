@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #include "internal/mpi_causal_runtime.h"
 #include "internal/mpi_causal_backend.h"
@@ -11,6 +12,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifdef __linux__
+#include <pthread.h>
+#include <sched.h>
+#endif
 
 /* Only the heartbeat owns service and receiver. Application producers touch
  * fixed slots and atomic monotone communication evidence. */
@@ -29,6 +34,11 @@ static size_t observer_work_budget = 16384;
 static size_t configured_owner_byte_budget = 65536;
 static size_t effective_byte_budget = 65536;
 static int rank_id, world_size;
+static int owner_rank, observer_cpu_requested = -1;
+static _Atomic int observer_cpu_effective = -1;
+#ifdef __linux__
+static _Thread_local int observer_worker, observer_cpu_attempted;
+#endif
 static uint64_t incarnation, raw_generation;
 static double origin, startup, activation_start;
 static _Atomic double control_cost, management_cost;
@@ -120,11 +130,46 @@ uint64_t peak_mpi_causal_runtime_operation_floor(void) {
   return atomic_load_explicit(&next_operation, memory_order_acquire);
 }
 int peak_mpi_causal_runtime_world_size(void) { return world_size; }
+void peak_mpi_causal_runtime_worker_start(void) {
+#ifdef __linux__
+  observer_worker = 1;
+#endif
+}
+static void bind_observer_worker(void) {
+#ifdef __linux__
+  if (!observer_worker || observer_cpu_attempted || observer_cpu_requested < 0 ||
+      rank_id != owner_rank)
+    return;
+  observer_cpu_attempted = 1;
+  cpu_set_t cpus;
+  CPU_ZERO(&cpus);
+  CPU_SET(observer_cpu_requested, &cpus);
+  int error = pthread_setaffinity_np(pthread_self(), sizeof cpus, &cpus);
+  if (!error)
+    atomic_store_explicit(&observer_cpu_effective, observer_cpu_requested,
+                          memory_order_relaxed);
+  else
+    fprintf(stderr, "[peak mpi causal] cannot bind observer CPU %d: %s; retaining existing affinity\n",
+            observer_cpu_requested, strerror(error));
+#endif
+}
 int peak_mpi_causal_runtime_prepare(size_t n, double q, double hb, double ema) {
   if (!peak_mpi_causal_runtime_requested())
     return 0;
   double begin = clock_seconds();
   slots = n;
+  const char *cpu = getenv("PEAK_MPI_OBSERVER_CPU");
+  uint64_t parsed_cpu;
+#ifdef __linux__
+  if (cpu && parse_unsigned(cpu, CPU_SETSIZE - 1, &parsed_cpu))
+    observer_cpu_requested = (int)parsed_cpu;
+  else if (cpu)
+    fprintf(stderr, "[peak mpi causal] invalid PEAK_MPI_OBSERVER_CPU; retaining existing affinity\n");
+#else
+  (void)parsed_cpu;
+  if (cpu)
+    fprintf(stderr, "[peak mpi causal] PEAK_MPI_OBSERVER_CPU is supported only on Linux; retaining existing affinity\n");
+#endif
   const char *work_budget_env = getenv("PEAK_MPI_OBSERVER_WORK_BUDGET");
   uint64_t parsed_work_budget;
   observer_work_budget = 16384;
@@ -357,6 +402,7 @@ void peak_mpi_causal_runtime_mpi_initialized(void) {
        parse_unsigned(owner, (uint64_t)world_size - 1, &parsed_owner));
   effective_byte_budget = configuration_valid && rank_id == (int)parsed_owner
                               ? configured_owner_byte_budget : 65536;
+  owner_rank = (int)parsed_owner;
   policy.member_capacity = (size_t)world_size;
   PeakMpiCausalServiceConfig c = {0};
   c.rank = (unsigned)rank_id;
@@ -452,6 +498,7 @@ void peak_mpi_causal_runtime_tick(double now, double elapsed, double C,
   atomic_store_explicit(&control_generation, generation, memory_order_relaxed);
   if (!atomic_load_explicit(&backend_ready, memory_order_acquire))
     return;
+  bind_observer_worker();
   uint64_t notified = peak_mpi_observer_loss_generation(capture);
   if (notified != handled_loss) {
     handled_loss = notified;
@@ -660,10 +707,12 @@ void peak_mpi_causal_runtime_report(void) {
           contract->pml, contract->coll, contract->pml_verified,
           contract->coll_verified, contract->fixed_rules_verified);
   fprintf(stderr,
-          "[peak mpi causal control] rank=%d heartbeat=%s hook_controller=%s work_budget=%zu configured_slots=%zu configured_owner_byte_budget=%zu effective_byte_budget=%zu\n",
+          "[peak mpi causal control] rank=%d heartbeat=%s hook_controller=%s work_budget=%zu configured_slots=%zu configured_owner_byte_budget=%zu effective_byte_budget=%zu observer_cpu_requested=%d observer_cpu_effective=%d\n",
           rank_id, heartbeat_enabled ? "enabled" : "disabled",
           hook_controller_enabled ? "enabled" : "none", observer_work_budget, slots,
-          configured_owner_byte_budget, effective_byte_budget);
+          configured_owner_byte_budget, effective_byte_budget,
+          observer_cpu_requested,
+          atomic_load_explicit(&observer_cpu_effective, memory_order_relaxed));
   PeakMpiCausalServiceStats stats = {0};
   if (service)
     peak_mpi_causal_service_stats(service, &stats);

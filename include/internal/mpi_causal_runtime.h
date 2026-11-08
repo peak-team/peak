@@ -42,6 +42,7 @@ void peak_mpi_causal_runtime_retire_slot(size_t slot, uint64_t generation);
 void peak_mpi_causal_runtime_publish_price(double seconds);
 void peak_mpi_causal_runtime_configure_control(int heartbeat_enabled,
                                                int hook_controller_enabled);
+void peak_mpi_causal_runtime_worker_start(void);
 void peak_mpi_causal_runtime_activation_begin(void);
 void peak_mpi_causal_runtime_activation_end(void);
 void peak_mpi_causal_runtime_mpi_initialized(void);

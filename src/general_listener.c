@@ -5375,6 +5375,9 @@ peak_heartbeat_wait_with_mpi_service(unsigned int sleep_us,
 
 void* peak_heartbeat_monitor(void* arg) {
     PeakHeartbeatArgs* heartbeat_args = (PeakHeartbeatArgs*)arg;
+#ifdef HAVE_MPI
+    peak_mpi_causal_runtime_worker_start();
+#endif
     peak_general_listener_exclude_current_thread();
     unsigned int heartbeat_time = heartbeat_args->heartbeat_time;
     unsigned int check_interval = heartbeat_args->check_interval;
