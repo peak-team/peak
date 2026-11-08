@@ -2005,6 +2005,13 @@ peak_fini_impl(void)
     PeakOutputAggregationMode aggregation_mode =
         found_MPI ? peak_requested_output_aggregation
                   : PEAK_OUTPUT_AGGREGATION_LOCAL;
+    /* The observer already reported; retain failed profiling requests and
+     * collective participation, but omit empty rank-local profiling CSVs. */
+    gboolean profile_report_requested =
+        aggregation_mode != PEAK_OUTPUT_AGGREGATION_LOCAL ||
+        (peak_report_capability_manifest().requested &
+         (PEAK_CAPABILITY_CPU_TARGET | PEAK_CAPABILITY_CUDA |
+          PEAK_CAPABILITY_MEMORY | PEAK_CAPABILITY_JIT)) != 0;
     int local_requested_mpi_finalize =
         mpi_interceptor_finalize_was_requested();
     int mpi_collectives_failed_closed =
@@ -2057,11 +2064,15 @@ peak_fini_impl(void)
         } else if (found_MPI && mpi_collectives_failed_closed && mpi_log_rank) {
             g_printerr("[peak] PEAK MPI collective path was already failed closed; writing rank-local output without touching MPI again\n");
         }
-        used_mpi_aggregation =
-            peak_general_listener_print_with_mpi_job_policy(
-                output_mode,
-                TRUE,
-                &report_write_succeeded);
+        if (profile_report_requested) {
+            used_mpi_aggregation =
+                peak_general_listener_print_with_mpi_job_policy(
+                    output_mode,
+                    TRUE,
+                    &report_write_succeeded);
+        } else {
+            report_write_succeeded = TRUE;
+        }
         report_published = 1;
     }
 
@@ -2156,11 +2167,15 @@ peak_fini_impl(void)
                    mpi_log_rank) {
             g_printerr("[peak] Aggregate output was not proven safe; writing rank-local output before process exit\n");
         }
-        used_mpi_aggregation =
-            peak_general_listener_print_with_mpi_job_policy(
-                output_mode,
-                found_MPI ? TRUE : FALSE,
-                &report_write_succeeded);
+        if (profile_report_requested) {
+            used_mpi_aggregation =
+                peak_general_listener_print_with_mpi_job_policy(
+                    output_mode,
+                    found_MPI ? TRUE : FALSE,
+                    &report_write_succeeded);
+        } else {
+            report_write_succeeded = TRUE;
+        }
         report_published = 1;
     }
     /*
