@@ -4,6 +4,7 @@
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <time.h>
 
 #define WORKER_COUNT 8
 #define STRESS_ROUNDS 200
@@ -90,10 +91,19 @@ run_handshake_checks(void)
     waiter.result = PEAK_PTHREAD_START_ABANDONED;
     CHECK(pthread_create(&thread, NULL, handshake_waiter, &waiter) == 0);
     unsigned int waiter_count = 0;
-    for (unsigned int attempt = 0;
-         attempt < 10000 && waiter_count == 0; ++attempt) {
+    struct timespec start, now;
+    CHECK(clock_gettime(CLOCK_MONOTONIC, &start) == 0);
+    do {
         waiter_count = peak_pthread_slot_registry_test_wake_waiters();
-    }
+        if (waiter_count != 0)
+            break;
+        /* Give the child time to enter the wait, independent of CPU speed. */
+        const struct timespec pause = { .tv_sec = 0, .tv_nsec = 1000000 };
+        nanosleep(&pause, NULL);
+        CHECK(clock_gettime(CLOCK_MONOTONIC, &now) == 0);
+    } while ((double)(now.tv_sec - start.tv_sec) +
+                 (double)(now.tv_nsec - start.tv_nsec) / 1e9 <
+             (double)HANDSHAKE_TIMEOUT_MS / 1000);
     CHECK(waiter_count == 1);
     CHECK(atomic_load_explicit(&state, memory_order_acquire) ==
           PEAK_PTHREAD_START_PENDING);
