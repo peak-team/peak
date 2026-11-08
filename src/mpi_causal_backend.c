@@ -653,10 +653,12 @@ int peak_mpi_causal_service_ingest_raw(PeakMpiCausalService *s, unsigned r,
     coarse(s, r, why,
            raw->lost_events > a->lost ? raw->lost_events - a->lost : 0);
   }
+  /* A newer request does not invalidate an older unverified reply. Freeze its
+   * coherent prefix before later RAW cuts can replace it. */
   if (!a->coarse && !s->approximate && !s->recovery_reset &&
       !s->recovery_needed && a->have_prefix && !a->verify_active &&
       a->requested_nonce > a->verified_nonce &&
-      a->echoed_nonce >= a->requested_nonce &&
+      a->echoed_nonce > a->verified_nonce &&
       a->raw_generation > a->last_verify_generation)
     freeze_verify_tuple(a);
   return 1;
