@@ -115,7 +115,7 @@ typedef struct {
 typedef struct {
     uint32_t active_nodes, active_edges, active_owners, active_branches;
     uint32_t peak_pending_nodes, settled_nodes;
-    uint32_t scc_count, excluded_candidates, retained_candidates; /* latest pass */
+    uint32_t scc_count, excluded_candidates, retained_candidates; /* latest processed pass (rooted subset or full graph) */
     uint64_t generation, lost_events, scc_settlements; /* lifetime commits */
     bool coarse;
     PeakMpiCostReason reason;
@@ -152,6 +152,18 @@ PeakMpiCostStatus peak_mpi_cost_model_add_edge(PeakMpiCostModel *, PeakMpiCostRe
                                             double wait_bound);
 PeakMpiCostStatus peak_mpi_cost_model_seal(PeakMpiCostModel *, PeakMpiCostRef);
 PeakMpiCostStatus peak_mpi_cost_model_run(PeakMpiCostModel *, size_t work_budget, size_t *work_used);
+/* Internal optional rooted solve. begin/add freeze graph mutation; run charges
+ * all selection/projection/solve/restore work to its ordinary budget. Completion
+ * does not assert global readiness: outside unsealed nodes/unknown owners can
+ * keep the result pending. Query delay for each root. It retains immutable settled
+ * values, omitted unsettled values remain pending, and global frontier is
+ * unknown until a legacy full solve. Active/settled counts remain global;
+ * latest SCC/candidate counts describe the latest processed subset. */
+PeakMpiCostStatus peak_mpi_cost_model_roots_begin(PeakMpiCostModel *);
+PeakMpiCostStatus peak_mpi_cost_model_roots_add(PeakMpiCostModel *, PeakMpiCostRef);
+/* Read-only defined/sealed hint, not a proof of transitive settlement. */
+int peak_mpi_cost_model_closed_hint(const PeakMpiCostModel *, PeakMpiCostRef);
+
 PeakMpiCostStatus peak_mpi_cost_model_delay(const PeakMpiCostModel *, PeakMpiCostRef, double *);
 
 PeakMpiCostStatus peak_mpi_cost_model_hold_branch(PeakMpiCostModel *, PeakMpiCostRef,

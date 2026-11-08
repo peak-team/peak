@@ -10,14 +10,14 @@
 typedef struct {
     uint64_t generation, search_stamp;
     uint32_t free_next, active_index, out, in, pins, component, input_count;
-    bool active, defined, sealed, settled, retire, visited, group_identity_valid;
+    bool active, defined, sealed, settled, retire, visited, group_identity_valid, root_selected;
     PeakMpiCostNodeSpec spec;
     double delay;
 } CostNode;
 
 typedef struct {
     uint64_t generation;
-    uint32_t free_next, active_index, rank, references, component;
+    uint32_t free_next, active_index, rank, references, component, root_references;
     bool active, defined, frozen, conflict;
     double L, P;
 } CostOwner;
@@ -61,6 +61,12 @@ typedef enum {
     COMMIT_NODES, FRONTIER_RANKS, FRONTIER_BRANCHES, FINISH
 } CostPhase;
 
+typedef enum {
+    ROOT_NONE, ROOT_CLEAR_OWNERS, ROOT_CLEAR_NODES, ROOT_SEEDS,
+    ROOT_CLOSURE, ROOT_PROJECT_NODES, ROOT_PROJECT_OWNERS,
+    ROOT_PROJECT_EDGES, ROOT_SOLVE, ROOT_RESTORE
+} RootPhase;
+
 struct PeakMpiCostModel {
     PeakMpiCostConfig config;
     CostNode *nodes;
@@ -90,6 +96,13 @@ struct PeakMpiCostModel {
     double frontier;
     PeakMpiCostStatus last_result;
     PeakMpiCostStats stats;
+    uint32_t *root_nodes, *root_edges, *root_owners;
+    RootPhase root_stage;
+    uint32_t root_cursor, root_seed_count, root_head, root_tail, root_edge;
+    uint32_t root_owner, root_n, root_e, root_o;
+    size_t root_full_n, root_full_e, root_full_o;
+    bool root_projected, root_swapped, root_reset, root_global_pending, root_global_closed;
+    PeakMpiCostStatus root_result;
 };
 
 static bool nonnegative(double x) { return isfinite(x) && x >= 0.0; }
@@ -144,7 +157,7 @@ static PeakMpiCostStatus writable(PeakMpiCostModel *m)
 {
     if (!m) return PEAK_MPI_COST_INVALID;
     if (m->stats.coarse) return PEAK_MPI_COST_COARSE;
-    if (m->phase != IDLE) return PEAK_MPI_COST_BUSY;
+    if (m->phase != IDLE || m->root_stage) return PEAK_MPI_COST_BUSY;
     return PEAK_MPI_COST_OK;
 }
 
@@ -177,6 +190,9 @@ PeakMpiCostModel *peak_mpi_cost_model_create(const PeakMpiCostConfig *config)
     m->config = *config;
     m->hash_capacity = 1;
     while (m->hash_capacity < config->max_edges * 4u) m->hash_capacity *= 2u;
+    m->root_nodes = calloc(config->max_nodes, sizeof(uint32_t));
+    m->root_edges = calloc(config->max_edges, sizeof(uint32_t));
+    m->root_owners = calloc(config->max_owners, sizeof(uint32_t));
     m->nodes = calloc(config->max_nodes, sizeof(*m->nodes));
     m->owners = calloc(config->max_owners, sizeof(*m->owners));
     m->edges = calloc(config->max_edges, sizeof(*m->edges));
@@ -193,7 +209,7 @@ PeakMpiCostModel *peak_mpi_cost_model_create(const PeakMpiCostConfig *config)
     m->branch_ids = calloc(config->max_branches, sizeof(*m->branch_ids));
     m->continuation_ids = calloc(config->max_ranks, sizeof(*m->continuation_ids));
     m->rank_seen = calloc(config->max_ranks, sizeof(*m->rank_seen));
-    if (!m->nodes || !m->owners || !m->edges || !m->branches || !m->ranks ||
+    if (!m->root_nodes || !m->root_edges || !m->root_owners || !m->nodes || !m->owners || !m->edges || !m->branches || !m->ranks ||
         !m->components || !m->stack || !m->finish || !m->queue || !m->edge_hash ||
         !m->node_ids || !m->owner_ids || !m->edge_ids || !m->branch_ids ||
         !m->continuation_ids || !m->rank_seen) {
@@ -217,6 +233,7 @@ PeakMpiCostModel *peak_mpi_cost_model_create(const PeakMpiCostConfig *config)
 void peak_mpi_cost_model_destroy(PeakMpiCostModel *m)
 {
     if (!m) return;
+    free(m->root_nodes); free(m->root_edges); free(m->root_owners);
     free(m->nodes); free(m->owners); free(m->edges); free(m->branches);
     free(m->ranks); free(m->components); free(m->stack); free(m->finish);
     free(m->queue); free(m->edge_hash); free(m->node_ids); free(m->owner_ids);
@@ -408,6 +425,9 @@ PeakMpiCostStatus peak_mpi_cost_model_seal(PeakMpiCostModel *m, PeakMpiCostRef r
  * incoming graph is no longer needed for settlement of a new prefix. */
 static bool selected(const PeakMpiCostModel *m, const CostEdge *e)
 {
+    if (m->root_projected &&
+        (!m->nodes[e->source].root_selected || !m->nodes[e->target].root_selected))
+        return false;
     /* Use precisely the guarantee predicate of the fallback path search. */
     if (m->ordering)
         return e->active && (e->kind == PEAK_MPI_COST_GUARANTEED ||
@@ -913,7 +933,7 @@ static void run_step(PeakMpiCostModel *m)
     }
 }
 
-PeakMpiCostStatus peak_mpi_cost_model_run(PeakMpiCostModel *m, size_t budget,
+static PeakMpiCostStatus full_model_run(PeakMpiCostModel *m, size_t budget,
                                        size_t *used)
 {
     if (used) *used = 0;
@@ -927,7 +947,7 @@ PeakMpiCostStatus peak_mpi_cost_model_run(PeakMpiCostModel *m, size_t budget,
             m->phase = RESET_NODES;
             m->has_reverse = false; m->requires_qualified_g_build = false;
             m->finish_count = m->component_count = m->stack_size = 0;
-            m->pending = false; m->all_closed = true; m->has_owner_conflict = false;
+            m->pending = m->root_projected && m->root_global_pending; m->all_closed = !m->root_projected || m->root_global_closed; m->has_owner_conflict = false;
             m->stats.scc_count = m->stats.excluded_candidates = m->stats.retained_candidates = 0;
         } else {
             m->phase = FRONTIER_RANKS; m->frontier = 0; m->frontier_valid = true;
@@ -940,12 +960,273 @@ PeakMpiCostStatus peak_mpi_cost_model_run(PeakMpiCostModel *m, size_t budget,
     return m->phase == IDLE ? m->last_result : PEAK_MPI_COST_YIELDED;
 }
 
+/* Optional rooted solve: begin/add roots while idle, then bounded run.
+ * Three fixed work vectors preserve original active-ID vectors and iteration
+ * order. Selection follows every incoming edge (even an excluded candidate):
+ * any guaranteed path target -> source for a selected reverse edge therefore
+ * lies in the same backward closure. Shared owners include every reference.
+ * Previously settled omitted nodes retain valid immutable values. The global
+ * frontier remains unknown; latest SCC/candidate statistics describe this
+ * processed subset, while capacity/settled counts remain global. */
+PeakMpiCostStatus peak_mpi_cost_model_roots_begin(PeakMpiCostModel *m) {
+    PeakMpiCostStatus st = writable(m);
+    if (st != PEAK_MPI_COST_OK)
+        return st;
+    if (m->search_stamp == UINT64_MAX)
+        return fail(m, PEAK_MPI_COST_GENERATION_OVERFLOW);
+    ++m->search_stamp;
+    m->root_stage = ROOT_CLEAR_OWNERS;
+    m->root_cursor = m->root_seed_count = 0;
+    m->root_full_n = m->stats.active_nodes;
+    m->root_full_e = m->stats.active_edges;
+    m->root_full_o = m->stats.active_owners;
+    m->root_head = m->root_tail = 0;
+    m->root_n = m->root_e = m->root_o = 0;
+    m->root_owner = NONE;
+    m->root_projected = m->root_swapped = m->root_reset = false;
+    m->root_global_pending = false;
+    m->root_global_closed = true;
+    m->root_result = PEAK_MPI_COST_PENDING;
+    m->root_edge = NONE;
+    return PEAK_MPI_COST_OK;
+}
+PeakMpiCostStatus peak_mpi_cost_model_roots_add(PeakMpiCostModel *m, PeakMpiCostRef ref) {
+    if (!m || m->root_stage != ROOT_CLEAR_OWNERS || m->root_cursor)
+        return PEAK_MPI_COST_BUSY;
+    if (!valid_node(m, ref))
+        return PEAK_MPI_COST_INVALID;
+    if (m->nodes[ref.slot].search_stamp == m->search_stamp)
+        return PEAK_MPI_COST_OK;
+    if (m->root_seed_count == m->config.max_nodes)
+        return PEAK_MPI_COST_PENDING;
+    m->nodes[ref.slot].search_stamp = m->search_stamp;
+    /* Reuse the search stamp to deduplicate seeds. Later G searches take a new
+     * stamp. queue holds seeds until selection flags/index heads are ready. */
+    m->queue[m->root_seed_count++] = ref.slot;
+    return PEAK_MPI_COST_OK;
+}
+int peak_mpi_cost_model_closed_hint(const PeakMpiCostModel *m, PeakMpiCostRef ref) {
+    return m && valid_node(m, ref) && m->nodes[ref.slot].defined && m->nodes[ref.slot].sealed;
+}
+/* Selection-only scratch: finish is the closure queue; stack[node slot].edge
+ * links owner references and owner.component is its head. No SCC work runs
+ * until closure is complete, so the later Tarjan/component uses cannot overlap. */
+static void root_include(PeakMpiCostModel *m, uint32_t i) {
+    CostNode *n = &m->nodes[i];
+    if (n->root_selected)
+        return;
+    n->root_selected = true;
+    m->finish[m->root_tail++] = i;
+}
+static void root_restore_begin(PeakMpiCostModel *m) {
+    m->phase = IDLE;
+    m->ordering = false;
+    m->root_stage = ROOT_RESTORE;
+    m->root_cursor = 0;
+}
+static void root_step(PeakMpiCostModel *m) {
+    uint32_t i;
+    switch (m->root_stage) {
+    case ROOT_NONE:
+    case ROOT_SOLVE:
+        break;
+    case ROOT_CLEAR_NODES: /* Clear one node and index its owner reference. */
+        if (m->root_cursor < m->root_full_n) {
+            i = m->node_ids[m->root_cursor++];
+            m->nodes[i].root_selected = false;
+            CostNode *n = &m->nodes[i];
+            if (!n->settled && (!n->defined || !n->sealed)) {
+                m->root_global_pending = true;
+                m->root_global_closed = false;
+            }
+            if (n->defined && !no_owner(n->spec.owner)) {
+                if (!valid_owner(m, n->spec.owner)) {
+                    fail(m, PEAK_MPI_COST_INVALID_REFERENCE);
+                    break;
+                }
+                CostOwner *o = &m->owners[n->spec.owner.slot];
+                if (o->defined && o->rank != n->spec.rank) {
+                    fail(m, PEAK_MPI_COST_CONFLICTING_DEFINITION);
+                    break;
+                }
+                m->stack[i].edge = o->component;
+                o->component = i;
+                if (o->references > 1)
+                    root_include(m, i);
+            }
+        } else {
+            m->root_stage = ROOT_SEEDS;
+            m->root_cursor = 0;
+        }
+        break;
+    case ROOT_CLEAR_OWNERS:
+        if (m->root_cursor < m->root_full_o) {
+            i = m->owner_ids[m->root_cursor++];
+            m->owners[i].root_references = 0;
+            m->owners[i].component = NONE;
+            if (!m->owners[i].defined || !m->owners[i].references) {
+                m->root_global_pending = true;
+                m->root_global_closed = false;
+            }
+        } else {
+            m->root_stage = ROOT_CLEAR_NODES;
+            m->root_cursor = 0;
+        }
+        break;
+    case ROOT_SEEDS:
+        if (m->root_cursor < m->root_seed_count)
+            root_include(m, m->queue[m->root_cursor++]);
+        else {
+            m->root_stage = ROOT_CLOSURE;
+            m->root_cursor = 0;
+        }
+        break;
+    case ROOT_CLOSURE:
+        if (m->root_edge != NONE) {
+            CostEdge *e = &m->edges[m->root_edge];
+            m->root_edge = e->in_next;
+            if (e->active)
+                root_include(m, e->source);
+        } else if (m->root_owner != NONE) {
+            i = m->root_owner;
+            m->root_owner = m->stack[i].edge;
+            root_include(m, i);
+        } else if (m->root_head < m->root_tail) {
+            i = m->finish[m->root_head++];
+            CostNode *n = &m->nodes[i];
+            m->root_edge = n->in;
+            if (n->defined && !no_owner(n->spec.owner)) {
+                CostOwner *o = &m->owners[n->spec.owner.slot];
+                if (!o->root_references) {
+                    o->root_references = 1;
+                    m->root_owner = o->component;
+                }
+            }
+        } else {
+            m->root_stage = ROOT_PROJECT_NODES;
+            m->root_cursor = 0;
+            m->root_projected = true;
+        }
+        break;
+    case ROOT_PROJECT_NODES:
+        if (m->root_cursor < m->root_full_n) {
+            i = m->node_ids[m->root_cursor++];
+            if (m->nodes[i].root_selected) { /* Active nodes never read free_next. Retirement/reset
+                                              * writes the free-list link before a node becomes
+                                              * inactive. Restore this saved index one selected node
+                                              * per work unit, including pre-swap cancellation. */
+                m->nodes[i].free_next = m->nodes[i].active_index;
+                m->nodes[i].active_index = m->root_n;
+                m->root_nodes[m->root_n++] = i;
+            }
+        } else {
+            m->root_stage = ROOT_PROJECT_OWNERS;
+            m->root_cursor = 0;
+        }
+        break;
+    case ROOT_PROJECT_OWNERS:
+        if (m->root_cursor < m->root_full_o) {
+            i = m->owner_ids[m->root_cursor++];
+            if (m->owners[i].root_references)
+                m->root_owners[m->root_o++] = i;
+        } else {
+            m->root_stage = ROOT_PROJECT_EDGES;
+            m->root_cursor = 0;
+        }
+        break;
+    case ROOT_PROJECT_EDGES:
+        if (m->root_cursor < m->root_full_e) {
+            i = m->edge_ids[m->root_cursor++];
+            CostEdge *e = &m->edges[i];
+            if (m->nodes[e->source].root_selected && m->nodes[e->target].root_selected)
+                m->root_edges[m->root_e++] = i;
+        } else {
+            uint32_t *ids = m->node_ids;
+            m->node_ids = m->root_nodes;
+            m->root_nodes = ids;
+            ids = m->owner_ids;
+            m->owner_ids = m->root_owners;
+            m->root_owners = ids;
+            ids = m->edge_ids;
+            m->edge_ids = m->root_edges;
+            m->root_edges = ids;
+            m->root_swapped = true;
+            m->stats.active_nodes = m->root_n;
+            m->stats.active_edges = m->root_e;
+            m->stats.active_owners = m->root_o;
+            m->graph_dirty = m->frontier_dirty = true;
+            m->root_stage = ROOT_SOLVE;
+        }
+        break;
+    case ROOT_RESTORE:
+        if (m->root_cursor < m->root_n) {
+            i = (m->root_swapped ? m->node_ids : m->root_nodes)[m->root_cursor++];
+            m->nodes[i].active_index = m->nodes[i].free_next;
+        } else {
+            if (m->root_swapped) {
+                uint32_t *ids = m->node_ids;
+                m->node_ids = m->root_nodes;
+                m->root_nodes = ids;
+                ids = m->owner_ids;
+                m->owner_ids = m->root_owners;
+                m->root_owners = ids;
+                ids = m->edge_ids;
+                m->edge_ids = m->root_edges;
+                m->root_edges = ids;
+            }
+            m->stats.active_nodes = m->root_full_n;
+            m->stats.active_edges = m->root_full_e;
+            m->stats.active_owners = m->root_full_o;
+            m->root_projected = m->root_swapped = false;
+            m->root_stage = ROOT_NONE;
+            m->graph_dirty = m->frontier_dirty = true;
+            m->frontier_valid = false;
+            if (m->root_reset) {
+                m->reset_stage = 1;
+                m->reset_cursor = 0;
+                m->root_reset = false;
+            }
+        }
+        break;
+    }
+}
+PeakMpiCostStatus peak_mpi_cost_model_run(PeakMpiCostModel *m, size_t budget, size_t *used) {
+    if (!m || !m->root_stage)
+        return full_model_run(m, budget, used);
+    size_t work = 0;
+    while (work < budget && m->root_stage) {
+        if (m->stats.coarse && m->root_stage < ROOT_RESTORE) {
+            m->root_result = PEAK_MPI_COST_COARSE;
+            if (m->root_projected)
+                root_restore_begin(m);
+            else {
+                m->root_stage = ROOT_NONE;
+                break;
+            }
+        }
+        if (m->root_stage == ROOT_SOLVE) {
+            size_t spent = 0;
+            PeakMpiCostStatus st = full_model_run(m, budget - work, &spent);
+            work += spent;
+            if (st == PEAK_MPI_COST_YIELDED)
+                break;
+            m->root_result = st;
+            root_restore_begin(m);
+        } else {
+            root_step(m);
+            ++work;
+        }
+    }
+    if (used)
+        *used = work;
+    return m->root_stage ? PEAK_MPI_COST_YIELDED : m->root_result;
+}
 PeakMpiCostStatus peak_mpi_cost_model_delay(const PeakMpiCostModel *m,
                                          PeakMpiCostRef ref, double *out)
 {
     if (!m || !out || !valid_node(m, ref)) return PEAK_MPI_COST_INVALID;
     if (m->stats.coarse) return PEAK_MPI_COST_COARSE;
-    if (m->phase != IDLE) return PEAK_MPI_COST_BUSY;
+    if (m->phase != IDLE || m->root_stage) return PEAK_MPI_COST_BUSY;
     if (!m->nodes[ref.slot].settled) return PEAK_MPI_COST_PENDING;
     *out = m->nodes[ref.slot].delay;
     return PEAK_MPI_COST_OK;
@@ -1051,7 +1332,7 @@ PeakMpiCostStatus peak_mpi_cost_model_frontier(const PeakMpiCostModel *m, double
 {
     if (!m || !out) return PEAK_MPI_COST_INVALID;
     if (m->stats.coarse) return PEAK_MPI_COST_COARSE;
-    if (m->phase != IDLE || m->frontier_dirty || !m->frontier_valid) return PEAK_MPI_COST_PENDING;
+    if (m->root_stage || m->phase != IDLE || m->frontier_dirty || !m->frontier_valid) return PEAK_MPI_COST_PENDING;
     *out = m->frontier;
     return PEAK_MPI_COST_OK;
 }
@@ -1191,13 +1472,28 @@ PeakMpiCostStatus peak_mpi_cost_model_raw(const PeakMpiCostModel *m, uint32_t ra
 
 void peak_mpi_cost_model_stats(const PeakMpiCostModel *m, PeakMpiCostStats *out)
 {
-    if (m && out) *out = m->stats;
+    if (m && out) {
+        *out = m->stats;
+        if (m->root_stage) {
+            out->active_nodes = m->root_full_n;
+            out->active_edges = m->root_full_e;
+            out->active_owners = m->root_full_o;
+        }
+    }
 }
 
 /* Epoch reset reuses active-ID/free lists: no allocation or capacity sweep. */
 void peak_mpi_cost_model_reset_begin(PeakMpiCostModel *m) {
     if (!m)
         return;
+    if (m->root_stage) {
+        if (m->root_projected) {
+            m->root_reset = true;
+            root_restore_begin(m);
+            return;
+        }
+        m->root_stage = ROOT_NONE;
+    }
     m->phase = IDLE;
     m->ordering = false;
     m->reset_stage = 1;
@@ -1206,6 +1502,10 @@ void peak_mpi_cost_model_reset_begin(PeakMpiCostModel *m) {
 int peak_mpi_cost_model_reset_work(PeakMpiCostModel *m, size_t budget,
                                    size_t *used) {
     *used = 0;
+    if (m->root_stage) {
+        peak_mpi_cost_model_run(m, budget, used);
+        return 0;
+    }
     while (m->reset_stage && *used < budget) {
         ++*used;
         if (m->reset_stage == 1) {

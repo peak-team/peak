@@ -101,7 +101,13 @@ typedef struct {
   PeakMpiCausalRecovery recovery;
   uint64_t uid_floor, acknowledged_loss, recovery_comm, feedback_epoch;
   size_t cut_head, cut_tail;
+  uint64_t root_bound, root_index;
+  PeakMpiCostRef root_ref;
+  int root_valid;
 } Rank;
+typedef enum { ROOT_PLAN_IDLE, ROOT_PLAN_RANKS, ROOT_PLAN_OPERATIONS,
+  ROOT_PLAN_CUTS, ROOT_PLAN_BEGIN, ROOT_PLAN_CONTINUATIONS,
+  ROOT_PLAN_BRANCHES, ROOT_PLAN_READY } RootPlanStage;
 struct PeakMpiCausalService {
   PeakMpiCausalServiceConfig config;
   PeakMpiCausalRecovery recovery, recovery_candidate;
@@ -152,6 +158,11 @@ struct PeakMpiCausalService {
   double now;
   unsigned verify_batch_stage, verify_batch_rank, verify_batch_start;
   size_t verify_batch_op, verify_batch_limit;
+  RootPlanStage root_plan_stage;
+  unsigned root_plan_rank, root_ref_count, root_ref_cursor;
+  size_t root_plan_cursor, root_dep_cursor;
+  int root_cut_active;
+  PeakMpiCostRef root_refs[5];
   int task_stage;
   size_t task_op, task_cursor, task_limit, task_count, task_best, task_bound;
   size_t *candidates;
@@ -820,6 +831,10 @@ static int queue_cut(PeakMpiCausalService *s, unsigned rank, PeakMpiCostRef ref,
   else
     r->cut_head = at;
   r->cut_tail = at;
+  /* An idle RAW cut can widen the required frontier without adding a graph
+   * edge. Ask for a new rooted solve before moving outside the old scope. */
+  if (s->root_cut_active && s->cuts[at].index > r->root_index)
+    s->graph_pending = 1;
   return 1;
 }
 static size_t advance_covered(PeakMpiCausalService *s, size_t allowance) {
@@ -836,6 +851,10 @@ static size_t advance_covered(PeakMpiCausalService *s, size_t allowance) {
     }
     SettledCut *cut = &s->cuts[r->cut_head];
     double d;
+    if (s->root_cut_active && cut->index > r->root_index) {
+      idle++;
+      continue;
+    }
     if (peak_mpi_cost_model_delay(s->model, cut->ref, &d) != PEAK_MPI_COST_OK) {
       idle++;
       continue;
@@ -1828,20 +1847,21 @@ static void matcher_work(PeakMpiCausalService *s, size_t budget) {
     }
   }
 }
-static int branch_live_at_cut(PeakMpiCausalService *s, Operation *o) {
-  Rank *r = &s->ranks[o->rank];
-  if (o->group_index > r->covered_index)
+static uint64_t branch_cut_index(PeakMpiCausalService *s, unsigned rank, int planned) {
+  return planned ? s->ranks[rank].root_index : s->ranks[rank].covered_index;
+}
+static int branch_live_for_indices(PeakMpiCausalService *s, Operation *o, int planned) {
+  uint64_t local_cut = branch_cut_index(s, o->rank, planned);
+  if (o->group_index > local_cut)
     return 0;
   if ((o->begin.flags & PEAK_MPI_CAUSAL_NONBLOCKING) && !o->immediate &&
-      (!o->completed || o->completion_index > r->covered_index))
+      (!o->completed || o->completion_index > local_cut))
     return 1;
   if (send_op(o->begin.operation) && !o->legacy_resolved &&
-      (!o->send_matched ||
-       o->consumer_index > s->ranks[o->consumer_rank].covered_index))
+      (!o->send_matched || o->consumer_index > branch_cut_index(s, o->consumer_rank, planned)))
     return 1;
   if (o->buffer != SIZE_MAX &&
-      (!s->buffers[o->buffer].closed ||
-       s->buffers[o->buffer].closed_index > r->covered_index))
+      (!s->buffers[o->buffer].closed || s->buffers[o->buffer].closed_index > local_cut))
     return 1;
   if (o->ambiguous && !o->ambiguity_closed)
     return 1;
@@ -1849,8 +1869,137 @@ static int branch_live_at_cut(PeakMpiCausalService *s, Operation *o) {
       s->operations[o->peer_op].used) {
     Operation *send = &s->operations[o->peer_op];
     if (!send->send_matched ||
-        send->consumer_index > s->ranks[send->consumer_rank].covered_index)
+        send->consumer_index > branch_cut_index(s, send->consumer_rank, planned))
       return 1;
+  }
+  return 0;
+}
+static int branch_live_at_cut(PeakMpiCausalService *s, Operation *o) {
+  return branch_live_for_indices(s, o, 0);
+}
+static int branch_live_at_root(PeakMpiCausalService *s, Operation *o) {
+  return branch_live_for_indices(s, o, 1);
+}
+static void root_ref(PeakMpiCausalService *s, PeakMpiCostRef ref) {
+  /* The single producer below adds at most five references: entry, exit,
+   * result, join, and buffer seal. Dependency roots are streamed separately. */
+  if (ref.generation)
+    s->root_refs[s->root_ref_count++] = ref;
+}
+/* Selection is only a heuristic. Full incoming/owner closure decides readiness. */
+static int prepare_root_cut(PeakMpiCausalService *s, size_t budget) {
+  s->last_work_used = 0;
+  while (budget) {
+    if (s->root_plan_stage == ROOT_PLAN_RANKS) {
+      if (s->root_plan_rank == s->config.world_size) {
+        s->root_plan_stage = ROOT_PLAN_OPERATIONS;
+        s->root_plan_cursor = 0;
+        continue;
+      }
+      Rank *r = &s->ranks[s->root_plan_rank++];
+      r->root_bound = UINT64_MAX;
+      r->root_index = r->covered_index;
+      r->root_ref = r->covered_ref;
+      r->root_valid = r->covered.generation != 0;
+    } else if (s->root_plan_stage == ROOT_PLAN_OPERATIONS) {
+      if (s->root_plan_cursor == s->operation_count) {
+        s->root_plan_stage = ROOT_PLAN_CUTS;
+        s->root_plan_rank = 0;
+        s->root_plan_cursor = SIZE_MAX;
+        continue;
+      }
+      Operation *o = &s->operations[s->active[s->root_plan_cursor++]];
+      Rank *r = &s->ranks[o->rank];
+      if (o->group_index > r->covered_index &&
+          !peak_mpi_cost_model_closed_hint(s->model, o->exit) && o->group_index < r->root_bound)
+        r->root_bound = o->group_index;
+    } else if (s->root_plan_stage == ROOT_PLAN_CUTS) {
+      if (s->root_plan_rank == s->config.world_size) {
+        s->root_plan_stage = ROOT_PLAN_BEGIN;
+        s->root_plan_rank = 0;
+        continue;
+      }
+      Rank *r = &s->ranks[s->root_plan_rank];
+      if (s->root_plan_cursor == SIZE_MAX)
+        s->root_plan_cursor = r->cut_head;
+      if (s->root_plan_cursor == SIZE_MAX) {
+        s->root_plan_rank++;
+        --budget;
+        ++s->last_work_used;
+        continue;
+      }
+      SettledCut *c = &s->cuts[s->root_plan_cursor];
+      if (c->index >= r->root_bound) {
+        s->root_plan_rank++;
+        s->root_plan_cursor = SIZE_MAX;
+        --budget;
+        ++s->last_work_used;
+        continue;
+      }
+      r->root_index = c->index;
+      r->root_ref = c->ref;
+      r->root_valid = 1;
+      s->root_plan_cursor = c->next;
+      if (s->root_plan_cursor == SIZE_MAX)
+        s->root_plan_rank++;
+    } else if (s->root_plan_stage == ROOT_PLAN_BEGIN) {
+      if (good(s, s->config.owner_rank, peak_mpi_cost_model_roots_begin(s->model))) {
+        s->root_plan_stage = ROOT_PLAN_CONTINUATIONS;
+        s->root_plan_rank = 0;
+      } else
+        return 1;
+    } else if (s->root_plan_stage == ROOT_PLAN_CONTINUATIONS) {
+      if (s->root_plan_rank == s->config.world_size) {
+        s->root_plan_stage = ROOT_PLAN_BRANCHES;
+        s->root_plan_cursor = 0;
+        s->root_ref_count = s->root_ref_cursor = 0;
+        s->root_dep_cursor = SIZE_MAX;
+        continue;
+      }
+      Rank *r = &s->ranks[s->root_plan_rank++];
+      if (r->root_valid)
+        good(s, s->config.owner_rank, peak_mpi_cost_model_roots_add(s->model, r->root_ref));
+    } else {
+      if (s->root_ref_cursor < s->root_ref_count) {
+        good(s, s->config.owner_rank,
+             peak_mpi_cost_model_roots_add(s->model, s->root_refs[s->root_ref_cursor++]));
+      } else if (s->root_dep_cursor != SIZE_MAX) {
+        PendingInput *d = &s->deps[s->root_dep_cursor];
+        s->root_dep_cursor = d->next;
+        if (d->group_index <= s->ranks[d->rank].root_index)
+          good(s, s->config.owner_rank, peak_mpi_cost_model_roots_add(s->model, d->ref));
+      } else {
+        if (s->root_plan_cursor == s->operation_count) {
+          s->root_cut_active = 1;
+          /* READY survives an exhausted heartbeat allowance. Until the first
+           * run starts, it distinguishes a new root set from an old cut cap. */
+          s->root_plan_stage = ROOT_PLAN_READY;
+          return 1;
+        }
+        Operation *o = &s->operations[s->active[s->root_plan_cursor++]];
+        Rank *r = &s->ranks[o->rank];
+        s->root_ref_cursor = s->root_ref_count = 0;
+        if (o->group_index <= r->root_index &&
+            (o->group_index > r->covered_index || branch_live_at_cut(s, o) ||
+             branch_live_at_root(s, o))) {
+          if ((!o->result_defined || o->completion_index > r->root_index) &&
+              o->dep_head != SIZE_MAX)
+            s->root_dep_cursor = o->dep_head;
+          root_ref(s, o->entry);
+          if (o->ended)
+            root_ref(s, o->exit);
+          if (o->result_defined && o->completion_index <= r->root_index)
+            root_ref(s, o->result);
+          if (o->collective_built && peak_mpi_cost_model_closed_hint(s->model, o->join))
+            root_ref(s, o->join);
+          if (o->buffer != SIZE_MAX && s->buffers[o->buffer].closed &&
+              s->buffers[o->buffer].closed_index <= r->root_index)
+            root_ref(s, s->buffers[o->buffer].seal);
+        }
+      }
+    }
+    --budget;
+    ++s->last_work_used;
   }
   return 0;
 }
@@ -2643,6 +2792,8 @@ static int recovery_work(PeakMpiCausalService *s, size_t budget, size_t *used) {
     s->recovery_reset = 1;
     s->recovery_rank = 0;
     s->recovery_cursor = 0;
+    s->root_plan_stage = ROOT_PLAN_IDLE;
+    s->root_cut_active = 0;
     s->model_running = s->plan_active = s->visibility_rank = 0;
     s->verify_batch_stage = s->verify_batch_rank = 0;
     s->verify_batch_op = s->verify_batch_limit = 0;
@@ -3075,7 +3226,7 @@ void peak_mpi_causal_service_tick(PeakMpiCausalService *s,
       ENGINE_GC
     };
     while (left) {
-      if (s->model_running)
+      if (s->model_running || s->root_plan_stage)
         s->engine_phase = ENGINE_MODEL;
       else if (s->pub_stage)
         s->engine_phase = ENGINE_PUBLISH;
@@ -3138,11 +3289,24 @@ void peak_mpi_causal_service_tick(PeakMpiCausalService *s,
         }
         s->engine_phase = ENGINE_MODEL;
       } else if (s->engine_phase == ENGINE_MODEL) {
-        if (!s->graph_pending && !s->model_running) {
+        if (!s->graph_pending && !s->model_running && !s->root_plan_stage) {
           left--;
           s->engine_phase = ENGINE_ADVANCE;
           continue;
         }
+        if (!s->model_running && !s->root_plan_stage) {
+          s->root_plan_stage = ROOT_PLAN_RANKS;
+          s->root_plan_rank = 0;
+        }
+        if (s->root_plan_stage && s->root_plan_stage != ROOT_PLAN_READY) {
+          int ready = prepare_root_cut(s, left);
+          left -= s->last_work_used;
+          if (!ready)
+            break;
+          if (!left)
+            break;
+        }
+        s->root_plan_stage = ROOT_PLAN_IDLE;
         size_t spent = 0;
         PeakMpiCostStatus status =
             peak_mpi_cost_model_run(s->model, left, &spent);
