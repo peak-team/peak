@@ -77,10 +77,10 @@ struct PeakMpiCostModel {
     uint32_t cursor, stack_size, finish_count, component_count, reverse_index;
     uint32_t scc_current, queue_head, queue_tail, search_edge, search_candidate;
     uint32_t topology_current, topology_edge, topology_done;
-    uint32_t gc_phase, gc_cursor;
+    uint32_t gc_phase, gc_cursor, gc_incident;
     uint32_t continuation_count;
     uint32_t group_node, group_edge, group_inputs;
-    bool group_unknown, ordering;
+    bool group_unknown, ordering, has_reverse;
     uint64_t search_stamp, group_stamp;
     unsigned reset_stage;
     uint32_t reset_cursor;
@@ -606,6 +606,7 @@ static void run_step(PeakMpiCostModel *m)
         if (m->cursor < m->stats.active_edges) {
             CostEdge *e = &m->edges[m->edge_ids[m->cursor++]];
             e->retained = e->kind != PEAK_MPI_COST_SEND_REVERSE;
+            if (e->kind == PEAK_MPI_COST_SEND_REVERSE) m->has_reverse = true;
             e->component_next = NONE;
         } else { m->phase = RESET_OWNERS; m->cursor = 0; }
         break;
@@ -626,7 +627,7 @@ static void run_step(PeakMpiCostModel *m)
                 m->group_unknown = false;
                 m->phase = GROUP_INPUTS;
             }
-        } else { m->ordering = true; m->phase = DFS_SCAN; m->cursor = 0; }
+        } else { m->ordering = m->has_reverse; m->phase = DFS_SCAN; m->cursor = 0; }
         break;
     case GROUP_INPUTS:
         if (m->group_edge != NONE) {
@@ -875,6 +876,7 @@ PeakMpiCostStatus peak_mpi_cost_model_run(PeakMpiCostModel *m, size_t budget,
         m->cursor = 0;
         if (m->graph_dirty) {
             m->phase = RESET_NODES;
+            m->has_reverse = false;
             m->finish_count = m->component_count = m->stack_size = 0;
             m->pending = false; m->all_closed = true;
             m->stats.scc_count = m->stats.excluded_candidates = m->stats.retained_candidates = 0;
@@ -1065,28 +1067,35 @@ PeakMpiCostStatus peak_mpi_cost_model_collect(PeakMpiCostModel *m, size_t budget
     if (status != PEAK_MPI_COST_OK) return status;
     size_t work = 0;
     while (work < budget) {
-        if (m->gc_phase == 0) {
-            if (m->gc_cursor < m->stats.active_edges) {
-                uint32_t i = m->edge_ids[m->gc_cursor];
-                CostEdge *e = &m->edges[i];
-                CostNode *a = &m->nodes[e->source], *b = &m->nodes[e->target];
-                if (a->settled && b->settled &&
-                    ((a->retire && !a->pins) || (b->retire && !b->pins))) remove_edge(m, i);
-                else ++m->gc_cursor;
-            } else { m->gc_phase = 1; m->gc_cursor = 0; }
-        } else {
-            if (m->gc_cursor < m->stats.active_nodes) {
-                uint32_t i = m->node_ids[m->gc_cursor];
-                CostNode *n = &m->nodes[i];
-                if (n->retire && n->settled && !n->pins && n->in == NONE && n->out == NONE)
-                    remove_node(m, i);
-                else ++m->gc_cursor;
-            } else {
-                m->gc_phase = m->gc_cursor = 0;
-                if (used) *used = work + 1;
-                return PEAK_MPI_COST_OK;
-            }
+        if (m->gc_cursor >= m->stats.active_nodes) {
+            m->gc_phase = m->gc_cursor = 0;
+            if (used) *used = work;
+            return PEAK_MPI_COST_OK;
         }
+        uint32_t i = m->node_ids[m->gc_cursor];
+        CostNode *n = &m->nodes[i];
+        if (!m->gc_phase) {
+            ++work;
+            if (!n->retire || !n->settled || n->pins) { ++m->gc_cursor; continue; }
+            m->gc_incident = n->out;
+            m->gc_phase = 1;
+        }
+        if (m->gc_phase == 1 && m->gc_incident == NONE) {
+            m->gc_incident = n->in;
+            m->gc_phase = 2;
+        }
+        if (m->gc_phase == 2 && m->gc_incident == NONE) {
+            if (n->in == NONE && n->out == NONE) remove_node(m, i);
+            else ++m->gc_cursor;
+            m->gc_phase = 0;
+            continue;
+        }
+        if (work == budget) break;
+        CostEdge *e = &m->edges[m->gc_incident];
+        uint32_t edge = m->gc_incident;
+        m->gc_incident = m->gc_phase == 1 ? e->out_next : e->in_next;
+        if (m->nodes[e->source].settled && m->nodes[e->target].settled)
+            remove_edge(m, edge);
         ++work;
     }
     if (used) *used = work;

@@ -33,6 +33,7 @@ static inline void peak_mpi_causal_profile_call(size_t slot) {
 }
 
 int peak_mpi_causal_runtime_requested(void);
+int peak_mpi_causal_runtime_needs_service(void);
 int peak_mpi_causal_runtime_prepare(size_t slots, double q,
                                     double heartbeat_max_seconds,
                                     double ema_alpha);

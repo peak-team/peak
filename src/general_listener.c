@@ -5335,6 +5335,44 @@ peak_heartbeat_wait_us(unsigned int sleep_us)
     return keep_running;
 }
 
+/* Keep the controller deadline independent of observer service turns. */
+static gboolean
+peak_heartbeat_wait_with_mpi_service(unsigned int sleep_us,
+                                    unsigned int service_us)
+{
+#ifdef HAVE_MPI
+    if (peak_mpi_causal_runtime_requested() && service_us && sleep_us > service_us) {
+        const double due = peak_second() + (double)sleep_us / 1e6;
+        for (;;) {
+            double remaining = due - peak_second();
+            if (remaining <= 0.0) return TRUE;
+            unsigned int wait_us = (unsigned int)MIN(
+                ceil(remaining * 1e6), (double)service_us);
+            if (!peak_heartbeat_wait_us(wait_us)) return FALSE;
+            double now = peak_second();
+            if (now >= due) return TRUE;
+            unsigned long long checkpoint = 0;
+            gboolean valid = peak_general_listener_thread_cpu_ns(&checkpoint);
+            if (!peak_mpi_causal_runtime_needs_service()) {
+                peak_general_listener_management_cpu_checkpoint(&checkpoint, &valid);
+                continue;
+            }
+            PeakDetachAccountingSnapshot accounting;
+            peak_general_listener_runtime_accounting_snapshot(&accounting);
+            double control = (double)
+                peak_general_listener_control_wall_ns_since_heartbeat(&accounting) / 1e9;
+            peak_mpi_causal_runtime_tick(now, MAX(now - peak_main_time, 1e-12),
+                control, peak_general_listener_management_cpu_seconds(),
+                accounting.completed_stop_window_count + accounting.failed_stop_window_count);
+            peak_general_listener_management_cpu_checkpoint(&checkpoint, &valid);
+        }
+    }
+#else
+    (void)service_us;
+#endif
+    return peak_heartbeat_wait_us(sleep_us);
+}
+
 void* peak_heartbeat_monitor(void* arg) {
     PeakHeartbeatArgs* heartbeat_args = (PeakHeartbeatArgs*)arg;
     peak_general_listener_exclude_current_thread();
@@ -6037,7 +6075,7 @@ void* peak_heartbeat_monitor(void* arg) {
         peak_general_listener_management_cpu_checkpoint(
             &management_cpu_checkpoint_ns,
             &management_cpu_checkpoint_valid);
-        if (!peak_heartbeat_wait_us((unsigned int)sleep_us)) {
+        if (!peak_heartbeat_wait_with_mpi_service((unsigned int)sleep_us, heartbeat_time)) {
             break;
         }
     }

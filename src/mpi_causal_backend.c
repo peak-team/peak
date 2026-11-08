@@ -150,6 +150,8 @@ struct PeakMpiCausalService {
   unsigned char *peers;
   uint64_t epoch, generation, order, gc_generation;
   double now;
+  unsigned verify_batch_stage, verify_batch_rank, verify_batch_start;
+  size_t verify_batch_op, verify_batch_limit;
   int task_stage;
   size_t task_op, task_cursor, task_limit, task_count, task_best, task_bound;
   size_t *candidates;
@@ -540,6 +542,26 @@ static void raw_to_policy(PeakMpiCausalService *s, unsigned r) {
   peak_mpi_policy_record_raw(s->ranks[root(s, r)].policy,
                              s->ranks[root(s, r)].key, &p, s->now);
 }
+static void freeze_verify_tuple(Rank *a) {
+  a->verify_slot_count = a->prefix_slot_count;
+  for (size_t i = 0; i < a->verify_slot_count; i++) {
+    size_t slot = a->prefix_slots[i];
+    a->verify_prefix[slot] = a->prefix[slot];
+  }
+  a->verify_nonce = a->echoed_nonce;
+  a->verify_generation = a->raw_generation;
+  a->verify_cursor = 0;
+  a->verify_active = 1;
+  a->verify_stage = 1;
+  a->accept_cursor = 0;
+  a->verify_idle = a->idle;
+  a->verify_group = a->idle_group;
+  a->verify_L = a->L;
+  a->verify_P = a->P;
+  a->verify_elapsed = a->elapsed;
+  a->verify_control = a->control;
+  a->verify_received = a->received_at;
+}
 int peak_mpi_causal_service_ingest_raw(PeakMpiCausalService *s, unsigned r,
                                        const PeakMpiCausalRaw *raw,
                                        double now) {
@@ -620,6 +642,12 @@ int peak_mpi_causal_service_ingest_raw(PeakMpiCausalService *s, unsigned r,
     coarse(s, r, why,
            raw->lost_events > a->lost ? raw->lost_events - a->lost : 0);
   }
+  if (!a->coarse && !s->approximate && !s->recovery_reset &&
+      !s->recovery_needed && a->have_prefix && !a->verify_active &&
+      a->requested_nonce > a->verified_nonce &&
+      a->echoed_nonce >= a->requested_nonce &&
+      a->raw_generation > a->last_verify_generation)
+    freeze_verify_tuple(a);
   return 1;
 }
 static int advance(PeakMpiCausalService *s, unsigned r,
@@ -2162,138 +2190,182 @@ static void checkpoint(PeakMpiCausalService *s, size_t budget) {
     }
   }
 }
-static void verify_prefixes(PeakMpiCausalService *s, size_t budget) {
-  s->last_work_used = 0;
-  unsigned visits = 0;
-  while (budget && visits < s->config.world_size) {
-    unsigned rank = s->visibility_rank
-                        ? s->visibility_rank - 1
-                        : s->verify_rank_cursor++ % s->config.world_size;
-    Rank *a = &s->ranks[rank];
-    visits++;
-    if (!a->have_prefix || a->coarse) {
+/* Verify a finite set of prefixes with one shared visibility/wake pass,
+ * then tuple commit. The heartbeat may update latest RAW values while a
+ * batch yields, but no parser/matcher/model/GC observes a partial batch. */
+static int verify_rank_prefix(PeakMpiCausalService *s, unsigned rank,
+                              size_t *left) {
+  size_t budget = *left;
+  size_t used_before = s->last_work_used;
+  Rank *a = &s->ranks[rank];
+  int result = 0;
+  if (!a->have_prefix || a->coarse) {
+    budget--;
+    s->last_work_used++;
+    goto done;
+  }
+  if (!a->verify_active) {
+    if (a->last_verify_generation == a->raw_generation && a->has_verified &&
+        a->verified_nonce >= a->echoed_nonce) {
       budget--;
       s->last_work_used++;
-      continue;
+      result = 0;
+      goto done;
     }
-    if (!a->verify_active) {
-      if (a->last_verify_generation == a->raw_generation && a->has_verified &&
-          a->verified_nonce >= a->echoed_nonce) {
-        budget--;
-        s->last_work_used++;
+    /* One coherent frozen tuple. Copy only its cumulative nonzero slots;
+     * later slot activation cannot alter this frozen membership. Subsequent
+     * accepted-prefix, pending-record and visible-operation walks
+     * resume at one transition per work unit. */
+    if (budget < a->prefix_slot_count) {
+      result = -1;
+      goto done;
+    }
+    freeze_verify_tuple(a);
+    budget -= a->verify_slot_count;
+    s->last_work_used += a->verify_slot_count;
+  }
+  if (a->verify_stage == 1) {
+    while (budget && a->accept_cursor < a->verify_slot_count) {
+      size_t at = a->prefix_slots[a->accept_cursor];
+      budget--;
+      s->last_work_used++;
+      if (a->sequence[at] < a->verify_prefix[at]) {
+        result = 0;
+        goto done;
+      }
+      a->accept_cursor++;
+    }
+    if (a->accept_cursor < a->verify_slot_count) {
+      result = budget ? 0 : -1;
+      goto done;
+    }
+    a->verify_stage = 2;
+  }
+  if (a->verify_stage == 2) {
+    size_t before = budget;
+    int clear = peak_mpi_causal_batches_prefix_clear_slots(
+        s->batches, rank, a->verify_prefix, a->prefix_slots,
+        a->verify_slot_count, &a->verify_cursor, &budget);
+    s->last_work_used += before - budget;
+    if (clear != 1) {
+      result = clear < 0 ? -1 : 0;
+      goto done;
+    }
+    a->verify_stage = 3;
+    a->verified_nonce = a->verify_nonce;
+  }
+
+  result = a->verify_stage == 3;
+done:
+  *left -= s->last_work_used - used_before;
+  return result;
+}
+static void verify_prefixes(PeakMpiCausalService *s, size_t budget) {
+  s->last_work_used = 0;
+  if (!s->verify_batch_stage) {
+    s->verify_batch_stage = 1;
+    s->verify_batch_rank = 0;
+    s->verify_batch_start = s->verify_rank_cursor++ % s->config.world_size;
+    s->visibility_rank = 1;
+  }
+  while (budget) {
+    if (s->verify_batch_stage == 1) {
+      if (s->verify_batch_rank < s->config.world_size) {
+        unsigned rank = (s->verify_batch_start + s->verify_batch_rank) %
+                        s->config.world_size;
+        int verified = verify_rank_prefix(s, rank, &budget);
+        if (verified < 0)
+          return;
+        s->verify_batch_rank++;
         continue;
       }
-      /* One coherent frozen tuple. Copy only its cumulative nonzero slots;
-       * later slot activation cannot alter this frozen membership. Subsequent
-       * accepted-prefix, pending-record and visible-operation walks
-       * resume at one transition per work unit. */
-      if (budget < a->prefix_slot_count)
-        return;
-      a->verify_slot_count = a->prefix_slot_count;
-      for (size_t i = 0; i < a->verify_slot_count; i++) {
-        size_t slot = a->prefix_slots[i];
-        a->verify_prefix[slot] = a->prefix[slot];
-      }
-      a->verify_nonce = a->echoed_nonce;
-      a->verify_generation = a->raw_generation;
-      a->verify_cursor = 0;
-      a->verify_active = 1;
-      a->verify_stage = 1;
-      a->accept_cursor = 0;
-      a->verify_idle = a->idle;
-      a->verify_group = a->idle_group;
-      a->verify_L = a->L;
-      a->verify_P = a->P;
-      a->verify_elapsed = a->elapsed;
-      a->verify_control = a->control;
-      a->verify_received = a->received_at;
-      budget -= a->verify_slot_count;
-      s->last_work_used += a->verify_slot_count;
+      s->verify_batch_stage = 2;
+      s->verify_batch_op = 0;
+      s->verify_batch_limit = s->operation_count;
     }
-    if (a->verify_stage == 1) {
-      while (budget && a->accept_cursor < a->verify_slot_count) {
-        size_t at = a->prefix_slots[a->accept_cursor];
+    if (s->verify_batch_stage == 2) {
+      while (budget && s->verify_batch_op < s->verify_batch_limit) {
+        Operation *o = &s->operations[s->active[s->verify_batch_op++]];
+        Rank *owner = &s->ranks[o->rank];
         budget--;
         s->last_work_used++;
-        if (a->sequence[at] < a->verify_prefix[at])
-          break;
-        a->accept_cursor++;
-      }
-      if (a->accept_cursor < a->verify_slot_count)
-        continue;
-      a->verify_stage = 2;
-    }
-    if (a->verify_stage == 2) {
-      size_t before = budget;
-      int clear = peak_mpi_causal_batches_prefix_clear_slots(
-          s->batches, rank, a->verify_prefix, a->prefix_slots,
-          a->verify_slot_count,
-          &a->verify_cursor, &budget);
-      s->last_work_used += before - budget;
-      if (clear != 1)
-        continue;
-      a->verify_stage = 3;
-      a->verified_nonce = a->verify_nonce;
-      a->visible_cursor = 0;
-      a->visible_limit = s->operation_count;
-      s->visibility_rank = rank + 1;
-    }
-    if (a->verify_stage == 3) {
-      while (budget && a->visible_cursor < a->visible_limit) {
-        Operation *o = &s->operations[s->active[a->visible_cursor++]];
-        budget--;
-        s->last_work_used++;
-        if (o->rank == rank && !o->visible &&
-            o->begin.sequence <= a->verify_prefix[o->begin.thread_uid - 1]) {
+        if (owner->verify_stage == 3 && !owner->coarse && !o->visible &&
+            o->begin.sequence <=
+                owner->verify_prefix[o->begin.thread_uid - 1]) {
           o->visible = 1;
-          o->visible_nonce = a->verify_nonce;
+          o->visible_nonce = owner->verify_nonce;
         }
         analysis_wake(s, o);
       }
-      if (a->visible_cursor < a->visible_limit)
+      if (s->verify_batch_op < s->verify_batch_limit)
         return;
-      if (a->verify_idle && budget < a->verify_slot_count)
-        return;
-      if (a->verify_idle) {
-        budget -= a->verify_slot_count;
-        s->last_work_used += a->verify_slot_count;
-      }
-      uint64_t *old = a->verified_prefix;
-      a->verified_prefix = a->verify_prefix;
-      a->verify_prefix = old;
-      a->verified_nonce = a->verify_nonce;
-      a->last_verify_generation = a->verify_generation;
-      a->has_verified = 1;
-      a->verify_active = a->verify_stage = 0;
-      s->visibility_rank = 0;
-      if (a->verify_idle && peak_mpi_causal_batches_last_group(
-                                s->batches, rank) == a->verify_group) {
-        PeakMpiObserverRecord idle = {0};
-        idle.P_cut = (uint64_t)(a->verify_P * 1e9);
-        idle.L_cut = idle.P_cut + (uint64_t)((a->verify_L - a->verify_P) * 1e9);
-        if (sec(idle.L_cut) >= a->last_L && sec(idle.P_cut) >= a->last_P) {
-          if (a->have_continuation) {
-            s->cycle_idle_progress = 1;
-            a->parsed_index++;
-            PeakMpiPolicySample sample = {
-                {rank, s->config.job_context},
-                0,
-                prefix_sum_slots(a->verified_prefix, a->prefix_slots,
-                                 a->verify_slot_count),
-                a->verify_control,
-                sec(idle.L_cut),
-                sec(idle.P_cut),
-                0,
-                a->verify_elapsed,
-                0,
-                0};
-            queue_cut(s, rank, a->continuation, sample, a->verify_received);
+      s->verify_batch_stage = 3;
+      s->verify_batch_rank = 0;
+    }
+    if (s->verify_batch_stage == 3) {
+      while (budget && s->verify_batch_rank < s->config.world_size) {
+        unsigned rank = (s->verify_batch_start + s->verify_batch_rank) %
+                        s->config.world_size;
+        Rank *a = &s->ranks[rank];
+        if (a->verify_stage != 3 || a->coarse) {
+          budget--;
+          s->last_work_used++;
+          if (a->coarse)
+            a->verify_active = a->verify_stage = 0;
+          s->verify_batch_rank++;
+          continue;
+        }
+        size_t cost =
+            a->verify_idle && a->verify_slot_count ? a->verify_slot_count : 1;
+        if (budget < cost)
+          return;
+        budget -= cost;
+        s->last_work_used += cost;
+        uint64_t *old = a->verified_prefix;
+        a->verified_prefix = a->verify_prefix;
+        a->verify_prefix = old;
+        a->verified_nonce = a->verify_nonce;
+        a->last_verify_generation = a->verify_generation;
+        a->has_verified = 1;
+        a->verify_active = a->verify_stage = 0;
+
+        if (a->verify_idle && peak_mpi_causal_batches_last_group(
+                                  s->batches, rank) == a->verify_group) {
+          PeakMpiObserverRecord idle = {0};
+          idle.P_cut = (uint64_t)(a->verify_P * 1e9);
+          idle.L_cut =
+              idle.P_cut + (uint64_t)((a->verify_L - a->verify_P) * 1e9);
+          if (sec(idle.L_cut) >= a->last_L && sec(idle.P_cut) >= a->last_P) {
+            if (a->have_continuation) {
+              s->cycle_idle_progress = 1;
+              a->parsed_index++;
+              PeakMpiPolicySample sample = {
+                  {rank, s->config.job_context},
+                  0,
+                  prefix_sum_slots(a->verified_prefix, a->prefix_slots,
+                                   a->verify_slot_count),
+                  a->verify_control,
+                  sec(idle.L_cut),
+                  sec(idle.P_cut),
+                  0,
+                  a->verify_elapsed,
+                  0,
+                  0};
+              queue_cut(s, rank, a->continuation, sample, a->verify_received);
+            }
           }
         }
+        s->verify_batch_rank++;
       }
+      if (s->verify_batch_rank < s->config.world_size)
+        return;
+      s->verify_batch_stage = 0;
+      s->visibility_rank = 0;
+      return;
     }
   }
 }
+
 static void parse_batches(PeakMpiCausalService *s, size_t budget) {
   s->last_work_used = 0;
   while (budget) {
@@ -2572,6 +2644,8 @@ static int recovery_work(PeakMpiCausalService *s, size_t budget, size_t *used) {
     s->recovery_rank = 0;
     s->recovery_cursor = 0;
     s->model_running = s->plan_active = s->visibility_rank = 0;
+    s->verify_batch_stage = s->verify_batch_rank = 0;
+    s->verify_batch_op = s->verify_batch_limit = 0;
     s->pub_stage = s->gc_stage = s->task_stage = 0;
     s->graph_pending = 0;
     s->analysis_head = s->analysis_tail = SIZE_MAX;

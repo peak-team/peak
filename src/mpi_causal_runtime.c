@@ -26,6 +26,8 @@ static unsigned char *peer_snapshot;
 static uint64_t *slot_prefixes;
 static size_t slots;
 static size_t observer_work_budget = 16384;
+static size_t configured_owner_byte_budget = 65536;
+static size_t effective_byte_budget = 65536;
 static int rank_id, world_size;
 static uint64_t incarnation, raw_generation;
 static double origin, startup, activation_start;
@@ -77,9 +79,22 @@ static int parse_unsigned(const char *value, uint64_t maximum,
   *result = (uint64_t)parsed;
   return 1;
 }
+static size_t owner_byte_budget_from_environment(void) {
+  const char *value = getenv("PEAK_MPI_OBSERVER_OWNER_BYTE_BUDGET");
+  uint64_t parsed;
+  if (!value)
+    return 65536;
+  if (parse_unsigned(value, 16777216, &parsed) && parsed > 0)
+    return (size_t)parsed;
+  fprintf(stderr, "[peak mpi causal] invalid PEAK_MPI_OBSERVER_OWNER_BYTE_BUDGET; using 65536 (valid range 1..16777216)\n");
+  return 65536;
+}
 int peak_mpi_causal_runtime_requested(void) {
   const char *v = getenv("PEAK_MPI_CAUSAL_FEEDBACK");
   return v && !strcmp(v, "1");
+}
+int peak_mpi_causal_runtime_needs_service(void) {
+  return atomic_load_explicit(&active, memory_order_relaxed);
 }
 int peak_mpi_causal_runtime_enabled(void) {
   return atomic_load_explicit(&ready, memory_order_acquire);
@@ -113,6 +128,8 @@ int peak_mpi_causal_runtime_prepare(size_t n, double q, double hb, double ema) {
   const char *work_budget_env = getenv("PEAK_MPI_OBSERVER_WORK_BUDGET");
   uint64_t parsed_work_budget;
   observer_work_budget = 16384;
+  configured_owner_byte_budget = owner_byte_budget_from_environment();
+  effective_byte_budget = 65536;
   if (work_budget_env) {
     if (parse_unsigned(work_budget_env, 1048576, &parsed_work_budget) &&
         parsed_work_budget > 0)
@@ -338,6 +355,8 @@ void peak_mpi_causal_runtime_mpi_initialized(void) {
       parse_unsigned(port, 65535, &parsed_port) && parsed_port &&
       (!owner ||
        parse_unsigned(owner, (uint64_t)world_size - 1, &parsed_owner));
+  effective_byte_budget = configuration_valid && rank_id == (int)parsed_owner
+                              ? configured_owner_byte_budget : 65536;
   policy.member_capacity = (size_t)world_size;
   PeakMpiCausalServiceConfig c = {0};
   c.rank = (unsigned)rank_id;
@@ -511,7 +530,7 @@ void peak_mpi_causal_runtime_tick(double now, double elapsed, double C,
   }
   double L = raw.L;
 
-  peak_mpi_causal_service_tick(service, capture, &raw, now, 65536, observer_work_budget);
+  peak_mpi_causal_service_tick(service, capture, &raw, now, effective_byte_budget, observer_work_budget);
   PeakMpiPolicyReason service_fault =
       peak_mpi_causal_service_fault_reason(service);
   if (service_fault != PEAK_MPI_POLICY_NO_REASON)
@@ -641,9 +660,10 @@ void peak_mpi_causal_runtime_report(void) {
           contract->pml, contract->coll, contract->pml_verified,
           contract->coll_verified, contract->fixed_rules_verified);
   fprintf(stderr,
-          "[peak mpi causal control] rank=%d heartbeat=%s hook_controller=%s work_budget=%zu configured_slots=%zu\n",
+          "[peak mpi causal control] rank=%d heartbeat=%s hook_controller=%s work_budget=%zu configured_slots=%zu configured_owner_byte_budget=%zu effective_byte_budget=%zu\n",
           rank_id, heartbeat_enabled ? "enabled" : "disabled",
-          hook_controller_enabled ? "enabled" : "none", observer_work_budget, slots);
+          hook_controller_enabled ? "enabled" : "none", observer_work_budget, slots,
+          configured_owner_byte_budget, effective_byte_budget);
   PeakMpiCausalServiceStats stats = {0};
   if (service)
     peak_mpi_causal_service_stats(service, &stats);
