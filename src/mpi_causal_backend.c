@@ -59,6 +59,7 @@ typedef struct {
   PeakMpiCostRef seal;
   int closed;
   uint64_t closed_index;
+  size_t references, next_free;
 } BufferInterval;
 typedef struct {
   PeakMpiCostRef ref;
@@ -135,7 +136,7 @@ struct PeakMpiCausalService {
   size_t node_count;
   Operation *operations;
   BufferInterval *buffers;
-  size_t buffer_count, buffer_index_capacity;
+  size_t buffer_count, buffer_index_capacity, free_buffer;
   size_t *buffer_index;
   size_t operation_count, scan, index_capacity, free_count;
   size_t *free_ops;
@@ -330,33 +331,69 @@ static void index_remove(PeakMpiCausalService *s, size_t slot) {
 }
 static BufferInterval *buffer_interval(PeakMpiCausalService *s, unsigned rank,
                                        uint64_t generation, int create) {
-  size_t h = op_hash(rank, generation);
+  size_t h = op_hash(rank, generation), empty = SIZE_MAX;
   for (size_t i = 0; i < 64; i++) {
     size_t at = (h + i) & (s->buffer_index_capacity - 1),
            v = s->buffer_index[at];
-    if (v) {
+    if (v == SIZE_MAX) {
+      if (empty == SIZE_MAX)
+        empty = at;
+    } else if (v) {
       BufferInterval *b = &s->buffers[v - 1];
       if (b->rank == rank && b->generation == generation)
         return b;
     } else {
-      if (!create)
-        return NULL;
-      if (!generation || s->buffer_count == s->config.max_context_parts) {
-        coarse(s, rank, PEAK_MPI_POLICY_RESOURCE_LIMIT, 0);
-        return NULL;
-      }
-      BufferInterval *b = &s->buffers[s->buffer_count++];
-      b->rank = rank;
-      b->generation = generation;
-      if (!reserve(s, rank, &b->seal))
-        return NULL;
-      s->buffer_index[at] = s->buffer_count;
-      return b;
+      if (empty == SIZE_MAX)
+        empty = at;
+      break;
     }
   }
-  if (create)
+  if (!create)
+    return NULL;
+  if (empty == SIZE_MAX || !generation ||
+      (s->free_buffer == SIZE_MAX &&
+       s->buffer_count == s->config.max_context_parts)) {
     coarse(s, rank, PEAK_MPI_POLICY_RESOURCE_LIMIT, 0);
-  return NULL;
+    return NULL;
+  }
+  size_t slot;
+  if (s->free_buffer != SIZE_MAX) {
+    slot = s->free_buffer;
+    s->free_buffer = s->buffers[slot].next_free;
+  } else
+    slot = s->buffer_count++;
+  BufferInterval *b = &s->buffers[slot];
+  memset(b, 0, sizeof *b);
+  b->rank = rank;
+  b->generation = generation;
+  if (!reserve(s, rank, &b->seal)) {
+    b->next_free = s->free_buffer;
+    s->free_buffer = slot;
+    return NULL;
+  }
+  s->buffer_index[empty] = slot + 1;
+  return b;
+}
+static void buffer_release(PeakMpiCausalService *s, size_t slot) {
+  BufferInterval *b = &s->buffers[slot];
+  if (--b->references)
+    return;
+  /* Only actual operation retirement calls this: its progress interval is
+   * closed and covered, and no live message/request branch can still use it.
+   * Detach by itself never releases an interval or its immutable seal. */
+  size_t h = op_hash(b->rank, b->generation);
+  for (size_t i = 0; i < 64; ++i) {
+    size_t at = (h + i) & (s->buffer_index_capacity - 1);
+    if (s->buffer_index[at] == slot + 1) {
+      s->buffer_index[at] = SIZE_MAX;
+      break;
+    }
+    if (!s->buffer_index[at])
+      break;
+  }
+  memset(b, 0, sizeof *b);
+  b->next_free = s->free_buffer;
+  s->free_buffer = slot;
 }
 static PeakMpiCostRef progress_input(PeakMpiCausalService *s, Operation *o) {
   if (o->buffer != SIZE_MAX)
@@ -1089,8 +1126,10 @@ static int parse_record(PeakMpiCausalService *s, unsigned r,
     if ((rec->flags & PEAK_MPI_CAUSAL_BUFFERED) &&
         rec->progress_scope == PEAK_MPI_OBSERVER_SCOPE_INTERVAL) {
       BufferInterval *b = buffer_interval(s, r, rec->progress_begin, 1);
-      if (b)
+      if (b) {
         o->buffer = (size_t)(b - s->buffers);
+        ++b->references;
+      }
     }
     if (remote_op(rec) && !o->context)
       coarse(s, r, PEAK_MPI_POLICY_BAD_IDENTITY, 0);
@@ -2330,6 +2369,8 @@ static void checkpoint(PeakMpiCausalService *s, size_t budget) {
         analysis_remove(s, o);
         peak_mpi_causal_match_index_remove_all(s->matching, slot);
         index_remove(s, slot);
+        if (o->buffer != SIZE_MAX)
+          buffer_release(s, o->buffer);
         memset(o, 0, sizeof *o);
         s->free_ops[s->free_count++] = slot;
       }
@@ -2848,6 +2889,7 @@ static int recovery_work(PeakMpiCausalService *s, size_t budget, size_t *used) {
         s->buffer_index[s->recovery_cursor++] = 0;
       else {
         s->buffer_count = s->node_count = 0;
+        s->free_buffer = SIZE_MAX;
         s->recovery_reset = 5;
       }
     } else if (s->recovery_reset == 5) {
@@ -3038,6 +3080,7 @@ peak_mpi_causal_service_create(const PeakMpiCausalServiceConfig *c) {
     return s;
   }
   s->epoch = 1;
+  s->free_buffer = SIZE_MAX;
   s->analysis_head = s->analysis_tail = SIZE_MAX;
   s->ranks = calloc(c->world_size, sizeof *s->ranks);
   s->prefix_slots =
