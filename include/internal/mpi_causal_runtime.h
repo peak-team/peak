@@ -8,12 +8,18 @@
 #ifdef HAVE_MPI
 #include "internal/mpi_policy_adapter.h"
 
-/* The callback thread remains the only writer of a priced slot.  Retirement
- * never clears it: the existing pthread registry owns safe generation reuse. */
+/* The callback thread is the only counter writer. Retirement never clears a
+ * slot: the existing pthread registry owns safe generation reuse. Price
+ * segments change only during quiescent startup; callbacks and snapshot
+ * readers must not run concurrently with price publication. */
 typedef struct {
-  _Atomic double profile_seconds;
+  _Atomic uint64_t callback_count;
   _Atomic double observer_seconds;
-  unsigned char padding[64 - 2 * sizeof(_Atomic double)];
+  uint64_t segment_start;
+  double sealed_profile_seconds;
+  unsigned char padding[64 - sizeof(_Atomic uint64_t) -
+                        sizeof(_Atomic double) - sizeof(uint64_t) -
+                        sizeof(double)];
 } PeakMpiCausalCostSlot;
 
 extern PeakMpiCausalCostSlot *peak_mpi_causal_cost_slots;
@@ -22,12 +28,12 @@ extern _Atomic double peak_mpi_causal_profile_price;
 
 static inline void peak_mpi_causal_profile_call(size_t slot) {
   PeakMpiCausalCostSlot *slots = peak_mpi_causal_cost_slots;
-  if (slots != NULL && slot < peak_mpi_causal_cost_capacity) {
-    double paid = atomic_load_explicit(&slots[slot].profile_seconds,
-                                       memory_order_relaxed);
-    double price = atomic_load_explicit(&peak_mpi_causal_profile_price,
-                                        memory_order_relaxed);
-    atomic_store_explicit(&slots[slot].profile_seconds, paid + price,
+  /* Both listener entry paths have already validated the mapped slot against
+   * the same fixed startup capacity used to allocate this slab. */
+  if (slots != NULL) {
+    uint64_t calls = atomic_load_explicit(&slots[slot].callback_count,
+                                          memory_order_relaxed);
+    atomic_store_explicit(&slots[slot].callback_count, calls + 1,
                           memory_order_relaxed);
   }
 }
@@ -39,6 +45,8 @@ int peak_mpi_causal_runtime_prepare(size_t slots, double q,
                                     double ema_alpha);
 void peak_mpi_causal_runtime_note_slot(size_t slot);
 void peak_mpi_causal_runtime_retire_slot(size_t slot, uint64_t generation);
+/* Startup-only: no callback writers or cost snapshot readers may run while
+ * old price segments are sealed. Already accumulated costs are not revalued. */
 void peak_mpi_causal_runtime_publish_price(double seconds);
 void peak_mpi_causal_runtime_configure_control(int heartbeat_enabled,
                                                int hook_controller_enabled);

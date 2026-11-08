@@ -20,10 +20,13 @@ int peak_mpi_causal_cost_prepare(size_t slots) {
     return 0;
   PeakMpiCausalCostSlot *allocated = storage;
   for (size_t i = 0; i < slots; ++i) {
-    atomic_init(&allocated[i].profile_seconds, 0);
+    atomic_init(&allocated[i].callback_count, 0);
     atomic_init(&allocated[i].observer_seconds, 0);
+    allocated[i].segment_start = 0;
+    allocated[i].sealed_profile_seconds = 0;
   }
-  if (!atomic_is_lock_free(&allocated[0].profile_seconds)) {
+  if (!atomic_is_lock_free(&allocated[0].callback_count) ||
+      !atomic_is_lock_free(&allocated[0].observer_seconds)) {
     free(allocated);
     return 0;
   }
@@ -48,11 +51,22 @@ void peak_mpi_causal_runtime_note_slot(size_t slot) {
 }
 
 void peak_mpi_causal_runtime_publish_price(double seconds) {
-  if (peak_mpi_causal_cost_slots != NULL && isfinite(seconds) && seconds >= 0)
-    atomic_store_explicit(&peak_mpi_causal_profile_price, seconds,
-                          memory_order_relaxed);
-  /* Each actual callback adds its then-current price. A new price changes
-   * only future charges; previously paid totals are never revalued. */
+  if (peak_mpi_causal_cost_slots == NULL || !isfinite(seconds) || seconds < 0)
+    return;
+  /* The sole production publisher runs before application hooks and the
+   * heartbeat are started. Tests may also publish between quiescent phases. */
+  double old_price = atomic_load_explicit(&peak_mpi_causal_profile_price,
+                                         memory_order_relaxed);
+  for (size_t i = 0; i < peak_mpi_causal_cost_capacity; ++i) {
+    PeakMpiCausalCostSlot *slot = &peak_mpi_causal_cost_slots[i];
+    uint64_t calls = atomic_load_explicit(&slot->callback_count,
+                                         memory_order_relaxed);
+    slot->sealed_profile_seconds +=
+        (double)(calls - slot->segment_start) * old_price;
+    slot->segment_start = calls;
+  }
+  atomic_store_explicit(&peak_mpi_causal_profile_price, seconds,
+                        memory_order_relaxed);
 }
 
 void peak_mpi_causal_cost_observer_add(size_t slot, double seconds) {
@@ -77,9 +91,14 @@ int peak_mpi_causal_cost_read_prefix(size_t count, double *profile,
   double P = 0, O = 0;
   if (count > peak_mpi_causal_cost_capacity)
     return 0;
+  double price = atomic_load_explicit(&peak_mpi_causal_profile_price,
+                                     memory_order_relaxed);
   for (size_t i = 0; i < count; ++i) {
-    P += atomic_load_explicit(&peak_mpi_causal_cost_slots[i].profile_seconds,
-                              memory_order_relaxed);
+    PeakMpiCausalCostSlot *slot = &peak_mpi_causal_cost_slots[i];
+    uint64_t calls = atomic_load_explicit(&slot->callback_count,
+                                         memory_order_relaxed);
+    P += slot->sealed_profile_seconds +
+         (double)(calls - slot->segment_start) * price;
     O += atomic_load_explicit(&peak_mpi_causal_cost_slots[i].observer_seconds,
                               memory_order_relaxed);
   }
