@@ -33,6 +33,7 @@
 #include <float.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <math.h>
 #include <poll.h>
 #include <sched.h>
 #include <stdatomic.h>
