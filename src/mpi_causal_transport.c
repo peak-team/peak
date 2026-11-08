@@ -19,6 +19,7 @@ typedef struct {
   uint64_t feedback_generation, nonce_sent, pending_ack;
   unsigned ack_count;
   int ack_due;
+  /* have may include further frames; need describes only the front frame. */
   size_t have, need, out_n, out_at;
   unsigned rank;
   unsigned char *in, *out;
@@ -38,6 +39,8 @@ struct PeakMpiCausalTransport {
   size_t peer_n, peer_cursor;
   PeakMpiCausalRaw raw;
   int raw_pending, raw_seen, held, object_done, have_feedback;
+  /* Buffered dispatch advances a turn without charging network bytes again. */
+  int receive_progress;
   PeakMpiObserverRecord record;
   PeakMpiPolicyFeedback feedback;
   PeakMpiCausalServiceStats stats;
@@ -430,11 +433,21 @@ static int read_frame(PeakMpiCausalTransport *t, Peer *p, size_t *budget) {
   ssize_t z;
   size_t k;
   const unsigned char *q;
-  if (p->have == p->need)
+  if (p->have >= HDR && p->need == HDR) {
+    q = p->in;
+    if (g32(&q) != MAGIC)
+      return -1;
+    (void)g32(&q);
+    k = g32(&q);
+    if (k > t->cap - HDR)
+      return -1;
+    p->need = HDR + k;
+  }
+  if (p->have >= p->need)
     return 1;
   if (!*budget)
     return 0;
-  k = p->need - p->have;
+  k = t->cap - p->have;
   if (k > *budget)
     k = *budget;
   z = recv(p->fd, p->in + p->have, k, 0);
@@ -442,7 +455,7 @@ static int read_frame(PeakMpiCausalTransport *t, Peer *p, size_t *budget) {
     p->have += (size_t)z;
     *budget -= (size_t)z;
     t->stats.received_bytes += (uint64_t)z;
-    if (p->have == HDR && p->need == HDR) {
+    if (p->have >= HDR && p->need == HDR) {
       q = p->in;
       if (g32(&q) != MAGIC)
         return -1;
@@ -452,14 +465,16 @@ static int read_frame(PeakMpiCausalTransport *t, Peer *p, size_t *budget) {
         return -1;
       p->need = HDR + k;
     }
-    return p->have == p->need;
+    return p->have >= p->need;
   }
   if (z < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
     return 0;
   return -1;
 }
 static void reset_input(Peer *p) {
-  p->have = 0;
+  p->have -= p->need;
+  if (p->have)
+    memmove(p->in, p->in + p->need, p->have);
   p->need = HDR;
 }
 static int enqueue(PeakMpiCausalTransport *t, unsigned type, const void *v) {
@@ -821,6 +836,7 @@ static void owner_tick(PeakMpiCausalTransport *t, double now, size_t *budget) {
         p->rank = rank;
         p->ready = 1;
         reset_input(p);
+        t->receive_progress = 1;
       } else if (p->ready && t->incarnations[rank] == inc && type == RAW &&
                  !seq) {
         rc = deliver(t, rank, inc, type, q, n, now);
@@ -831,6 +847,7 @@ static void owner_tick(PeakMpiCausalTransport *t, double now, size_t *budget) {
         if (!rc)
           continue;
         reset_input(p);
+        t->receive_progress = 1;
       } else if (p->ready && t->incarnations[rank] == inc && seq) {
         if (seq <= t->accepted[rank]) {
           t->stats.duplicates++;
@@ -852,6 +869,7 @@ static void owner_tick(PeakMpiCausalTransport *t, double now, size_t *budget) {
         p->pending_ack = t->accepted[rank];
         p->ack_count++;
         reset_input(p);
+        t->receive_progress = 1;
       } else {
         fault(t, rank, PEAK_MPI_POLICY_BAD_IDENTITY);
         close_peer(p);
@@ -996,6 +1014,7 @@ static void client_tick(PeakMpiCausalTransport *t, double now, size_t *budget) {
       return;
     }
     reset_input(p);
+    t->receive_progress = 1;
     ++frames;
   }
   if (t->send_index < t->count && *budget) {
@@ -1054,8 +1073,9 @@ void peak_mpi_causal_transport_tick(PeakMpiCausalTransport *t,
   if (owner) {
     for (rounds = 0; rounds < t->c.queue_frames + 2; ++rounds) {
       before = budget;
+      t->receive_progress = 0;
       owner_tick(t, now, &budget);
-      if (!budget || before == budget)
+      if (!budget || (before == budget && !t->receive_progress))
         break;
     }
     /* A bounded end-of-heartbeat tailflush. If the shared allowance is
@@ -1084,8 +1104,9 @@ void peak_mpi_causal_transport_tick(PeakMpiCausalTransport *t,
   } else if (raw->active) {
     for (rounds = 0; rounds < t->c.queue_frames + 2; ++rounds) {
       before = budget;
+      t->receive_progress = 0;
       client_tick(t, now, &budget);
-      if (!budget || before == budget)
+      if (!budget || (before == budget && !t->receive_progress))
         break;
     }
   }
