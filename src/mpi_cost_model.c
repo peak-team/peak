@@ -56,7 +56,7 @@ typedef enum {
     IDLE, RESET_NODES, RESET_EDGES, RESET_OWNERS, GROUP_SCAN, GROUP_INPUTS,
     FILTER_SCAN, FILTER_SEARCH, ORDER_SAVE, ORDER_RESET,
     ORDER_BUILD, ORDER_QUEUE, ORDER_DEPTH,
-    DFS_SCAN, DFS_WALK, SCC_SCAN, SCC_WALK, AGG_NODES, CHECK_OWNERS,
+    DFS_SCAN, DFS_WALK, SCC_WALK, AGG_NODES,
     BLOCK_OWNERS, AGG_EDGES, CHECK_GROUPS, QUEUE_COMPONENTS, TOPOLOGY,
     COMMIT_NODES, FRONTIER_RANKS, FRONTIER_BRANCHES, FINISH
 } CostPhase;
@@ -80,7 +80,8 @@ struct PeakMpiCostModel {
     uint32_t gc_phase, gc_cursor, gc_incident;
     uint32_t continuation_count;
     uint32_t group_node, group_edge, group_inputs;
-    bool group_unknown, ordering, has_reverse;
+    bool group_unknown, ordering, has_reverse, has_owner_conflict;
+    bool requires_qualified_g_build;
     uint64_t search_stamp, group_stamp;
     unsigned reset_stage;
     uint32_t reset_cursor;
@@ -472,19 +473,27 @@ static void search_step(PeakMpiCostModel *m)
     }
 }
 
+/* Fixed scratch is shared with later ordering/topology phases. During DFS,
+ * queue holds discovery indices and finish is the active Tarjan stack. */
 static void dfs_push(PeakMpiCostModel *m, uint32_t i)
 {
-    m->nodes[i].visited = true;
-    m->stack[m->stack_size++] = (CostFrame){i, m->nodes[i].out};
+    CostNode *n = &m->nodes[i];
+    n->visited = true;
+    m->queue[i] = ++m->reverse_index;
+    n->input_count = m->queue[i];
+    m->finish[m->finish_count++] = i;
+    m->stack[m->stack_size++] = (CostFrame){i, n->out};
 }
-
-static void scc_push(PeakMpiCostModel *m, uint32_t i)
+static void dfs_return(PeakMpiCostModel *m)
 {
-    m->nodes[i].component = m->scc_current;
-    ++m->components[m->scc_current].nodes;
-    m->stack[m->stack_size++] = (CostFrame){i, m->nodes[i].in};
+    uint32_t child = m->stack[--m->stack_size].node;
+    if (m->stack_size && m->nodes[child].component == NONE) {
+        CostNode *parent = &m->nodes[m->stack[m->stack_size - 1u].node];
+        if (m->nodes[child].input_count < parent->input_count)
+            parent->input_count = m->nodes[child].input_count;
+    }
+    m->phase = m->stack_size ? DFS_WALK : DFS_SCAN;
 }
-
 static void aggregate_node(PeakMpiCostModel *m, uint32_t i)
 {
     CostNode *n = &m->nodes[i];
@@ -509,6 +518,7 @@ static void aggregate_node(PeakMpiCostModel *m, uint32_t i)
             if (!isfinite(c->weight)) fail(m, PEAK_MPI_COST_INVALID_COST);
         } else if (o->component != n->component) {
             o->conflict = true;
+            m->has_owner_conflict = true;
         }
     }
 }
@@ -604,22 +614,46 @@ static void run_step(PeakMpiCostModel *m)
         break;
     case RESET_EDGES:
         if (m->cursor < m->stats.active_edges) {
-            CostEdge *e = &m->edges[m->edge_ids[m->cursor++]];
+            uint32_t at = m->edge_ids[m->cursor++];
+            CostEdge *e = &m->edges[at];
             e->retained = e->kind != PEAK_MPI_COST_SEND_REVERSE;
             if (e->kind == PEAK_MPI_COST_SEND_REVERSE) m->has_reverse = true;
+            if (e->kind == PEAK_MPI_COST_SLACK_INPUT) m->requires_qualified_g_build = true;
             e->component_next = NONE;
+            /* Singleton G adjacency can be prepared while edges are hot.
+             * SLACK_INPUT qualification is not known until GROUP_SCAN. */
+            if (e->kind == PEAK_MPI_COST_GUARANTEED && e->source != e->target) {
+                uint32_t source = m->nodes[e->source].active_index;
+                uint32_t target = m->nodes[e->target].active_index;
+                e->component_next = m->components[source].out;
+                m->components[source].out = at;
+                ++m->components[target].indegree;
+            }
         } else { m->phase = RESET_OWNERS; m->cursor = 0; }
         break;
     case RESET_OWNERS:
         if (m->cursor < m->stats.active_owners) {
             CostOwner *o = &m->owners[m->owner_ids[m->cursor++]];
             o->component = NONE; o->conflict = false;
+            /* Definitions/references cannot change while a run is busy. */
+            if (!o->defined || !o->references) {
+                m->pending = true;
+                m->all_closed = false;
+            }
         } else { m->phase = GROUP_SCAN; m->cursor = 0; }
         break;
     case GROUP_SCAN:
         if (m->cursor < m->stats.active_nodes) {
             i = m->node_ids[m->cursor++];
             CostNode *n = &m->nodes[i];
+            if (!m->has_reverse || m->requires_qualified_g_build) {
+                m->components[n->active_index].out = NONE;
+                m->components[n->active_index].indegree = 0;
+            }
+            if (m->has_reverse) {
+                n->component = n->active_index;
+                m->components[n->active_index].nodes = 1;
+            }
             if (!n->settled && n->defined && n->spec.kind == PEAK_MPI_COST_COLLECTIVE && n->spec.s1) {
                 if (m->group_stamp == UINT64_MAX) { fail(m, PEAK_MPI_COST_GENERATION_OVERFLOW); break; }
                 ++m->group_stamp;
@@ -627,7 +661,15 @@ static void run_step(PeakMpiCostModel *m)
                 m->group_unknown = false;
                 m->phase = GROUP_INPUTS;
             }
-        } else { m->ordering = m->has_reverse; m->phase = DFS_SCAN; m->cursor = 0; }
+        } else {
+            m->ordering = m->has_reverse;
+            m->component_count = m->ordering ? m->stats.active_nodes : 0;
+            m->phase = m->ordering
+                ? (m->requires_qualified_g_build ? ORDER_BUILD : ORDER_QUEUE)
+                : DFS_SCAN;
+            m->queue_head = m->queue_tail = m->topology_done = 0;
+            m->cursor = m->reverse_index = 0;
+        }
         break;
     case GROUP_INPUTS:
         if (m->group_edge != NONE) {
@@ -673,29 +715,32 @@ static void run_step(PeakMpiCostModel *m)
     case DFS_SCAN:
         if (m->cursor < m->stats.active_nodes) {
             i = m->node_ids[m->cursor++];
-            if (m->nodes[i].active && !m->nodes[i].visited) { dfs_push(m, i); m->phase = DFS_WALK; }
-        } else { m->phase = SCC_SCAN; m->reverse_index = m->finish_count; }
+            if (m->nodes[i].active && !m->nodes[i].visited) {
+                dfs_push(m, i); m->phase = DFS_WALK;
+            }
+        } else {
+            m->phase = m->ordering ? ORDER_BUILD : AGG_NODES;
+            m->cursor = 0;
+        }
         break;
     case DFS_WALK: {
         CostFrame *f = &m->stack[m->stack_size - 1u];
+        CostNode *n = &m->nodes[f->node];
         if (f->edge != NONE) {
             CostEdge *e = &m->edges[f->edge]; f->edge = e->out_next;
-            if (selected(m, e) && !m->nodes[e->target].visited) dfs_push(m, e->target);
-        } else {
-            m->finish[m->finish_count++] = f->node;
-            if (--m->stack_size == 0) m->phase = DFS_SCAN;
-        }
+            if (selected(m, e)) {
+                CostNode *target = &m->nodes[e->target];
+                if (!target->visited) dfs_push(m, e->target);
+                else if (target->component == NONE &&
+                         m->queue[e->target] < n->input_count)
+                    n->input_count = m->queue[e->target];
+            }
+        } else if (n->input_count == m->queue[f->node]) {
+            m->scc_current = m->component_count++;
+            m->phase = SCC_WALK;
+        } else dfs_return(m);
         break;
     }
-    case SCC_SCAN:
-        if (m->reverse_index) {
-            i = m->finish[--m->reverse_index];
-            if (m->nodes[i].component == NONE) {
-                m->scc_current = m->component_count++;
-                scc_push(m, i); m->phase = SCC_WALK;
-            }
-        } else { m->phase = m->ordering ? ORDER_BUILD : AGG_NODES; m->cursor = 0; }
-        break;
     /* The guaranteed-only SCC DAG gives an exact necessary path condition.
      * Its longest-path levels do not depend on arbitrary DFS visitation order.
      * Reuse component scratch and node input_count until filtering finishes;
@@ -716,7 +761,7 @@ static void run_step(PeakMpiCostModel *m)
         } else {
             m->phase = ORDER_QUEUE;
             m->cursor = 0;
-            m->queue_head = m->queue_tail = 0;
+            m->queue_head = m->queue_tail = m->topology_done = 0;
         }
         break;
     case ORDER_QUEUE:
@@ -738,8 +783,17 @@ static void run_step(PeakMpiCostModel *m)
             } else m->topology_current = NONE;
         } else if (m->queue_head < m->queue_tail) {
             m->topology_current = m->queue[m->queue_head++];
+            ++m->topology_done;
             m->topology_edge = m->components[m->topology_current].out;
-        } else { m->phase = ORDER_SAVE; m->cursor = 0; }
+        } else {
+            /* A partial Kahn traversal means G has a multi-node cycle.
+             * Discard its scratch and compute exact SCCs before filtering. */
+            if (m->topology_done != m->component_count) {
+                m->component_count = 0;
+                m->phase = ORDER_RESET;
+            } else m->phase = ORDER_SAVE;
+            m->cursor = 0;
+        }
         break;
     case ORDER_SAVE:
         if (m->cursor < m->stats.active_nodes) {
@@ -757,34 +811,29 @@ static void run_step(PeakMpiCostModel *m)
         if (m->cursor < m->stats.active_nodes) {
             uint32_t at = m->cursor++;
             CostNode *n = &m->nodes[m->node_ids[at]];
-            n->input_count = 0; n->component = NONE;
+            n->input_count = 0; n->component = NONE; n->visited = false;
             memset(&m->components[at], 0, sizeof(m->components[at]));
             m->components[at].out = m->components[at].group = NONE;
             m->components[at].ready = m->components[at].all_slack = true;
             m->components[at].entries_qualified = true;
             m->components[at].min_wait = INFINITY;
-        } else { m->phase = DFS_SCAN; m->cursor = 0; }
+        } else { m->phase = DFS_SCAN; m->cursor = m->reverse_index = 0; }
         break;
     case SCC_WALK: {
-        CostFrame *f = &m->stack[m->stack_size - 1u];
-        if (f->edge != NONE) {
-            CostEdge *e = &m->edges[f->edge]; f->edge = e->in_next;
-            if (selected(m, e) && m->nodes[e->source].component == NONE) scc_push(m, e->source);
-        } else if (--m->stack_size == 0) m->phase = SCC_SCAN;
+        /* Pop one member per work unit, including very large components. */
+        i = m->finish[--m->finish_count];
+        m->nodes[i].component = m->scc_current;
+        m->nodes[i].input_count = 0;
+        ++m->components[m->scc_current].nodes;
+        if (i == m->stack[m->stack_size - 1u].node) dfs_return(m);
         break;
     }
     case AGG_NODES:
         if (m->cursor < m->stats.active_nodes) aggregate_node(m, m->node_ids[m->cursor++]);
-        else { m->phase = CHECK_OWNERS; m->cursor = 0; }
-        break;
-    case CHECK_OWNERS:
-        if (m->cursor < m->stats.active_owners) {
-            CostOwner *o = &m->owners[m->owner_ids[m->cursor++]];
-            if (!o->defined || !o->references) {
-                m->pending = true;
-                m->all_closed = false;
-            }
-        } else { m->phase = BLOCK_OWNERS; m->cursor = 0; }
+        else {
+            m->phase = m->has_owner_conflict ? BLOCK_OWNERS : AGG_EDGES;
+            m->cursor = 0;
+        }
         break;
     case BLOCK_OWNERS:
         if (m->cursor < m->stats.active_nodes) {
@@ -876,9 +925,9 @@ PeakMpiCostStatus peak_mpi_cost_model_run(PeakMpiCostModel *m, size_t budget,
         m->cursor = 0;
         if (m->graph_dirty) {
             m->phase = RESET_NODES;
-            m->has_reverse = false;
+            m->has_reverse = false; m->requires_qualified_g_build = false;
             m->finish_count = m->component_count = m->stack_size = 0;
-            m->pending = false; m->all_closed = true;
+            m->pending = false; m->all_closed = true; m->has_owner_conflict = false;
             m->stats.scc_count = m->stats.excluded_candidates = m->stats.retained_candidates = 0;
         } else {
             m->phase = FRONTIER_RANKS; m->frontier = 0; m->frontier_valid = true;
