@@ -155,6 +155,7 @@ struct PeakMpiCausalService {
   PeakMpiPolicySample *samples;
   unsigned char *peers;
   uint64_t epoch, generation, order, gc_generation;
+  uint64_t recovery_loss_total;
   double now;
   unsigned verify_batch_stage, verify_batch_rank, verify_batch_start;
   size_t verify_batch_op, verify_batch_limit;
@@ -601,6 +602,8 @@ int peak_mpi_causal_service_ingest_raw(PeakMpiCausalService *s, unsigned r,
     return 1;
   if (s->recovery_reset && raw->recovery.loss > a->recovery.loss)
     s->recovery_restart = 1;
+  /* Preserve the unsigned rank sum without rescanning every rank per feedback. */
+  s->recovery_loss_total += raw->recovery.loss - a->recovery.loss;
   a->recovery = raw->recovery;
   if (a->recovery.fault_mask &
       ~(UINT64_C(1) << PEAK_MPI_OBSERVER_REASON_RING_OVERFLOW))
@@ -2987,9 +2990,7 @@ static int sink_feedback(void *v, unsigned rank, double now,
     out->recovery.comm = recovery_local_comm(s, rank);
     out->generation += s->recovery.epoch * 4 + s->recovery.state;
   }
-  out->recovery.loss = 0;
-  for (unsigned r = 0; r < s->config.world_size; r++)
-    out->recovery.loss += s->ranks[r].recovery.loss;
+  out->recovery.loss = s->recovery_loss_total;
   out->recovery.fault_mask =
       s->hard_fault ? UINT64_C(1) << PEAK_MPI_OBSERVER_REASON_METADATA : 0;
   if (s->approximate) {
