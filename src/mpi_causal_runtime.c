@@ -49,6 +49,25 @@ static double mode_seconds[5], previous_tick, exceeded_seconds,
 static uint64_t age_histogram[64], age_samples;
 static PeakMpiPolicyDecision last_decision;
 static PeakMpiPolicyFeedback last_feedback;
+/* First local decision observation, not the remote fault's physical time. */
+typedef struct {
+  double elapsed;
+  uint64_t event_cut;
+  PeakMpiPolicyReason reason;
+  int known, cut_known;
+} ModeEntry;
+static ModeEntry first_stale = {.elapsed = NAN}, first_coarse = {.elapsed = NAN};
+static void observe_mode_entry(double now, const PeakMpiPolicyDecision *d) {
+  ModeEntry *entry = d->mode == PEAK_MPI_POLICY_STALE ? &first_stale
+      : d->mode == PEAK_MPI_POLICY_COARSE ? &first_coarse : NULL;
+  if (!entry || entry->known)
+    return;
+  entry->elapsed = fmax(0, now - origin);
+  entry->reason = d->reason;
+  entry->cut_known = receiver.have_feedback;
+  entry->event_cut = entry->cut_known ? receiver.feedback.event_cut : 0;
+  entry->known = 1;
+}
 static PeakMpiCausalWorkPrices work_prices;
 static _Atomic int fine_paused;
 static _Atomic uint64_t capture_epoch = 1;
@@ -697,6 +716,7 @@ void peak_mpi_causal_runtime_tick(double now, double elapsed, double C,
   if ((raw.app_cost_known
            ? peak_mpi_policy_receiver_snapshot_cut(&receiver, now, raw.elapsed, raw.cut, 0, &last_decision)
            : peak_mpi_policy_receiver_snapshot(&receiver, now, raw.elapsed, raw.L, 0, &last_decision)) == PEAK_MPI_POLICY_OK) {
+    observe_mode_entry(now, &last_decision);
     double dt = previous_tick ? fmax(0, now - previous_tick) : 0;
     mode_seconds[last_decision.mode] += dt;
     if (A > policy.q * raw.elapsed)
@@ -725,9 +745,12 @@ int peak_mpi_causal_runtime_decision(double now, double elapsed,
     return 0;
   PeakMpiCausalCostSnapshot cost;
   peak_mpi_causal_runtime_cost_now(&cost);
-  return (cost.app_cost_known
+  int valid = (cost.app_cost_known
       ? peak_mpi_policy_receiver_snapshot_cut(&receiver, now, elapsed, cost.cut, headroom, d)
       : peak_mpi_policy_receiver_snapshot(&receiver, now, elapsed, cost.L, headroom, d)) == PEAK_MPI_POLICY_OK;
+  if (valid)
+    observe_mode_entry(now, d);
+  return valid;
 }
 void peak_mpi_causal_runtime_report(void) {
   if (!peak_mpi_causal_runtime_enabled())
@@ -790,11 +813,14 @@ void peak_mpi_causal_runtime_report(void) {
           rank_id, last_feedback.app_cost_known, last_feedback.A_cut, last_feedback.local_latest_A,
           last_feedback.received_app_sum, last_feedback.received_raw_sum,
           last_feedback.risk);
+  PeakMpiPolicyResult result;
   if (cost.app_cost_known)
-    peak_mpi_policy_receiver_snapshot_cut(&receiver, clock_seconds(), clock_seconds() - origin,
-                                          cost.cut, 0, &last_decision);
-  else peak_mpi_policy_receiver_snapshot(&receiver, clock_seconds(), clock_seconds() - origin,
-                                          L, 0, &last_decision);
+    result = peak_mpi_policy_receiver_snapshot_cut(&receiver, clock_seconds(), clock_seconds() - origin,
+                                                   cost.cut, 0, &last_decision);
+  else result = peak_mpi_policy_receiver_snapshot(&receiver, clock_seconds(), clock_seconds() - origin,
+                                                  L, 0, &last_decision);
+  if (result == PEAK_MPI_POLICY_OK)
+    observe_mode_entry(receiver.last_now, &last_decision);
   double age_p50 = NAN, age_p95 = NAN, age_p99 = NAN;
   uint64_t cumulative = 0;
   for (unsigned bucket = 0; bucket < 64; bucket++) {
@@ -817,6 +843,18 @@ void peak_mpi_causal_runtime_report(void) {
       rank_id, age_p50, age_p95, age_p99,
       age_samples ? maximum_feedback_age : NAN, (unsigned long long)age_samples,
       last_feedback.oldest_unresolved_age);
+  fprintf(stderr,
+          "[peak mpi causal mode_onset] rank=%d clock=local_elapsed "
+          "observation=mode_decision first_stale_known=%d "
+          "first_stale_observed_elapsed=%.9g first_stale_reason=%u "
+          "first_stale_cut=%llu first_stale_cut_known=%d first_coarse_known=%d "
+          "first_coarse_observed_elapsed=%.9g first_coarse_reason=%u "
+          "first_coarse_cut=%llu first_coarse_cut_known=%d\n",
+          rank_id, first_stale.known, first_stale.elapsed,
+          (unsigned)first_stale.reason, (unsigned long long)first_stale.event_cut,
+          first_stale.cut_known, first_coarse.known, first_coarse.elapsed,
+          (unsigned)first_coarse.reason, (unsigned long long)first_coarse.event_cut,
+          first_coarse.cut_known);
   static const char *mode_names[] = {"local", "complete", "stale", "coarse",
                                      "approx"};
   fprintf(stderr,
