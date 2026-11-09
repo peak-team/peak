@@ -32,6 +32,7 @@ struct PeakMpiPolicy {
     uint64_t lost_events, seen;
     int active, membership_complete, have_input_generation, have_cut;
     int baseline_valid, generation_exhausted, membership_unavailable;
+    int progress_estimate;
 };
 
 static int nonnegative(double v) { return isfinite(v) && v >= 0; }
@@ -245,6 +246,11 @@ void peak_mpi_policy_recover(PeakMpiPolicy *p, double now, double g) {
     size_t used = 0;
     (void)peak_mpi_policy_recover_work(p, SIZE_MAX, &used);
 }
+void peak_mpi_policy_mark_progress_estimate(PeakMpiPolicy *p) {
+    if (!p || p->progress_estimate) return;
+    p->progress_estimate = 1; p->baseline_valid = 0;
+    (void)bump(p);
+}
 void peak_mpi_policy_free(PeakMpiPolicy *p) {
     if (!p) return;
     free(p->index); free(p->scratch); free(p->members); free(p);
@@ -274,7 +280,10 @@ PeakMpiPolicyResult peak_mpi_policy_submit_cut(PeakMpiPolicy *p,
     if (!nonnegative(c->F) || !nonnegative(c->age_seconds) ||
         !nonnegative(c->oldest_unresolved_age) ||
         (c->sample_count && !c->samples) ||
-        (c->quality & ~PEAK_MPI_POLICY_COMPLETE_CUT) ||
+        (c->quality & ~(PEAK_MPI_POLICY_COMPLETE_CUT |
+                        PEAK_MPI_POLICY_OBSERVED_PROGRESS_CUT)) ||
+        ((c->quality & PEAK_MPI_POLICY_OBSERVED_PROGRESS_CUT) &&
+         c->quality != PEAK_MPI_POLICY_OBSERVED_PROGRESS_CUT) ||
         (p->have_cut && c->cut_id <= p->last_cut_id))
         return bad_cut(p, PEAK_MPI_POLICY_BAD_CUT);
     if (c->sample_count > p->config.member_capacity) {
@@ -308,7 +317,10 @@ PeakMpiPolicyResult peak_mpi_policy_submit_cut(PeakMpiPolicy *p,
     p->policy_generation = c->policy_generation;
     if (policy_change) p->baseline_valid = 0;
     int full = p->membership_complete && c->sample_count == p->count;
-    int fine_complete = (c->quality & PEAK_MPI_POLICY_COMPLETE_CUT) == PEAK_MPI_POLICY_COMPLETE_CUT;
+    int fine_complete = c->quality == PEAK_MPI_POLICY_COMPLETE_CUT ||
+        c->quality == PEAK_MPI_POLICY_OBSERVED_PROGRESS_CUT;
+    if (c->quality == PEAK_MPI_POLICY_OBSERVED_PROGRESS_CUT)
+        peak_mpi_policy_mark_progress_estimate(p);
     int fresh = age <= 3*p->config.heartbeat_max_seconds;
     if (!full || !fresh || (p->mode != PEAK_MPI_POLICY_COARSE && !fine_complete)) {
         make_stale(p); p->baseline_valid = 0;
@@ -393,6 +405,7 @@ PeakMpiPolicyResult peak_mpi_policy_merge(PeakMpiPolicy *p, const PeakMpiPolicy 
         ++p->count;
     }
     p->g = maximum(p->g, s->g); p->F = maximum(p->F, s->F);
+    p->progress_estimate |= s->progress_estimate;
     p->count_hint = SIZE_MAX-p->count_hint < s->count_hint ? SIZE_MAX :
         p->count_hint+s->count_hint;
     p->cohort = merged; p->active = 1;
@@ -506,6 +519,16 @@ static PeakMpiPolicyResult feedback_common(PeakMpiPolicy *p, double now,
         f->risk_known = f->tails_complete = f->received_raw_complete = 0;
         f->received_raw_sum = f->risk = f->U_tail = 0;
     }
+    if (p->active && p->progress_estimate) {
+        f->approximate = 1;
+        /* A complete coarse SUM_A cut is independent of progress visibility. */
+        if (f->mode != PEAK_MPI_POLICY_COARSE)
+            f->coverage_complete = f->risk_known = f->tails_complete = 0;
+        if (f->mode == PEAK_MPI_POLICY_COMPLETE) {
+            f->mode = PEAK_MPI_POLICY_APPROX;
+            f->reason = PEAK_MPI_POLICY_PROGRESS_UNPROVEN;
+        }
+    }
     return PEAK_MPI_POLICY_OK;
 }
 
@@ -569,13 +592,15 @@ PeakMpiPolicyResult peak_mpi_policy_feedback_batch(PeakMpiPolicy *p,
 
 static int feedback_valid(const PeakMpiPolicyFeedback *f) {
     if (f->mode == PEAK_MPI_POLICY_APPROX &&
-        (!f->approximate || !f->recovery.epoch || f->coverage_complete ||
+        (!f->approximate ||
+         (!f->recovery.epoch && f->reason != PEAK_MPI_POLICY_PROGRESS_UNPROVEN) ||
+         f->coverage_complete ||
          f->risk_known || f->tails_complete))
         return 0;
     if (!(f->mode >= PEAK_MPI_POLICY_LOCAL &&
           f->mode <= PEAK_MPI_POLICY_APPROX &&
           f->reason >= PEAK_MPI_POLICY_NO_REASON &&
-          f->reason <= PEAK_MPI_POLICY_BAD_CUT && f->member_count &&
+          f->reason <= PEAK_MPI_POLICY_PROGRESS_UNPROVEN && f->member_count &&
           isfinite(f->q) && f->q > 0 && f->q < 1 &&
           (!f->membership_complete || f->member_count > 1 ||
            f->mode == PEAK_MPI_POLICY_LOCAL) &&
@@ -613,6 +638,8 @@ static int feedback_valid(const PeakMpiPolicyFeedback *f) {
      * Keep those quantities unchanged and independently visible. Complete
      * membership/coverage flags, not a numerical reconciliation, establish
      * whether the raw history is known. */
+    if (f->reason == PEAK_MPI_POLICY_PROGRESS_UNPROVEN &&
+        (f->mode != PEAK_MPI_POLICY_APPROX || !f->approximate)) return 0;
     if (f->risk_known && f->mode == PEAK_MPI_POLICY_COMPLETE && f->risk != f->F) return 0;
     if (f->coverage_complete && f->mode == PEAK_MPI_POLICY_COMPLETE &&
         f->D_cut > f->F) return 0;

@@ -4,6 +4,8 @@
 #include <string.h>
 
 static const char intel_name[] = "intel-2021.11-ofi-opx-host-async-v1";
+static const char intel_approx_name[] =
+    "intel-2021.11-ofi-opx-host-async0-pmpi-approx-v1";
 static const char ompi_name[] =
     "ompi-5.0.5-ucx-1.17-rc-proto2-host-observed-v1";
 static const char *setting(const char *name) {
@@ -104,7 +106,32 @@ peak_mpi_progress_contract_select_public(const char *version,
     copy(c.pml, sizeof(c.pml), v->pml);
     copy(c.coll, sizeof(c.coll), v->coll);
   }
-  if (!strcmp(c.requested_profile, intel_name)) {
+  if (!strcmp(c.requested_profile, intel_approx_name)) {
+    int version_ok = version_token(version, "Intel(R) MPI Library 2021.11", 0);
+    int config = (!strcmp(c.fabrics, "shm:ofi") || !strcmp(c.fabrics, "ofi")) &&
+                 !strcmp(c.ofi_provider, "opx") &&
+                 (!getenv("FI_PROVIDER") || !strcmp(c.fi_provider, "opx"));
+    /* This profile records requested async0, never claims effective progress
+     * verification or a private/implementation-level progress guarantee. */
+    c.async_verified = 0;
+    c.effective_async_progress = -1;
+    if (version_ok && config && !strcmp(c.async_setting, "0") &&
+        c.provided_thread_level >= 0) {
+      c.profile = PEAK_MPI_PROGRESS_INTEL_2021_11_OPX_ASYNC0_APPROX;
+      c.observed_p2p_completion = c.observed_collective_completion = 1;
+      c.progress_estimate = 1;
+      c.name = intel_approx_name;
+      c.reason = "explicit Intel 2021.11 OPX async0 PMPI estimate; "
+                 "progress unproven";
+    } else
+      c.reason =
+          !version_ok ? "named Intel approximate profile MPI version mismatch"
+          : !config ? "named Intel approximate profile requires explicit "
+                      "OFI/OPX configuration"
+          : strcmp(c.async_setting, "0")
+              ? "named Intel approximate profile requires I_MPI_ASYNC_PROGRESS=0"
+              : "native provided thread level could not be recorded";
+  } else if (!strcmp(c.requested_profile, intel_name)) {
     int version_ok = version_token(version, "Intel(R) MPI Library 2021.11", 0);
     int config = (!strcmp(c.fabrics, "shm:ofi") || !strcmp(c.fabrics, "ofi")) &&
                  !strcmp(c.ofi_provider, "opx") &&
@@ -162,13 +189,16 @@ int peak_mpi_progress_contract_supports(const PeakMpiProgressContract *c,
                                         unsigned flags) {
   if (!c || c->profile == PEAK_MPI_PROGRESS_UNKNOWN)
     return 0;
-  int observed = c->profile ==
+  int observed = c->progress_estimate || c->profile ==
                  PEAK_MPI_PROGRESS_OMPI_5_0_5_UCX_1_17_RC_PROTO2_HOST_OBSERVED;
+  if (c->progress_estimate && (op == PEAK_MPI_CAUSAL_BSEND ||
+                              (flags & PEAK_MPI_CAUSAL_BUFFERED)))
+    return 0;
   if (observed && (flags & PEAK_MPI_CAUSAL_VARIABLE_COUNT))
     return 0;
   switch (op) {
   case PEAK_MPI_CAUSAL_SSEND:
-    return !observed && c->autonomous_p2p;
+    return c->progress_estimate || (!observed && c->autonomous_p2p);
   case PEAK_MPI_CAUSAL_SEND:
   case PEAK_MPI_CAUSAL_BSEND:
   case PEAK_MPI_CAUSAL_RSEND:
@@ -234,6 +264,10 @@ unsigned peak_mpi_progress_contract_result_flags(
   *scope = PEAK_MPI_OBSERVER_SCOPE_UNKNOWN;
   if (!peak_mpi_progress_contract_supports(c, op, flags))
     return 0;
+  if (c->progress_estimate) {
+    *scope = PEAK_MPI_OBSERVER_SCOPE_INTERVAL;
+    return PEAK_MPI_OBSERVER_PROGRESS_ESTIMATED;
+  }
   if (c->profile == PEAK_MPI_PROGRESS_INTEL_2021_11_ASYNC) {
     *scope = PEAK_MPI_OBSERVER_SCOPE_AUTONOMOUS;
     return PEAK_MPI_OBSERVER_PROGRESS_SEALED;

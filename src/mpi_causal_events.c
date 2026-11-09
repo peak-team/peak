@@ -519,6 +519,8 @@ static Context *begin_call(PeakMpiCausalOperation op, const Comm *comm,
   r->tag = tag;
   r->root = root;
   r->flags = flags | ordered_caller;
+  if (contract.progress_estimate)
+    r->flags |= PEAK_MPI_OBSERVER_PROGRESS_ESTIMATED;
   r->capability_uid = (uint64_t)contract.profile;
   r->progress_scope = PEAK_MPI_OBSERVER_SCOPE_INTERVAL;
   if (op == PEAK_MPI_CAUSAL_BSEND)
@@ -1859,8 +1861,9 @@ DECLARE_REAL(Cancel, (MPI_Request * request))
 static int wrap_Cancel(Fn_Cancel real, MPI_Request *request) {
   int observe = wrapper_enter();
   if (observe &&
-      contract.profile ==
-          PEAK_MPI_PROGRESS_OMPI_5_0_5_UCX_1_17_RC_PROTO2_HOST_OBSERVED)
+      (contract.progress_estimate ||
+       contract.profile ==
+           PEAK_MPI_PROGRESS_OMPI_5_0_5_UCX_1_17_RC_PROTO2_HOST_OBSERVED))
     fail(PEAK_MPI_OBSERVER_REASON_CAPABILITY);
   Request old = {0};
   if (observe && request)
@@ -2418,7 +2421,8 @@ static Context *collective_begin(PeakMpiCausalOperation op, MPI_Comm handle,
   if (single_flow)
     flags |= PEAK_MPI_OBSERVER_SLACK_SINGLE_FLOW;
   if (contract.profile == PEAK_MPI_PROGRESS_INTEL_2021_11_ASYNC ||
-      (contract.observed_collective_completion && no_open))
+      (contract.observed_collective_completion && !contract.progress_estimate &&
+       no_open))
     flags |= PEAK_MPI_OBSERVER_SLACK_NO_OPEN_PROGRESS;
   Context *c = begin_call(op, comm, flags, -1, -1, world_peer(comm, root), 1);
   if (c) {

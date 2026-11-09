@@ -10,7 +10,8 @@ extern "C" {
 #endif
 
 /* Local capture ABI, not an MPI capability claim or a portable wire encoding.
- * Adapters must supply complete identities/progress scope or call fail(). */
+ * Adapters supply complete identities/progress scope, or explicitly mark an
+ * opt-in progress estimate; unsupported/lost capture still calls fail(). */
 #define PEAK_MPI_OBSERVER_RECOVERY_API 1
 
 #define PEAK_MPI_OBSERVER_RECORD_BYTES 256u
@@ -71,7 +72,8 @@ enum {
     PEAK_MPI_OBSERVER_SLACK_SINGLE_FLOW = 1u << 2,
     PEAK_MPI_OBSERVER_SLACK_NO_OPEN_PROGRESS = 1u << 3,
     PEAK_MPI_OBSERVER_CANCELLED = 1u << 4,
-    PEAK_MPI_OBSERVER_APP_COST_KNOWN = 1u << 24
+    PEAK_MPI_OBSERVER_APP_COST_KNOWN = 1u << 24,
+    PEAK_MPI_OBSERVER_PROGRESS_ESTIMATED = 1u << 25
 };
 
 typedef struct {

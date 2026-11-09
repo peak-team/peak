@@ -7,7 +7,8 @@
 typedef enum {
   PEAK_MPI_PROGRESS_UNKNOWN = 0,
   PEAK_MPI_PROGRESS_INTEL_2021_11_ASYNC,
-  PEAK_MPI_PROGRESS_OMPI_5_0_5_UCX_1_17_RC_PROTO2_HOST_OBSERVED
+  PEAK_MPI_PROGRESS_OMPI_5_0_5_UCX_1_17_RC_PROTO2_HOST_OBSERVED,
+  PEAK_MPI_PROGRESS_INTEL_2021_11_OPX_ASYNC0_APPROX
 } PeakMpiProgressProfile;
 
 typedef struct {
@@ -18,6 +19,8 @@ typedef struct {
   unsigned observed_p2p_completion : 1;
   unsigned observed_buffer_detach : 1;
   unsigned observed_collective_completion : 1;
+  /* Explicit PMPI estimate; observed completion does not seal progress. */
+  unsigned progress_estimate : 1;
   const char *name;
   const char *reason;
   int effective_async_progress, provided_thread_level, async_verified;

@@ -93,6 +93,7 @@ typedef struct {
   int have_continuation, have_raw, active, coarse, unknown, have_prefix;
   /* Sticky disqualifier: unrelated collectives never enter message lists. */
   int other_point_to_point;
+  int progress_estimate;
   PeakMpiPolicyReason reason;
   uint64_t lost;
   PeakMpiPolicy *policy;
@@ -278,6 +279,7 @@ static int node(PeakMpiCausalService *s, unsigned r, double L, double P,
     spec.single_execution_flow =
         (rec->flags & PEAK_MPI_OBSERVER_SLACK_SINGLE_FLOW) != 0;
     spec.progress_clear =
+        rec->capability_uid != PEAK_MPI_PROGRESS_INTEL_2021_11_OPX_ASYNC0_APPROX &&
         (rec->flags & PEAK_MPI_OBSERVER_SLACK_NO_OPEN_PROGRESS) != 0;
   }
   return reserve(s, r, out) &&
@@ -448,6 +450,11 @@ static PeakMpiCostRef output(Operation *o) {
              ? o->result
              : o->exit;
 }
+static void mark_progress_estimate(PeakMpiCausalService *s, unsigned r) {
+  r = root(s, r);
+  s->ranks[r].progress_estimate = 1;
+  peak_mpi_policy_mark_progress_estimate(s->ranks[r].policy);
+}
 static int merge(PeakMpiCausalService *s, unsigned a, unsigned b) {
   a = root(s, a);
   b = root(s, b);
@@ -465,6 +472,7 @@ static int merge(PeakMpiCausalService *s, unsigned a, unsigned b) {
     return 0;
   }
   s->ranks[a].key = k;
+  s->ranks[a].progress_estimate |= s->ranks[b].progress_estimate;
   s->ranks[b].parent = a;
   s->ranks[a].cohort_size += s->ranks[b].cohort_size;
   if (s->ranks[a].coarse || s->ranks[b].coarse)
@@ -676,6 +684,8 @@ int peak_mpi_causal_service_ingest_raw(PeakMpiCausalService *s, unsigned r,
     return 1;
   }
   a->incarnation = raw->incarnation;
+  if (raw->contract_profile == PEAK_MPI_PROGRESS_INTEL_2021_11_OPX_ASYNC0_APPROX)
+    mark_progress_estimate(s, r);
   if (!isfinite(raw->L) || !isfinite(raw->P) || !isfinite(raw->elapsed) ||
       raw->L < 0 || raw->P < 0 || raw->P > raw->L || (!raw->app_cost_known && raw->L * 1e9 >= (double)UINT64_MAX) || (raw->app_cost_known &&
       (!peak_mpi_cost_cut_valid(raw->cut, raw->P, raw->A, raw->L))) || raw->elapsed < 0) {
@@ -1218,11 +1228,14 @@ static int parse_record(PeakMpiCausalService *s, unsigned r,
         ++b->references;
       }
     }
+    if (rec->capability_uid == PEAK_MPI_PROGRESS_INTEL_2021_11_OPX_ASYNC0_APPROX)
+      mark_progress_estimate(s, r);
     if (remote_op(rec) && !o->context)
       coarse(s, r, PEAK_MPI_POLICY_BAD_IDENTITY, 0);
     if (remote_op(rec) &&
         (rec->progress_scope == PEAK_MPI_OBSERVER_SCOPE_UNKNOWN ||
          (rec->capability_uid != PEAK_MPI_PROGRESS_INTEL_2021_11_ASYNC &&
+          rec->capability_uid != PEAK_MPI_PROGRESS_INTEL_2021_11_OPX_ASYNC0_APPROX &&
           rec->capability_uid !=
               PEAK_MPI_PROGRESS_OMPI_5_0_5_UCX_1_17_RC_PROTO2_HOST_OBSERVED)))
       coarse(s, r, PEAK_MPI_POLICY_MISSING_CONTRACT, 0);
@@ -2425,7 +2438,8 @@ static int publish_work(PeakMpiCausalService *s, size_t budget) {
                               s->pub_F,
                               s->pub_age + fmax(0, s->now - s->pub_started),
                               s->pub_oldest,
-                              PEAK_MPI_POLICY_COMPLETE_CUT,
+                              leader->progress_estimate ? PEAK_MPI_POLICY_OBSERVED_PROGRESS_CUT
+                                                        : PEAK_MPI_POLICY_COMPLETE_CUT,
                               1,
                               s->samples,
                               s->pub_count};

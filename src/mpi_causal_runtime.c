@@ -743,11 +743,12 @@ void peak_mpi_causal_runtime_report(void) {
   fprintf(stderr,
           "[peak mpi causal contract] rank=%d reason=%s profile=%s fabrics=%s "
           "ofi_provider=%s fi_provider=%s async_setting=%s effective_async=%d "
-          "async_verified=%d provided_thread_level=%d\n",
+          "async_verified=%d provided_thread_level=%d progress_estimate=%d\n",
           rank_id, contract->reason, contract->requested_profile,
           contract->fabrics, contract->ofi_provider, contract->fi_provider,
           contract->async_setting, contract->effective_async_progress,
-          contract->async_verified, contract->provided_thread_level);
+          contract->async_verified, contract->provided_thread_level,
+          contract->progress_estimate);
   fprintf(stderr,
           "[peak mpi causal mpi_config] rank=%d ucx_tls=%s ucx_proto=%s "
           "ucx_tm=%s pml=%s coll=%s pml_verified=%d coll_verified=%d "

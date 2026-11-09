@@ -37,7 +37,8 @@ typedef enum {
     PEAK_MPI_POLICY_EVENT_LOSS,
     PEAK_MPI_POLICY_RESOURCE_LIMIT,
     PEAK_MPI_POLICY_BAD_IDENTITY,
-    PEAK_MPI_POLICY_BAD_CUT
+    PEAK_MPI_POLICY_BAD_CUT,
+    PEAK_MPI_POLICY_PROGRESS_UNPROVEN
 } PeakMpiPolicyReason;
 
 typedef enum {
@@ -53,7 +54,9 @@ enum {
     PEAK_MPI_POLICY_PREFIX_COMPLETE = 1u << 0,
     PEAK_MPI_POLICY_FRONTIER_COMPLETE = 1u << 1,
     PEAK_MPI_POLICY_BACKLOG_COMPLETE = 1u << 2,
-    PEAK_MPI_POLICY_COMPLETE_CUT = (1u << 0) | (1u << 1) | (1u << 2)
+    PEAK_MPI_POLICY_COMPLETE_CUT = (1u << 0) | (1u << 1) | (1u << 2),
+    /* Complete observed PMPI cuts, explicitly incomplete progress coverage. */
+    PEAK_MPI_POLICY_OBSERVED_PROGRESS_CUT = 1u << 3
 };
 
 typedef struct {
@@ -80,6 +83,8 @@ typedef struct {
  * continuation/send/request/progress branches. Only an adapter/model with a
  * reviewed complete capability contract may set COMPLETE_CUT. PMPI parameter
  * logs and an async-progress switch do not establish that precondition.
+ * OBSERVED_PROGRESS_CUT is the explicit opt-in estimate alternative, not
+ * complete progress coverage; it can learn rates but cannot establish risk.
  * Ages are measured durations, never cross-node absolute timestamps. */
 typedef struct {
     PeakMpiPolicyCohortKey cohort;
@@ -142,6 +147,8 @@ PeakMpiPolicy *peak_mpi_policy_create(const PeakMpiPolicyConfig *config,
     size_t member_count, int actual_communication, int membership_complete,
     double now);
 void peak_mpi_policy_free(PeakMpiPolicy *policy);
+/* Sticky explicit estimate, independent of event loss/recovery. */
+void peak_mpi_policy_mark_progress_estimate(PeakMpiPolicy *policy);
 PeakMpiPolicyResult peak_mpi_policy_record_raw(PeakMpiPolicy *policy,
     PeakMpiPolicyCohortKey cohort, const PeakMpiPolicySample *sample, double now);
 /* Covered samples retain their own actual cost/elapsed observations and do
