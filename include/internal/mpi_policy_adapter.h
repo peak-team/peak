@@ -205,9 +205,10 @@ PeakMpiPolicyResult peak_mpi_policy_receiver_init(PeakMpiPolicyReceiver *receive
 PeakMpiPolicyResult peak_mpi_policy_receiver_rebind(PeakMpiPolicyReceiver *receiver,
     PeakMpiPolicyCohortKey cohort, size_t known_member_count,
     int membership_complete, double now);
-/* A strictly larger locally observed lower bound tightens g and invalidates
- * global membership/headroom, without inventing an epoch or resetting any
- * raw history/packet generation. Older/equal hints are ignored. Once this key
+/* A strictly larger locally observed lower bound invalidates global
+ * membership/headroom while retaining local/learned g until feedback is stale.
+ * Stale/coarse pressure uses the bound. No epoch or raw history/packet
+ * generation is reset. Older/equal hints are ignored. Once this key
  * had feedback, its complete tuples cannot confirm the growth: a new backend
  * epoch plus covered feedback is required. Before the first feedback, an
  * initial matching-key complete tuple may confirm a sufficient bound. */

@@ -125,8 +125,8 @@ static PeakMpiPolicyResult bad_cut(PeakMpiPolicy *p, PeakMpiPolicyReason reason)
 static void make_stale(PeakMpiPolicy *p) {
     if (p->mode == PEAK_MPI_POLICY_COARSE || !p->active) return;
     p->mode = PEAK_MPI_POLICY_STALE; p->reason = PEAK_MPI_POLICY_FEEDBACK_OLD;
-    p->g = p->membership_complete ? (double)(p->count ? p->count : 1) :
-        maximum(p->g, (double)(p->count_hint ? p->count_hint : 1));
+    /* Stale pressure is temporary; it must not replace the learned rate
+     * estimate, especially when no new profiling is available after recovery. */
     p->baseline_valid = 0;
 }
 static int raw_stream_compatible(const Member *m, const PeakMpiPolicySample *s) {
@@ -454,6 +454,9 @@ static PeakMpiPolicyResult feedback_common(PeakMpiPolicy *p, double now,
     f->cohort = p->cohort; f->generation = p->revision;
     f->policy_generation = p->policy_generation; f->mode = p->mode; f->reason = p->reason;
     f->member_count = p->count_hint; f->q = p->config.q; f->g = p->g; f->F = p->F;
+    if (p->mode == PEAK_MPI_POLICY_STALE)
+        f->g = p->membership_complete ? (double)(p->count ? p->count : 1) :
+            maximum(p->g, (double)(p->count_hint ? p->count_hint : 1));
     f->rate_baseline_valid = p->baseline_valid;
     f->risk = p->mode == PEAK_MPI_POLICY_COARSE ? coarse_sum : p->F;
     if (!isfinite(f->received_raw_sum) || !isfinite(coarse_sum) || !isfinite(f->U_tail)) {
@@ -590,7 +593,6 @@ PeakMpiPolicyResult peak_mpi_policy_receiver_note_membership_hint(PeakMpiPolicyR
     if (count <= r->known_member_count) return PEAK_MPI_POLICY_IGNORED;
     r->membership_hint_pending |= r->have_feedback;
     r->known_member_count = count; r->membership_complete = 0; r->active = 1;
-    r->conservative_g = maximum(r->conservative_g, (double)count);
     return PEAK_MPI_POLICY_OK;
 }
 int peak_mpi_policy_receiver_recover(PeakMpiPolicyReceiver *r, double now) {
@@ -651,7 +653,8 @@ PeakMpiPolicyResult peak_mpi_policy_receiver_accept(PeakMpiPolicyReceiver *r,
              f->reason != PEAK_MPI_POLICY_EVENT_LOSS))
             r->coarse_reason = f->reason;
     }
-    r->conservative_g = maximum(r->conservative_g, f->g);
+    if (f->mode != PEAK_MPI_POLICY_STALE)
+        r->conservative_g = maximum(r->conservative_g, f->g);
     return PEAK_MPI_POLICY_OK;
 }
 PeakMpiPolicyResult peak_mpi_policy_receiver_mark_coarse(PeakMpiPolicyReceiver *r,
@@ -697,13 +700,15 @@ PeakMpiPolicyResult peak_mpi_policy_receiver_snapshot(PeakMpiPolicyReceiver *r,
             d->mode = PEAK_MPI_POLICY_STALE; d->reason = PEAK_MPI_POLICY_FEEDBACK_OLD;
         }
         d->g = r->have_feedback ? f->g : r->conservative_g;
-        if (d->mode == PEAK_MPI_POLICY_STALE || d->mode == PEAK_MPI_POLICY_COARSE ||
-            !r->membership_complete) {
+        /* A membership bound is not a pressure observation. Unknown members
+         * still forbid global headroom, without tightening local control. */
+        if (d->mode == PEAK_MPI_POLICY_STALE || d->mode == PEAK_MPI_POLICY_COARSE) {
             d->g = r->membership_complete ? (double)(r->known_member_count ? r->known_member_count : 1) :
                 maximum(r->conservative_g, (double)(r->known_member_count ? r->known_member_count : 1));
         }
         d->g = maximum(1, d->g);
-        r->conservative_g = maximum(r->conservative_g, d->g);
+        if (d->mode != PEAK_MPI_POLICY_STALE)
+            r->conservative_g = maximum(r->conservative_g, d->g);
         int matching_mode = !r->permanent_coarse || f->mode == PEAK_MPI_POLICY_COARSE;
         d->global_available = fresh && matching_mode &&
             d->mode != PEAK_MPI_POLICY_STALE && r->membership_complete &&
