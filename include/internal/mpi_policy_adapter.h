@@ -71,6 +71,9 @@ typedef struct {
     uint64_t generation, event_cut, control_generation;
     double L, P, D, elapsed, age_seconds;
     int mixed_control;
+    double A;
+    int app_cost_known;
+    PeakMpiCostCut cut;
 } PeakMpiPolicySample;
 
 /* Each member sample belongs to this one committed cut. F includes all live
@@ -109,9 +112,16 @@ typedef struct {
     double received_raw_sum, age_seconds, oldest_unresolved_age;
     uint64_t lost_events;
     /* Fine coverage means one complete prefix/frontier/backlog cut. Coarse
-     * coverage instead means a complete raw-cost cut; no fine graph is claimed. */
+     * coverage instead means a complete application-cost cut (legacy raw L
+     * without an annotation); no fine graph is claimed. */
     int membership_complete, coverage_complete, risk_known, tails_complete;
     int received_raw_complete, rate_baseline_valid;
+    /* Known cut values use the canonical ns conversion; local_latest_L and
+     * received_raw_sum above remain raw-cost diagnostics, never A aliases. */
+    double A_cut, local_latest_A, received_app_sum;
+    int app_cost_known;
+    PeakMpiCostCut cut;
+    uint64_t local_latest_A_ns, local_latest_L_ns;
 } PeakMpiPolicyFeedback;
 
 typedef struct PeakMpiPolicy PeakMpiPolicy;
@@ -125,7 +135,7 @@ int peak_mpi_policy_recover_work(PeakMpiPolicy *, size_t budget, size_t *used);
  * local member may communicate with an unmanaged/unknown remote participant.
  * Empty membership is allowed only without actual communication; a complete
  * singleton stays local. All sample costs/ages are finite nonnegative seconds,
- * P<=L; zero costs/cuts/generations are valid. now is one owner's monotonic
+ * P<=A<=L when annotated; legacy samples conservatively use A=L. Zero costs/cuts/generations are valid. now is one owner's monotonic
  * clock. No absolute timestamps from different ranks are compared. */
 PeakMpiPolicy *peak_mpi_policy_create(const PeakMpiPolicyConfig *config,
     PeakMpiPolicyCohortKey cohort, const PeakMpiPolicyMemberId *members,
@@ -221,14 +231,17 @@ PeakMpiPolicyResult peak_mpi_policy_receiver_accept(PeakMpiPolicyReceiver *recei
 PeakMpiPolicyResult peak_mpi_policy_receiver_mark_coarse(PeakMpiPolicyReceiver *receiver,
     PeakMpiPolicyReason reason, double now);
 /* This fixes q_eff once for all four future-demand inputs. Actual history uses
- * original q. U_tail is extended only by local L newer than local_latest_L;
+ * original q. U_tail is extended only by local A newer than local_latest_A;
  * already covered profile/control/observer cost is never charged again.
  * Unknown/stale global headroom is NaN and forbids reattach relaxation; caller
  * retains all existing local lease, forecast and safety checks. */
 PeakMpiPolicyResult peak_mpi_policy_receiver_snapshot(PeakMpiPolicyReceiver *receiver,
-    double now, double local_elapsed_now, double local_L_now,
+    double now, double local_elapsed_now, double local_A_now,
     double existing_local_headroom, PeakMpiPolicyDecision *decision);
 
+PeakMpiPolicyResult peak_mpi_policy_receiver_snapshot_cut(PeakMpiPolicyReceiver *,
+    double now, double local_elapsed_now, PeakMpiCostCut cut,
+    double existing_local_headroom, PeakMpiPolicyDecision *);
 int peak_mpi_policy_receiver_recover(PeakMpiPolicyReceiver *receiver,
                                      double now);
 

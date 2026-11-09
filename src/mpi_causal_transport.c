@@ -11,7 +11,7 @@
 #include <unistd.h>
 
 #define HDR 40u
-#define MAGIC UINT32_C(0x504d4332)
+#define MAGIC UINT32_C(0x504d4335)
 enum { SEND_BATCH_FRAMES = 16 };
 enum { HELLO = 1, RECORD, OBJECT, RAW, ACK, FEEDBACK, WMRQ };
 typedef struct {
@@ -91,7 +91,7 @@ static double gd(const unsigned char **p) {
   X(result_ref)                                                                \
   X(progress_begin)                                                            \
   X(progress_end)                                                              \
-  X(L_cut)                                                                     \
+  X(L_cut) X(A_cut)                                                            \
   X(P_cut)                                                                     \
   X(control_generation) X(communicator_uid) X(request_uid)                     \
       X(request_generation) X(activation) X(collective_ordinal) X(batch_uid)   \
@@ -136,6 +136,9 @@ static void recovery_encode(unsigned char **p, const PeakMpiCausalRecovery *r) {
   pd(p, r->L);
   pd(p, r->P);
   pd(p, r->elapsed);
+  pd(p, r->A);
+  p64(p, r->app_cost_known);
+  p64(p, r->cut.P_ns); p64(p, r->cut.A_ns); p64(p, r->cut.L_ns);
 }
 static void recovery_decode(const unsigned char **p, PeakMpiCausalRecovery *r) {
 #define D(f) r->f = g64(p);
@@ -144,14 +147,19 @@ static void recovery_decode(const unsigned char **p, PeakMpiCausalRecovery *r) {
   r->L = gd(p);
   r->P = gd(p);
   r->elapsed = gd(p);
+  r->A = gd(p);
+  r->app_cost_known = g64(p);
+  r->cut.P_ns = g64(p); r->cut.A_ns = g64(p); r->cut.L_ns = g64(p);
 }
-#define RECOVERY_BYTES 88u
+#define RECOVERY_BYTES 128u
 #define F64(X)                                                                 \
   X(cohort.job_incarnation)                                                    \
   X(cohort.cohort_id)                                                          \
   X(cohort.epoch)                                                              \
   X(member.process)                                                            \
   X(member.incarnation)                                                        \
+  X(cut.P_ns) X(cut.A_ns) X(cut.L_ns) X(local_latest_A_ns)                    \
+  X(local_latest_L_ns)                                                         \
   X(generation)                                                                \
   X(event_cut) X(control_generation) X(policy_generation) X(lost_events)
 #define FD(X)                                                                  \
@@ -165,14 +173,15 @@ static void recovery_decode(const unsigned char **p, PeakMpiCausalRecovery *r) {
   X(risk)                                                                      \
   X(U_tail)                                                                    \
   X(T_safe)                                                                    \
-  X(local_latest_L) X(received_raw_sum) X(age_seconds) X(oldest_unresolved_age)
+  X(local_latest_L) X(received_raw_sum) X(age_seconds) X(oldest_unresolved_age) \
+  X(A_cut) X(local_latest_A) X(received_app_sum)
 #define FI(X)                                                                  \
   X(mode)                                                                      \
   X(reason)                                                                    \
   X(membership_complete)                                                       \
   X(coverage_complete)                                                         \
   X(risk_known)                                                                \
-  X(tails_complete) X(received_raw_complete) X(rate_baseline_valid)
+  X(tails_complete) X(received_raw_complete) X(rate_baseline_valid) X(app_cost_known)
 static size_t feedback_encode(unsigned char *b,
                               const PeakMpiPolicyFeedback *r) {
   unsigned char *p = b;
@@ -267,6 +276,9 @@ static size_t raw_encode(unsigned char *b, const PeakMpiCausalRaw *r) {
   p64(&p, r->incarnation);
   p64(&p, r->control_generation);
   pd(&p, r->L);
+  pd(&p, r->A);
+  p32(&p, (uint32_t)r->app_cost_known);
+  p64(&p, r->cut.P_ns); p64(&p, r->cut.A_ns); p64(&p, r->cut.L_ns);
   pd(&p, r->P);
   pd(&p, r->elapsed);
   p32(&p, r->contract_profile);
@@ -288,7 +300,7 @@ static int raw_decode(const unsigned char *p, size_t n, PeakMpiCausalRaw *r,
                       unsigned char *peers, unsigned world, uint64_t *prefixes,
                       size_t slots) {
   size_t i;
-  if (n < 104 + RECOVERY_BYTES)
+  if (n < 140 + RECOVERY_BYTES)
     return 0;
   memset(r, 0, sizeof(*r));
   r->generation = g64(&p);
@@ -298,6 +310,9 @@ static int raw_decode(const unsigned char *p, size_t n, PeakMpiCausalRaw *r,
   r->incarnation = g64(&p);
   r->control_generation = g64(&p);
   r->L = gd(&p);
+  r->A = gd(&p);
+  r->app_cost_known = (int)g32(&p);
+  r->cut.P_ns = g64(&p); r->cut.A_ns = g64(&p); r->cut.L_ns = g64(&p);
   r->P = gd(&p);
   r->elapsed = gd(&p);
   r->contract_profile = g32(&p);
@@ -307,14 +322,14 @@ static int raw_decode(const unsigned char *p, size_t n, PeakMpiCausalRaw *r,
   r->coarse_reason = g32(&p);
   r->lost_events = g64(&p);
   r->peer_count = g32(&p);
-  if (r->peer_count != world || n < 104 + RECOVERY_BYTES + r->peer_count)
+  if (r->peer_count != world || n < 140 + RECOVERY_BYTES + r->peer_count)
     return 0;
   memcpy(peers, p, r->peer_count);
   r->known_peers = peers;
   p += r->peer_count;
   r->slot_count = g32(&p);
   if ((r->slot_count && r->slot_count != slots) ||
-      n != 104 + RECOVERY_BYTES + r->peer_count + 8 * r->slot_count)
+      n != 140 + RECOVERY_BYTES + r->peer_count + 8 * r->slot_count)
     return 0;
   for (i = 0; i < r->slot_count; ++i)
     prefixes[i] = g64(&p);
@@ -497,7 +512,7 @@ static int enqueue(PeakMpiCausalTransport *t, unsigned type, const void *v) {
 static int deliver(PeakMpiCausalTransport *t, unsigned rank, uint64_t inc,
                    unsigned type, const unsigned char *b, size_t n,
                    double now) {
-  if (type == RECORD && n == 224) {
+  if (type == RECORD && n == 232) {
     PeakMpiObserverRecord r;
     record_decode(b, &r);
     if (r.incarnation != inc) {
@@ -1004,7 +1019,7 @@ static void client_tick(PeakMpiCausalTransport *t, double now, size_t *budget) {
       uint64_t nonce = g64(&q);
       if (nonce > t->requested_nonce)
         t->requested_nonce = nonce;
-    } else if (type == FEEDBACK && n == 232 + RECOVERY_BYTES + 4) {
+    } else if (type == FEEDBACK && n == 300 + RECOVERY_BYTES + 4) {
       feedback_decode(q, &t->feedback);
       t->have_feedback = 1;
       t->stats.feedbacks++;

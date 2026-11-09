@@ -82,10 +82,12 @@ typedef struct {
   size_t prefix_slot_count, verify_slot_count;
   int idle, verify_active, verify_idle, verify_stage, has_verified;
   size_t visible_cursor, visible_limit, accept_cursor;
-  double verify_L, verify_P, verify_elapsed, verify_received;
+  double verify_elapsed, verify_received;
+  PeakMpiCostCut raw_cut, verify_cut;
+  int app_cost_known, verify_app_cost_known;
   uint64_t verify_control;
-  double L, P, elapsed, received_at, covered_at, last_L, last_P;
-  uint64_t last_L_cut, last_P_cut;
+  double L, A, P, elapsed, received_at, covered_at, last_A, last_P;
+  uint64_t last_A_cut, last_P_cut, last_raw_L_cut;
   PeakMpiCostRef continuation, covered_ref;
   int have_continuation, have_raw, active, coarse, unknown, have_prefix;
   /* Sticky disqualifier: unrelated collectives never enter message lists. */
@@ -200,7 +202,14 @@ struct PeakMpiCausalService {
   PeakMpiPolicyReason local_fault;
   PeakMpiCausalServiceStats stats;
 };
-static double sec(uint64_t n) { return (double)n * 1e-9; }
+static double sec(uint64_t n) { return peak_mpi_cost_cut_seconds(n); }
+static double recovery_app_cost(const PeakMpiCausalRecovery *r) {
+  return r->app_cost_known ? sec(r->cut.A_ns) : r->L;
+}
+static PeakMpiCostCut legacy_cost_cut(double L, double P) {
+  PeakMpiCostCut c = {(uint64_t)(P * 1e9), (uint64_t)(L * 1e9), (uint64_t)(L * 1e9)};
+  return c;
+}
 static unsigned root(PeakMpiCausalService *s, unsigned r) {
   while (s->ranks[r].parent != r)
     r = s->ranks[r].parent;
@@ -627,6 +636,9 @@ static void raw_to_policy(PeakMpiCausalService *s, unsigned r) {
       a->elapsed,
       0,
       0};
+  p.A = a->A;
+  p.app_cost_known = a->app_cost_known;
+  p.cut = a->raw_cut;
   peak_mpi_policy_record_raw(s->ranks[root(s, r)].policy,
                              s->ranks[root(s, r)].key, &p, s->now);
 }
@@ -644,8 +656,8 @@ static void freeze_verify_tuple(Rank *a) {
   a->accept_cursor = 0;
   a->verify_idle = a->idle;
   a->verify_group = a->idle_group;
-  a->verify_L = a->L;
-  a->verify_P = a->P;
+  a->verify_cut = a->raw_cut;
+  a->verify_app_cost_known = a->app_cost_known;
   a->verify_elapsed = a->elapsed;
   a->verify_control = a->control;
   a->verify_received = a->received_at;
@@ -663,14 +675,19 @@ int peak_mpi_causal_service_ingest_raw(PeakMpiCausalService *s, unsigned r,
   }
   a->incarnation = raw->incarnation;
   if (!isfinite(raw->L) || !isfinite(raw->P) || !isfinite(raw->elapsed) ||
-      raw->L < 0 || raw->P < 0 || raw->P > raw->L || raw->elapsed < 0) {
+      raw->L < 0 || raw->P < 0 || raw->P > raw->L || (!raw->app_cost_known && raw->L * 1e9 >= (double)UINT64_MAX) || (raw->app_cost_known &&
+      (!peak_mpi_cost_cut_valid(raw->cut, raw->P, raw->A, raw->L))) || raw->elapsed < 0) {
     coarse(s, r, PEAK_MPI_POLICY_BAD_CUT, 0);
     return 1;
   }
   if (a->have_raw && raw->generation < a->raw_generation)
     return 1;
   if (a->have_raw &&
-      (raw->L < a->L || raw->P < a->P || raw->elapsed < a->elapsed)) {
+      (raw->L < a->L || (raw->app_cost_known ? raw->A : raw->L) < a->A ||
+       (raw->app_cost_known && a->app_cost_known &&
+        (raw->cut.P_ns < a->raw_cut.P_ns || raw->cut.A_ns < a->raw_cut.A_ns ||
+         raw->cut.L_ns < a->raw_cut.L_ns ||
+         raw->cut.P_ns-a->raw_cut.P_ns > raw->cut.A_ns-a->raw_cut.A_ns)) || raw->P < a->P || raw->elapsed < a->elapsed)) {
     coarse(s, r, PEAK_MPI_POLICY_BAD_CUT, 0);
     return 1;
   }
@@ -691,6 +708,9 @@ int peak_mpi_causal_service_ingest_raw(PeakMpiCausalService *s, unsigned r,
   a->idle = raw->idle_cut;
   a->idle_group = raw->idle_group_uid;
   a->L = raw->L;
+  a->A = raw->app_cost_known ? raw->A : raw->L;
+  a->raw_cut = raw->app_cost_known ? raw->cut : legacy_cost_cut(raw->L, raw->P);
+  a->app_cost_known = raw->app_cost_known;
   a->P = raw->P;
   a->elapsed = raw->elapsed;
   a->control = raw->control_generation;
@@ -745,13 +765,19 @@ int peak_mpi_causal_service_ingest_raw(PeakMpiCausalService *s, unsigned r,
 static int advance(PeakMpiCausalService *s, unsigned r,
                    const PeakMpiObserverRecord *rec, PeakMpiCostRef *out) {
   Rank *a = &s->ranks[r];
-  double L = sec(rec->L_cut), P = sec(rec->P_cut);
-  if (rec->L_cut < a->last_L_cut || rec->P_cut < a->last_P_cut ||
-      rec->P_cut - a->last_P_cut > rec->L_cut - a->last_L_cut) {
+  if ((rec->flags & PEAK_MPI_CAUSAL_APP_COST_KNOWN) &&
+      (rec->P_cut > rec->A_cut || rec->A_cut > rec->L_cut)) {
     coarse(s, r, PEAK_MPI_POLICY_BAD_CUT, 0);
     return 0;
   }
-  if (!node(s, r, sec(rec->L_cut - a->last_L_cut),
+  double A = sec(peak_mpi_causal_record_app_cost(rec)), P = sec(rec->P_cut);
+  if (rec->L_cut < a->last_raw_L_cut ||
+      peak_mpi_causal_record_app_cost(rec) < a->last_A_cut || rec->P_cut < a->last_P_cut ||
+      rec->P_cut - a->last_P_cut > peak_mpi_causal_record_app_cost(rec) - a->last_A_cut) {
+    coarse(s, r, PEAK_MPI_POLICY_BAD_CUT, 0);
+    return 0;
+  }
+  if (!node(s, r, sec(peak_mpi_causal_record_app_cost(rec) - a->last_A_cut),
             sec(rec->P_cut - a->last_P_cut), rec, out))
     return 0;
   int thread_edge = 0;
@@ -763,9 +789,10 @@ static int advance(PeakMpiCausalService *s, unsigned r,
   if (a->have_continuation && !thread_edge &&
       !edge(s, r, a->continuation, *out, PEAK_MPI_COST_PROGRESS, 0))
     return 0;
-  a->last_L = L;
+  a->last_A = A;
   a->last_P = P;
-  a->last_L_cut = rec->L_cut;
+  a->last_A_cut = peak_mpi_causal_record_app_cost(rec);
+  a->last_raw_L_cut = rec->L_cut;
   a->last_P_cut = rec->P_cut;
   a->continuation = *out;
   a->have_continuation = 1;
@@ -788,12 +815,12 @@ static void seal_output(PeakMpiCausalService *s, Operation *o) {
 static void legacy_resolve(PeakMpiCausalService *s, Operation *o) {
   double bound = 0;
   for (unsigned r = 0; r < s->config.world_size; r++)
-    bound += s->ranks[r].L;
+    bound += s->ranks[r].A;
   /* This is an ownerless paid-history upper anchor, never another raw owner. */
   PeakMpiCostRef ref;
   if (!reserve(s, o->rank, &ref))
     return;
-  double inside = fmax(0, sec(o->end.L_cut) - sec(o->begin.L_cut));
+  double inside = fmax(0, sec(peak_mpi_causal_record_app_cost(&o->end)) - sec(peak_mpi_causal_record_app_cost(&o->begin)));
   PeakMpiCostNodeSpec spec = {PEAK_MPI_COST_EVENT,
                               o->rank,
                               PEAK_MPI_COST_NO_OWNER,
@@ -899,14 +926,18 @@ static void match_index_insert(PeakMpiCausalService *s, Operation *o) {
 }
 static int queue_cut(PeakMpiCausalService *s, unsigned rank, PeakMpiCostRef ref,
                      PeakMpiPolicySample sample, double received) {
+  Rank *r = &s->ranks[rank];
+  if (sample.app_cost_known && sample.cut.A_ns < r->last_A_cut) {
+    coarse(s, rank, PEAK_MPI_POLICY_BAD_CUT, 0);
+    return 0;
+  }
   if (!s->free_cut_count) {
     coarse(s, rank, PEAK_MPI_POLICY_RESOURCE_LIMIT, 0);
     return 0;
   }
   size_t at = s->free_cuts[--s->free_cut_count];
-  Rank *r = &s->ranks[rank];
   s->cuts[at] = (SettledCut){
-      ref, sample, received, sample.L - r->last_L, r->parsed_index, SIZE_MAX};
+      ref, sample, received, sample.app_cost_known ? sec(sample.cut.A_ns-r->last_A_cut) : sample.L-r->last_A, r->parsed_index, SIZE_MAX};
   if (r->cut_tail != SIZE_MAX)
     s->cuts[r->cut_tail].next = at;
   else
@@ -1025,6 +1056,11 @@ static int parse_record(PeakMpiCausalService *s, unsigned r,
   Rank *a = &s->ranks[r];
   if (a->coarse)
     return 1;
+  if ((rec->flags & PEAK_MPI_CAUSAL_APP_COST_KNOWN) &&
+      (rec->P_cut > rec->A_cut || rec->A_cut > rec->L_cut)) {
+    coarse(s, r, PEAK_MPI_POLICY_BAD_CUT, 0);
+    return 1;
+  }
   if (rec->thread_uid && rec->thread_uid <= s->config.slots &&
       rec->sequence > a->processed[rec->thread_uid - 1]) {
     a->processed_sum += rec->sequence - a->processed[rec->thread_uid - 1];
@@ -1049,12 +1085,16 @@ static int parse_record(PeakMpiCausalService *s, unsigned r,
                                   0,
                                   a->processed_sum,
                                   rec->control_generation,
-                                  sec(rec->L_cut),
+                                  sec(peak_mpi_causal_record_app_cost(rec)),
                                   sec(rec->P_cut),
                                   0,
                                   sec(rec->progress_end),
                                   0,
                                   0};
+    sample.L = sec(rec->L_cut);
+    sample.A = sec(peak_mpi_causal_record_app_cost(rec));
+    sample.app_cost_known = (rec->flags & PEAK_MPI_CAUSAL_APP_COST_KNOWN) != 0;
+    sample.cut = (PeakMpiCostCut){rec->P_cut, peak_mpi_causal_record_app_cost(rec), rec->L_cut};
     queue_cut(s, r, a->continuation, sample, s->now);
     return 1;
   }
@@ -1185,10 +1225,10 @@ static int parse_record(PeakMpiCausalService *s, unsigned r,
     Operation *wait = find_op(s, r, rec->batch_uid);
     if (wait) {
       wait->observed_count++;
-      double bound = s->ranks[r].last_L;
+      double bound = s->ranks[r].last_A;
       for (unsigned other = 0; other < s->config.world_size; other++)
         if (other != r)
-          bound += s->ranks[other].L;
+          bound += s->ranks[other].A;
       PeakMpiCostRef ref;
       if (reserve(s, r, &ref)) {
         PeakMpiCostNodeSpec spec = {
@@ -1292,20 +1332,21 @@ static int parse_record(PeakMpiCausalService *s, unsigned r,
   a->anchor[rec->thread_uid - 1] = rec->op_uid;
   o->completed |=
       o->immediate || !(o->begin.flags & PEAK_MPI_CAUSAL_NONBLOCKING);
-  uint64_t Lcut = s->building_concurrent ? a->last_L_cut : rec->L_cut;
+  uint64_t Acut = s->building_concurrent ? a->last_A_cut : peak_mpi_causal_record_app_cost(rec);
   uint64_t Pcut = s->building_concurrent ? a->last_P_cut : rec->P_cut;
-  double L = sec(Lcut), P = sec(Pcut);
+  double A = sec(Acut), P = sec(Pcut);
   PeakMpiCostOwnerRef own = PEAK_MPI_COST_NO_OWNER;
-  if (Lcut < a->last_L_cut || Pcut < a->last_P_cut ||
-      Pcut - a->last_P_cut > Lcut - a->last_L_cut) {
+  if ((!s->building_concurrent && rec->L_cut < a->last_raw_L_cut) ||
+      Acut < a->last_A_cut || Pcut < a->last_P_cut ||
+      Pcut - a->last_P_cut > Acut - a->last_A_cut) {
     coarse(s, r, PEAK_MPI_POLICY_BAD_CUT, 0);
     return 1;
   }
-  if (Lcut > a->last_L_cut || Pcut > a->last_P_cut) {
+  if (Acut > a->last_A_cut || Pcut > a->last_P_cut) {
     if (!good(s, r, peak_mpi_cost_model_reserve_owner(s->model, &own)) ||
         !good(s, r,
               peak_mpi_cost_model_define_owner(s->model, own, r,
-                                               sec(Lcut - a->last_L_cut),
+                                               sec(Acut - a->last_A_cut),
                                                sec(Pcut - a->last_P_cut))))
       return 1;
   }
@@ -1325,9 +1366,10 @@ static int parse_record(PeakMpiCausalService *s, unsigned r,
       (o->begin.flags & PEAK_MPI_CAUSAL_NONBLOCKING))
     edge(s, r, o->entry, o->exit, PEAK_MPI_COST_GUARANTEED, 0);
   if (!s->building_concurrent) {
-    a->last_L = L;
+    a->last_A = A;
     a->last_P = P;
-    a->last_L_cut = Lcut;
+    a->last_A_cut = Acut;
+    a->last_raw_L_cut = rec->L_cut;
     a->last_P_cut = Pcut;
     a->continuation = o->exit;
     a->have_continuation = 1;
@@ -2145,7 +2187,11 @@ static int publish_work(PeakMpiCausalService *s, size_t budget) {
                                  fmax(0, s->now - a->received_at),
                                  0};
         s->samples[s->pub_count++] = p;
-        s->pub_F += p.L;
+        p.A = a->A;
+        p.app_cost_known = a->app_cost_known;
+        p.cut = a->raw_cut;
+        s->samples[s->pub_count - 1] = p;
+        s->pub_F += p.app_cost_known ? sec(p.cut.A_ns) : p.L;
         s->pub_age = fmax(s->pub_age, p.age_seconds);
         continue;
       }
@@ -2566,10 +2612,11 @@ static void verify_prefixes(PeakMpiCausalService *s, size_t budget) {
         if (a->verify_idle && peak_mpi_causal_batches_last_group(
                                   s->batches, rank) == a->verify_group) {
           PeakMpiObserverRecord idle = {0};
-          idle.P_cut = (uint64_t)(a->verify_P * 1e9);
-          idle.L_cut =
-              idle.P_cut + (uint64_t)((a->verify_L - a->verify_P) * 1e9);
-          if (sec(idle.L_cut) >= a->last_L && sec(idle.P_cut) >= a->last_P) {
+          idle.P_cut = a->verify_cut.P_ns;
+          idle.A_cut = a->verify_cut.A_ns;
+          idle.L_cut = a->verify_cut.L_ns;
+          if (a->verify_app_cost_known) idle.flags |= PEAK_MPI_CAUSAL_APP_COST_KNOWN;
+          if (idle.A_cut >= a->last_A_cut && idle.P_cut >= a->last_P_cut) {
             if (a->have_continuation) {
               s->cycle_idle_progress = 1;
               a->parsed_index++;
@@ -2585,6 +2632,9 @@ static void verify_prefixes(PeakMpiCausalService *s, size_t budget) {
                   a->verify_elapsed,
                   0,
                   0};
+              sample.A = sec(idle.A_cut);
+              sample.app_cost_known = a->verify_app_cost_known;
+              sample.cut = a->verify_cut;
               queue_cut(s, rank, a->continuation, sample, a->verify_received);
             }
           }
@@ -2648,13 +2698,14 @@ static void parse_batches(PeakMpiCausalService *s, size_t budget) {
       s->group_start = a->continuation;
       if (s->plan.concurrent) {
         if (s->plan.end->L_cut < s->plan.begin->L_cut ||
+            peak_mpi_causal_record_app_cost(s->plan.end) < peak_mpi_causal_record_app_cost(s->plan.begin) ||
             s->plan.end->P_cut < s->plan.begin->P_cut ||
             s->plan.end->P_cut - s->plan.begin->P_cut >
-                s->plan.end->L_cut - s->plan.begin->L_cut) {
+                peak_mpi_causal_record_app_cost(s->plan.end) - peak_mpi_causal_record_app_cost(s->plan.begin)) {
           coarse(s, rank, PEAK_MPI_POLICY_BAD_CUT, 0);
           return;
         }
-        if (!node(s, rank, sec(s->plan.end->L_cut - s->plan.begin->L_cut),
+        if (!node(s, rank, sec(peak_mpi_causal_record_app_cost(s->plan.end) - peak_mpi_causal_record_app_cost(s->plan.begin)),
                   sec(s->plan.end->P_cut - s->plan.begin->P_cut), NULL,
                   &s->group_cost))
           return;
@@ -2665,9 +2716,10 @@ static void parse_batches(PeakMpiCausalService *s, size_t budget) {
         good(s, rank, peak_mpi_cost_model_seal(s->model, s->group_cost));
         a->continuation = s->group_cost;
         a->have_continuation = 1;
-        a->last_L = sec(rec.L_cut);
+        a->last_A = sec(peak_mpi_causal_record_app_cost(&rec));
         a->last_P = sec(rec.P_cut);
-        a->last_L_cut = rec.L_cut;
+        a->last_A_cut = peak_mpi_causal_record_app_cost(&rec);
+        a->last_raw_L_cut = rec.L_cut;
         a->last_P_cut = rec.P_cut;
         s->building_concurrent = 0;
       }
@@ -2864,7 +2916,10 @@ static int recovery_work(PeakMpiCausalService *s, size_t budget, size_t *used) {
       }
       if (!isfinite(a->recovery.L) || !isfinite(a->recovery.P) ||
           !isfinite(a->recovery.elapsed) || a->recovery.P < 0 ||
-          a->recovery.P > a->recovery.L || a->recovery.elapsed < 0 ||
+          (!a->recovery.app_cost_known && a->recovery.L * 1e9 >= (double)UINT64_MAX) ||
+          a->recovery.P > a->recovery.L ||
+          (a->recovery.app_cost_known && !peak_mpi_cost_cut_valid(
+              a->recovery.cut, a->recovery.P, a->recovery.A, a->recovery.L)) || a->recovery.elapsed < 0 ||
           !a->recovery.uid_floor) {
         coarse(s, s->recovery_rank, PEAK_MPI_POLICY_BAD_CUT, 0);
         return 1;
@@ -2949,7 +3004,7 @@ static int recovery_work(PeakMpiCausalService *s, size_t budget, size_t *used) {
     } else if (s->recovery_reset == 6) {
       ++*used;
       if (s->recovery_rank < s->config.world_size)
-        s->recovery_H += s->ranks[s->recovery_rank++].recovery.L;
+        s->recovery_H += recovery_app_cost(&s->ranks[s->recovery_rank++].recovery);
       else {
         s->recovery_reset = 7;
         s->recovery_rank = 0;
@@ -2968,9 +3023,12 @@ static int recovery_work(PeakMpiCausalService *s, size_t budget, size_t *used) {
       }
       ++*used;
       Rank *a = &s->ranks[s->recovery_rank];
-      a->last_L_cut = (uint64_t)(a->recovery.L * 1e9);
-      a->last_P_cut = (uint64_t)(a->recovery.P * 1e9);
-      a->last_L = sec(a->last_L_cut);
+      PeakMpiCostCut base = a->recovery.app_cost_known ? a->recovery.cut
+          : legacy_cost_cut(a->recovery.L, a->recovery.P);
+      a->last_P_cut = base.P_ns;
+      a->last_A_cut = base.A_ns;
+      a->last_raw_L_cut = base.L_ns;
+      a->last_A = sec(a->last_A_cut);
       a->last_P = sec(a->last_P_cut);
       a->uid_floor = a->recovery.uid_floor;
       a->acknowledged_loss = a->recovery.loss;
@@ -3023,7 +3081,7 @@ static int recovery_work(PeakMpiCausalService *s, size_t budget, size_t *used) {
       Rank *a = &s->ranks[r];
       if (!good(s, r, peak_mpi_cost_model_seal(s->model, a->continuation)))
         return 1;
-      peak_mpi_cost_model_reset_base(s->model, r, a->last_L, a->last_P);
+      peak_mpi_cost_model_reset_base(s->model, r, a->last_A, a->last_P);
       peak_mpi_policy_recover_begin(a->policy, s->now, s->recovery_g);
       s->recovery_reset = 12;
     } else {

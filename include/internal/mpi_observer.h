@@ -70,7 +70,8 @@ enum {
     PEAK_MPI_OBSERVER_SLACK_S1 = 1u << 1,
     PEAK_MPI_OBSERVER_SLACK_SINGLE_FLOW = 1u << 2,
     PEAK_MPI_OBSERVER_SLACK_NO_OPEN_PROGRESS = 1u << 3,
-    PEAK_MPI_OBSERVER_CANCELLED = 1u << 4
+    PEAK_MPI_OBSERVER_CANCELLED = 1u << 4,
+    PEAK_MPI_OBSERVER_APP_COST_KNOWN = 1u << 24
 };
 
 typedef struct {
@@ -82,7 +83,8 @@ typedef struct {
     int32_t peer, tag, root, actual_source, actual_tag, mpi_error;
     uint32_t kind, operation, phase, flags, progress_scope;
     uint32_t partition, completion_index, completion_count;
-    uint64_t reserved[4];
+    uint64_t A_cut; /* Billable application cost; valid only with APP_COST_KNOWN. */
+    uint64_t reserved[3];
 } PeakMpiObserverRecord;
 
 typedef struct {

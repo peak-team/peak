@@ -75,7 +75,8 @@ static double clock_seconds(void) {
   return t.tv_sec + t.tv_nsec * 1e-9;
 }
 static uint64_t ns(double x) {
-  return x > 0 && x < (double)UINT64_MAX * 1e-9 ? (uint64_t)(x * 1e9) : 0;
+  double scaled = x * 1e9;
+  return x > 0 && scaled < (double)UINT64_MAX ? (uint64_t)scaled : 0;
 }
 static int parse_unsigned(const char *value, uint64_t maximum,
                           uint64_t *result) {
@@ -222,7 +223,9 @@ int peak_mpi_causal_runtime_prepare(size_t n, double q, double hb, double ema) {
   PeakMpiObserver *calibration = peak_mpi_observer_create(&calibration_config);
   if (calibration) {
     PeakMpiObserverProducer writer;
-    PeakMpiObserverRecord record = {.kind = PEAK_MPI_OBSERVER_EVENT_START, .op_uid = 1};
+    PeakMpiObserverRecord record = {.kind = PEAK_MPI_OBSERVER_EVENT_START,
+                                    .op_uid = 1,
+                                    .flags = PEAK_MPI_CAUSAL_APP_COST_KNOWN};
     peak_mpi_observer_activate(calibration);
     if (peak_mpi_observer_claim(calibration, 0, 1, 1, &writer) ==
         PEAK_MPI_OBSERVER_OK) {
@@ -300,16 +303,51 @@ static int get_producer(void) {
   producer_valid = 1;
   return 1;
 }
+static int cost_component_ns(double value, uint64_t *out) {
+  double scaled = value * 1e9;
+  if (!isfinite(value) || value < 0 || !isfinite(scaled) || scaled >= (double)UINT64_MAX)
+    return 0;
+  *out = (uint64_t)scaled;
+  return 1;
+}
+static int cost_add_component(uint64_t *sum, double value) {
+  uint64_t part;
+  if (!cost_component_ns(value, &part) || part > UINT64_MAX - *sum)
+    return 0;
+  *sum += part;
+  return 1;
+}
+void peak_mpi_causal_runtime_cost_now(PeakMpiCausalCostSnapshot *s) {
+  memset(s, 0, sizeof *s);
+  peak_mpi_causal_cost_read(&s->P, &s->producer_observer);
+  s->control = atomic_load_explicit(&control_cost, memory_order_relaxed);
+  s->heartbeat = atomic_load_explicit(&management_cost, memory_order_relaxed);
+  peak_mpi_causal_listener_actual_costs(&s->control, &s->heartbeat,
+                                       &s->control_generation);
+  atomic_store_explicit(&control_generation, s->control_generation, memory_order_relaxed);
+  s->startup = startup;
+  s->A = s->P + s->producer_observer + s->startup + s->control;
+  s->L = s->A + s->heartbeat;
+  s->app_cost_known = cost_component_ns(s->P, &s->cut.P_ns);
+  s->cut.A_ns = s->cut.P_ns;
+  s->app_cost_known = s->app_cost_known &&
+      cost_add_component(&s->cut.A_ns, s->producer_observer) &&
+      cost_add_component(&s->cut.A_ns, s->startup) &&
+      cost_add_component(&s->cut.A_ns, s->control);
+  s->cut.L_ns = s->cut.A_ns;
+  s->app_cost_known = s->app_cost_known &&
+      cost_add_component(&s->cut.L_ns, s->heartbeat);
+  if (!s->app_cost_known)
+    peak_mpi_causal_runtime_fail(PEAK_MPI_OBSERVER_REASON_INVALID_COST);
+}
+void peak_mpi_causal_runtime_cost_components(double *L, double *P, double *A) {
+  PeakMpiCausalCostSnapshot s;
+  peak_mpi_causal_runtime_cost_now(&s);
+  *L = s.L; *P = s.P; *A = s.A;
+}
 void peak_mpi_causal_runtime_cost_snapshot(double *L, double *P) {
-  double p = 0, o = 0;
-  peak_mpi_causal_cost_read(&p, &o);
-  double C = atomic_load_explicit(&control_cost, memory_order_relaxed),
-         M = atomic_load_explicit(&management_cost, memory_order_relaxed);
-  uint64_t generation = 0;
-  peak_mpi_causal_listener_actual_costs(&C, &M, &generation);
-  atomic_store_explicit(&control_generation, generation, memory_order_relaxed);
-  *P = p;
-  *L = p + o + startup + C + M;
+  double A;
+  peak_mpi_causal_runtime_cost_components(L, P, &A);
 }
 void peak_mpi_causal_runtime_boundary(PeakMpiObserverRecord *r) {
   if (!get_producer())
@@ -318,10 +356,13 @@ void peak_mpi_causal_runtime_boundary(PeakMpiObserverRecord *r) {
       producer.slot,
       boundary_price +
           boundary_slot_price * (double)peak_mpi_causal_cost_used_slots());
-  double L, P;
-  peak_mpi_causal_runtime_cost_snapshot(&L, &P);
-  r->P_cut = ns(P);
-  r->L_cut = r->P_cut + ns(L - P);
+  PeakMpiCausalCostSnapshot cost;
+  peak_mpi_causal_runtime_cost_now(&cost);
+  r->P_cut = cost.app_cost_known ? cost.cut.P_ns : ns(cost.P);
+  r->A_cut = cost.app_cost_known ? cost.cut.A_ns : ns(cost.L);
+  r->L_cut = cost.app_cost_known ? cost.cut.L_ns : ns(cost.L);
+  if (cost.app_cost_known) r->flags |= PEAK_MPI_CAUSAL_APP_COST_KNOWN;
+  else r->flags &= ~PEAK_MPI_CAUSAL_APP_COST_KNOWN;
   r->control_generation =
       atomic_load_explicit(&control_generation, memory_order_relaxed);
   if (r->phase == PEAK_MPI_CAUSAL_GROUP_BEGIN ||
@@ -479,7 +520,11 @@ static void freeze_raw(PeakMpiCausalRaw *raw) {
       raw->lost_events += state.lost;
     }
   }
-  peak_mpi_causal_runtime_cost_snapshot(&raw->L, &raw->P);
+  PeakMpiCausalCostSnapshot cost;
+  peak_mpi_causal_runtime_cost_now(&cost);
+  raw->L = cost.L; raw->P = cost.P; raw->A = cost.A;
+  raw->cut = cost.cut;
+  raw->app_cost_known = cost.app_cost_known;
   raw->control_generation =
       atomic_load_explicit(&control_generation, memory_order_relaxed);
   raw->elapsed = clock_seconds() - origin;
@@ -575,7 +620,7 @@ void peak_mpi_causal_runtime_tick(double now, double elapsed, double C,
   } else if (raw.recovery.loss && raw.recovery.state != PEAK_MPI_RECOVERY_ACK) {
     (void)peak_mpi_causal_events_recovery(&raw.recovery);
   }
-  double L = raw.L;
+  double A = raw.A;
 
   peak_mpi_causal_service_tick(service, capture, &raw, now, effective_byte_budget, observer_work_budget);
   PeakMpiPolicyReason service_fault =
@@ -602,7 +647,10 @@ void peak_mpi_causal_runtime_tick(double now, double elapsed, double C,
         PeakMpiCausalRecovery candidate = f.recovery;
         atomic_store_explicit(&fine_paused, 1, memory_order_release);
         if (peak_mpi_causal_events_recovery(&candidate)) {
-          peak_mpi_causal_runtime_cost_snapshot(&candidate.L, &candidate.P);
+          PeakMpiCausalCostSnapshot cost;
+          peak_mpi_causal_runtime_cost_now(&cost);
+          candidate.L = cost.L; candidate.P = cost.P; candidate.A = cost.A;
+          candidate.cut = cost.cut; candidate.app_cost_known = cost.app_cost_known;
           candidate.elapsed = clock_seconds() - origin;
           for (size_t i = 0; i < slots; i++) {
             PeakMpiObserverSlotState st;
@@ -646,11 +694,12 @@ void peak_mpi_causal_runtime_tick(double now, double elapsed, double C,
             : PEAK_MPI_POLICY_EVENT_LOSS,
         now);
   latch_capture_coarse();
-  if (peak_mpi_policy_receiver_snapshot(&receiver, now, raw.elapsed, L, 0,
-                                        &last_decision) == PEAK_MPI_POLICY_OK) {
+  if ((raw.app_cost_known
+           ? peak_mpi_policy_receiver_snapshot_cut(&receiver, now, raw.elapsed, raw.cut, 0, &last_decision)
+           : peak_mpi_policy_receiver_snapshot(&receiver, now, raw.elapsed, raw.L, 0, &last_decision)) == PEAK_MPI_POLICY_OK) {
     double dt = previous_tick ? fmax(0, now - previous_tick) : 0;
     mode_seconds[last_decision.mode] += dt;
-    if (L > policy.q * raw.elapsed)
+    if (A > policy.q * raw.elapsed)
       exceeded_seconds += dt;
     if (receiver.have_feedback &&
         isfinite(last_decision.feedback_age_seconds) &&
@@ -674,11 +723,11 @@ int peak_mpi_causal_runtime_decision(double now, double elapsed,
   if (!peak_mpi_causal_runtime_enabled() ||
       !atomic_load_explicit(&active, memory_order_relaxed))
     return 0;
-  double L, P;
-  peak_mpi_causal_runtime_cost_snapshot(&L, &P);
-  (void)P;
-  return peak_mpi_policy_receiver_snapshot(&receiver, now, elapsed, L, headroom,
-                                           d) == PEAK_MPI_POLICY_OK;
+  PeakMpiCausalCostSnapshot cost;
+  peak_mpi_causal_runtime_cost_now(&cost);
+  return (cost.app_cost_known
+      ? peak_mpi_policy_receiver_snapshot_cut(&receiver, now, elapsed, cost.cut, headroom, d)
+      : peak_mpi_policy_receiver_snapshot(&receiver, now, elapsed, cost.L, headroom, d)) == PEAK_MPI_POLICY_OK;
 }
 void peak_mpi_causal_runtime_report(void) {
   if (!peak_mpi_causal_runtime_enabled())
@@ -724,26 +773,27 @@ void peak_mpi_causal_runtime_report(void) {
       lost_local += state.lost;
     }
   }
-  double L, P;
-  peak_mpi_causal_runtime_cost_snapshot(&L, &P);
-  double priced_profile = 0, producer_observer = 0;
-  peak_mpi_causal_cost_read(&priced_profile, &producer_observer);
-  double actual_control =
-      atomic_load_explicit(&control_cost, memory_order_relaxed);
-  double actual_management =
-      atomic_load_explicit(&management_cost, memory_order_relaxed);
-  uint64_t actual_generation = 0;
-  peak_mpi_causal_listener_actual_costs(&actual_control, &actual_management,
-                                        &actual_generation);
+  PeakMpiCausalCostSnapshot cost;
+  peak_mpi_causal_runtime_cost_now(&cost);
+  double L = cost.L, P = cost.P, A = cost.A;
+  double priced_profile = cost.P, producer_observer = cost.producer_observer;
+  double actual_control = cost.control, actual_management = cost.heartbeat;
   fprintf(stderr,
           "[peak mpi causal cost] rank=%d profile_seconds=%.12g "
           "control_seconds=%.12g management_seconds=%.12g "
-          "producer_observer_seconds=%.12g startup_seconds=%.12g L=%.12g\n",
+          "producer_observer_seconds=%.12g startup_seconds=%.12g L=%.12g app_cost=%.12g excluded_heartbeat=%.12g\n",
           rank_id, priced_profile, actual_control, actual_management,
-          producer_observer, startup, L);
-  peak_mpi_policy_receiver_snapshot(&receiver, clock_seconds(),
-                                    clock_seconds() - origin, L, 0,
-                                    &last_decision);
+          producer_observer, startup, L, A, actual_management);
+  fprintf(stderr,
+          "[peak mpi causal app_cost] rank=%d known=%d A_cut=%.12g latest_A=%.12g received_app_sum=%.12g received_raw_sum=%.12g billable_risk=%.12g\n",
+          rank_id, last_feedback.app_cost_known, last_feedback.A_cut, last_feedback.local_latest_A,
+          last_feedback.received_app_sum, last_feedback.received_raw_sum,
+          last_feedback.risk);
+  if (cost.app_cost_known)
+    peak_mpi_policy_receiver_snapshot_cut(&receiver, clock_seconds(), clock_seconds() - origin,
+                                          cost.cut, 0, &last_decision);
+  else peak_mpi_policy_receiver_snapshot(&receiver, clock_seconds(), clock_seconds() - origin,
+                                          L, 0, &last_decision);
   double age_p50 = NAN, age_p95 = NAN, age_p99 = NAN;
   uint64_t cumulative = 0;
   for (unsigned bucket = 0; bucket < 64; bucket++) {
@@ -817,11 +867,19 @@ void peak_mpi_causal_runtime_finalize(void) {
     finalizing = 1;
     peak_mpi_causal_events_finalize_begin();
     double now = clock_seconds();
+    struct timespec cpu_begin, cpu_end;
+    int have_cpu_begin = clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_begin) == 0;
     peak_mpi_causal_runtime_tick(
         now, now - origin,
         atomic_load_explicit(&control_cost, memory_order_relaxed),
         atomic_load_explicit(&management_cost, memory_order_relaxed),
         atomic_load_explicit(&control_generation, memory_order_relaxed));
+    /* This bounded drain executes synchronously on the finalizing caller.
+     * The original PMPI_Finalize duration is outside this measured interval. */
+    if (have_cpu_begin && clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_end) == 0)
+      peak_mpi_causal_runtime_observer_cost(
+          (double)(cpu_end.tv_sec - cpu_begin.tv_sec) +
+          (double)(cpu_end.tv_nsec - cpu_begin.tv_nsec) * 1e-9);
     peak_mpi_causal_runtime_report();
   }
 }

@@ -63,6 +63,15 @@ int peak_mpi_causal_runtime_decision(double now, double elapsed,
                                      double existing_local_headroom,
                                      PeakMpiPolicyDecision *decision);
 void peak_mpi_causal_runtime_cost_snapshot(double *L, double *P);
+/* One component read supplies both raw diagnostics and authoritative cuts. */
+typedef struct {
+  double L, P, A, producer_observer, startup, control, heartbeat;
+  uint64_t control_generation;
+  PeakMpiCostCut cut;
+  int app_cost_known;
+} PeakMpiCausalCostSnapshot;
+void peak_mpi_causal_runtime_cost_now(PeakMpiCausalCostSnapshot *);
+void peak_mpi_causal_runtime_cost_components(double *L, double *P, double *A);
 void peak_mpi_causal_runtime_report(void);
 #else
 static inline void peak_mpi_causal_profile_call(size_t slot) { (void)slot; }

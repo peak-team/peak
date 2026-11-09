@@ -41,6 +41,9 @@ typedef struct {
   /* Frozen producer prefixes at this raw cut; ownership remains with caller. */
   const uint64_t *slot_prefixes;
   size_t slot_count;
+  double A;
+  int app_cost_known;
+  PeakMpiCostCut cut;
 } PeakMpiCausalRaw;
 
 typedef struct {

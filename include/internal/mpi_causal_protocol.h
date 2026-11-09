@@ -65,7 +65,8 @@ enum {
   PEAK_MPI_CAUSAL_STATUS_ONLY = 1u << 19,
   PEAK_MPI_CAUSAL_RECLAIMED = 1u << 20,
   PEAK_MPI_CAUSAL_VARIABLE_COUNT = 1u << 21,
-  PEAK_MPI_CAUSAL_LEGACY_INPUT = 1u << 22
+  PEAK_MPI_CAUSAL_LEGACY_INPUT = 1u << 22,
+  PEAK_MPI_CAUSAL_APP_COST_KNOWN = PEAK_MPI_OBSERVER_APP_COST_KNOWN
 };
 #define PEAK_MPI_CAUSAL_CUT_PRECAPTURED UINT32_C(0x80000000)
 #define PEAK_MPI_CAUSAL_ANY_SOURCE (-1)
@@ -118,8 +119,12 @@ typedef struct {
  * receive source/tag at BEGIN; END actual_source/actual_tag are the received
  * status. Collective ordinal is per-context MPI call order. Definitions name
  * local communicator UIDs and lineage; equal member lists do not identify a
- * context. P/L are supplied by runtime_submit in its fixed cost unit, not this
- * frontend.
+ * context. P/L/A are supplied by runtime_submit in its fixed cost unit, not this
+ * frontend. APP_COST_KNOWN distinguishes a valid zero A from absent legacy
+ * metadata, whose conservative application cost remains raw L.
  */
 
+static inline uint64_t peak_mpi_causal_record_app_cost(const PeakMpiObserverRecord *r) {
+  return r->flags & PEAK_MPI_CAUSAL_APP_COST_KNOWN ? r->A_cut : r->L_cut;
+}
 #endif /* PEAK_MPI_CAUSAL_PROTOCOL_H */

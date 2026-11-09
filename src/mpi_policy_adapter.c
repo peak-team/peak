@@ -9,6 +9,8 @@ typedef struct {
     PeakMpiPolicyMemberId id;
     PeakMpiPolicySample raw, covered;
     double raw_received_at, baseline_P;
+    uint64_t baseline_P_ns;
+    int baseline_cut_known;
     uint64_t baseline_control_generation, seen;
     int have_raw, have_covered;
 } Member;
@@ -82,18 +84,41 @@ static int config_valid(const PeakMpiPolicyConfig *c) {
 static int clock_valid(double now, double previous) {
     return nonnegative(now) && now >= previous;
 }
+static double sample_app(const PeakMpiPolicySample *s) {
+    return s->app_cost_known ? peak_mpi_cost_cut_seconds(s->cut.A_ns) : s->L;
+}
+static double feedback_app_cut(const PeakMpiPolicyFeedback *f) {
+    return f->app_cost_known ? f->A_cut : f->L_cut;
+}
+static double feedback_latest_app(const PeakMpiPolicyFeedback *f) {
+    return f->app_cost_known ? f->local_latest_A : f->local_latest_L;
+}
 static int sample_valid(const PeakMpiPolicySample *s) {
-    return s && nonnegative(s->L) && nonnegative(s->P) && s->P <= s->L &&
+    return s && nonnegative(s->L) && nonnegative(s->P) && s->P <= s->L && (!s->app_cost_known ||
+        peak_mpi_cost_cut_valid(s->cut, s->P, s->A, s->L)) &&
         nonnegative(s->D) && nonnegative(s->elapsed) && nonnegative(s->age_seconds);
 }
 static int raw_equal(const PeakMpiPolicySample *a, const PeakMpiPolicySample *b) {
-    return a->event_cut == b->event_cut && a->L == b->L && a->P == b->P &&
+    return a->event_cut == b->event_cut && a->L == b->L && sample_app(a) == sample_app(b) &&
+        (!(a->app_cost_known && b->app_cost_known) || a->A == b->A) &&
+        (!(a->app_cost_known && b->app_cost_known) ||
+         (a->cut.P_ns == b->cut.P_ns && a->cut.A_ns == b->cut.A_ns && a->cut.L_ns == b->cut.L_ns)) && a->P == b->P &&
         a->elapsed == b->elapsed && a->control_generation == b->control_generation;
 }
 static int follows(const PeakMpiPolicySample *a, const PeakMpiPolicySample *b) {
-    return a->event_cut >= b->event_cut && a->L >= b->L && a->P >= b->P &&
+    int cost_follows = a->app_cost_known && b->app_cost_known
+        ? a->cut.P_ns >= b->cut.P_ns && a->cut.A_ns >= b->cut.A_ns &&
+          a->cut.L_ns >= b->cut.L_ns &&
+          a->cut.P_ns-b->cut.P_ns <= a->cut.A_ns-b->cut.A_ns
+        : a->L >= b->L && a->P >= b->P;
+    return cost_follows && a->event_cut >= b->event_cut &&
         a->elapsed >= b->elapsed && a->control_generation >= b->control_generation;
 }
+static int raw_follows(const PeakMpiPolicySample *a, const PeakMpiPolicySample *b) {
+    return a->L >= b->L && a->P >= b->P &&
+        (!(a->app_cost_known && b->app_cost_known) || a->A >= b->A) && follows(a,b);
+}
+
 static int bump(PeakMpiPolicy *p) {
     if (p->revision == UINT64_MAX) {
         p->generation_exhausted = 1; p->membership_complete = 0;
@@ -132,8 +157,8 @@ static void make_stale(PeakMpiPolicy *p) {
 static int raw_stream_compatible(const Member *m, const PeakMpiPolicySample *s) {
     if (!m->have_raw) return 1;
     if (s->generation == m->raw.generation) return raw_equal(s, &m->raw);
-    if (s->generation > m->raw.generation) return follows(s, &m->raw);
-    return follows(&m->raw, s);
+    if (s->generation > m->raw.generation) return raw_follows(s, &m->raw);
+    return raw_follows(&m->raw, s);
 }
 static int apply_raw(Member *m, const PeakMpiPolicySample *s, double now) {
     if (m->have_raw && s->generation <= m->raw.generation) return 0;
@@ -306,7 +331,10 @@ PeakMpiPolicyResult peak_mpi_policy_submit_cut(PeakMpiPolicy *p,
                 double amplitude = 0;
                 for (size_t i=0; i<c->sample_count; ++i) {
                     const Member *m = &p->members[p->scratch[i]];
-                    amplitude = maximum(amplitude, c->samples[i].P-m->baseline_P);
+                    double delta = c->samples[i].app_cost_known && m->baseline_cut_known
+                        ? peak_mpi_cost_cut_seconds(c->samples[i].cut.P_ns-m->baseline_P_ns)
+                        : c->samples[i].P-m->baseline_P;
+                    amplitude = maximum(amplitude, delta);
                 }
                 if (amplitude > 0) {
                     double sample = clamp_g(maximum(0, c->F-p->baseline_F)/amplitude, p->count);
@@ -318,6 +346,8 @@ PeakMpiPolicyResult peak_mpi_policy_submit_cut(PeakMpiPolicy *p,
             for (size_t i=0; i<c->sample_count; ++i) {
                 Member *m = &p->members[p->scratch[i]];
                 m->baseline_P = c->samples[i].P;
+                m->baseline_P_ns = c->samples[i].cut.P_ns;
+                m->baseline_cut_known = c->samples[i].app_cost_known;
                 m->baseline_control_generation = c->samples[i].control_generation;
             }
         }
@@ -427,6 +457,7 @@ static PeakMpiPolicyResult feedback_common(PeakMpiPolicy *p, double now,
     f->age_seconds = maximum(f->age_seconds, pressure_age(p, now));
     f->T_safe = INFINITY;
     double coarse_sum = 0;
+    f->app_cost_known = 1;
     for (size_t i=0; i<p->count; ++i) {
         const Member *m = &p->members[i];
         if (p->have_cut && m->have_raw && m->have_covered && m->raw.elapsed > m->covered.elapsed) {
@@ -438,10 +469,20 @@ static PeakMpiPolicyResult feedback_common(PeakMpiPolicy *p, double now,
             f->received_raw_sum += maximum(m->have_raw ? m->raw.L : 0,
                 m->have_covered ? m->covered.L : 0);
         else f->received_raw_complete = f->tails_complete = 0;
+        if (m->have_raw || m->have_covered)
+            f->received_app_sum += maximum(m->have_raw ? sample_app(&m->raw) : 0,
+                m->have_covered ? sample_app(&m->covered) : 0);
+        if ((m->have_raw && !m->raw.app_cost_known) ||
+            (m->have_covered && !m->covered.app_cost_known)) f->app_cost_known = 0;
         if (!m->have_covered) { f->risk_known = f->tails_complete = 0; continue; }
-        coarse_sum += m->covered.L; f->T_safe = minimum(f->T_safe, m->covered.elapsed);
-        if (m->have_raw && m->raw.L > m->covered.L)
-            f->U_tail += m->raw.L-m->covered.L;
+        coarse_sum += sample_app(&m->covered); f->T_safe = minimum(f->T_safe, m->covered.elapsed);
+        if (m->have_raw) {
+            if (m->raw.app_cost_known && m->covered.app_cost_known) {
+                if (m->raw.cut.A_ns > m->covered.cut.A_ns)
+                    f->U_tail += peak_mpi_cost_cut_seconds(m->raw.cut.A_ns-m->covered.cut.A_ns);
+            } else if (sample_app(&m->raw) > sample_app(&m->covered))
+                f->U_tail += sample_app(&m->raw)-sample_app(&m->covered);
+        }
     }
     if (!isfinite(f->T_safe)) { f->T_safe = 0; f->risk_known = 0; }
     /* Fold tick's age transition into this scan; batch admission therefore
@@ -459,7 +500,7 @@ static PeakMpiPolicyResult feedback_common(PeakMpiPolicy *p, double now,
             maximum(p->g, (double)(p->count_hint ? p->count_hint : 1));
     f->rate_baseline_valid = p->baseline_valid;
     f->risk = p->mode == PEAK_MPI_POLICY_COARSE ? coarse_sum : p->F;
-    if (!isfinite(f->received_raw_sum) || !isfinite(coarse_sum) || !isfinite(f->U_tail)) {
+    if (!isfinite(f->received_app_sum) || !isfinite(f->received_raw_sum) || !isfinite(coarse_sum) || !isfinite(f->U_tail)) {
         coarse(p, PEAK_MPI_POLICY_RESOURCE_LIMIT); (void)bump(p);
         f->mode = p->mode; f->reason = p->reason; f->g = p->g; f->generation = p->revision;
         f->risk_known = f->tails_complete = f->received_raw_complete = 0;
@@ -475,10 +516,18 @@ static void feedback_member(const Member *m, const PeakMpiPolicyFeedback *common
     f->member = m->id;
     if (m->have_covered) {
         f->event_cut = m->covered.event_cut; f->control_generation = m->covered.control_generation;
-        f->L_cut = m->covered.L; f->P_cut = m->covered.P; f->D_cut = m->covered.D;
+        f->cut = m->covered.cut;
+        f->L_cut = m->covered.app_cost_known ? peak_mpi_cost_cut_seconds(m->covered.cut.L_ns) : m->covered.L;
+        f->A_cut = sample_app(&m->covered);
+        f->P_cut = m->covered.app_cost_known ? peak_mpi_cost_cut_seconds(m->covered.cut.P_ns) : m->covered.P; f->D_cut = m->covered.D;
         f->local_elapsed_at_cut = m->covered.elapsed;
     }
     f->local_latest_L = maximum(m->have_raw ? m->raw.L : 0, f->L_cut);
+    f->local_latest_A = maximum(m->have_raw ? sample_app(&m->raw) : 0, f->A_cut);
+    f->local_latest_A_ns = m->have_raw && m->raw.cut.A_ns > f->cut.A_ns
+        ? m->raw.cut.A_ns : f->cut.A_ns;
+    f->local_latest_L_ns = m->have_raw && m->raw.cut.L_ns > f->cut.L_ns
+        ? m->raw.cut.L_ns : f->cut.L_ns;
 }
 
 PeakMpiPolicyResult peak_mpi_policy_feedback(PeakMpiPolicy *p,
@@ -537,7 +586,13 @@ static int feedback_valid(const PeakMpiPolicyFeedback *f) {
           (!f->membership_complete || f->mode != PEAK_MPI_POLICY_STALE ||
            f->g == (double)f->member_count) &&
           nonnegative(f->L_cut) && nonnegative(f->P_cut) &&
-          f->P_cut <= f->L_cut && nonnegative(f->D_cut) &&
+          f->P_cut <= f->L_cut && (!f->app_cost_known ||
+          (peak_mpi_cost_cut_valid(f->cut, f->P_cut, f->A_cut, f->L_cut) &&
+           f->local_latest_A_ns >= f->cut.A_ns &&
+           f->local_latest_L_ns >= f->cut.L_ns && f->local_latest_A_ns <= f->local_latest_L_ns &&
+           f->local_latest_A == peak_mpi_cost_cut_seconds(f->local_latest_A_ns) &&
+           nonnegative(f->local_latest_A) && f->local_latest_A >= f->A_cut &&
+           nonnegative(f->received_app_sum))) && nonnegative(f->D_cut) &&
           nonnegative(f->local_elapsed_at_cut) && nonnegative(f->F) &&
           nonnegative(f->risk) && nonnegative(f->U_tail) &&
           nonnegative(f->T_safe) && nonnegative(f->local_latest_L) &&
@@ -616,8 +671,14 @@ PeakMpiPolicyResult peak_mpi_policy_receiver_accept(PeakMpiPolicyReceiver *r,
     if (!feedback_valid(f) || f->q != r->config.q ||
         f->policy_generation < r->config.policy_generation ||
         (r->have_history && (f->event_cut < r->feedback.event_cut ||
-         f->L_cut < r->feedback.L_cut || f->P_cut < r->feedback.P_cut ||
-         f->local_latest_L < r->feedback.local_latest_L ||
+         (f->app_cost_known && r->feedback.app_cost_known &&
+          (f->cut.P_ns < r->feedback.cut.P_ns || f->cut.A_ns < r->feedback.cut.A_ns ||
+           f->cut.L_ns < r->feedback.cut.L_ns || f->local_latest_A_ns < r->feedback.local_latest_A_ns ||
+           f->local_latest_L_ns < r->feedback.local_latest_L_ns ||
+           f->cut.P_ns-r->feedback.cut.P_ns > f->cut.A_ns-r->feedback.cut.A_ns)) ||
+         (!(f->app_cost_known && r->feedback.app_cost_known) &&
+          (f->L_cut < r->feedback.L_cut || f->P_cut < r->feedback.P_cut ||
+           f->local_latest_L < r->feedback.local_latest_L)) ||
          f->local_elapsed_at_cut < r->feedback.local_elapsed_at_cut ||
          f->control_generation < r->feedback.control_generation ||
          f->policy_generation < r->feedback.policy_generation))) {
@@ -671,10 +732,11 @@ PeakMpiPolicyResult peak_mpi_policy_receiver_mark_coarse(PeakMpiPolicyReceiver *
     return PEAK_MPI_POLICY_OK;
 }
 
-PeakMpiPolicyResult peak_mpi_policy_receiver_snapshot(PeakMpiPolicyReceiver *r,
-    double now, double elapsed, double L, double local_headroom, PeakMpiPolicyDecision *d) {
+static PeakMpiPolicyResult receiver_snapshot(PeakMpiPolicyReceiver *r,
+    double now, double elapsed, double A, const PeakMpiCostCut *cut,
+    double local_headroom, PeakMpiPolicyDecision *d) {
     if (!r || !d || !clock_valid(now, r->last_now) || !nonnegative(elapsed) ||
-        !nonnegative(L) || !isfinite(local_headroom)) return PEAK_MPI_POLICY_INVALID;
+        !nonnegative(A) || !isfinite(local_headroom)) return PEAK_MPI_POLICY_INVALID;
     r->last_now = now; memset(d, 0, sizeof(*d));
     d->g = 1; d->mode = PEAK_MPI_POLICY_LOCAL; d->global_headroom = NAN;
     d->available_headroom = local_headroom;
@@ -687,15 +749,19 @@ PeakMpiPolicyResult peak_mpi_policy_receiver_snapshot(PeakMpiPolicyReceiver *r,
         double age = r->have_feedback ? maximum(age_add(f->age_seconds,now-r->received_at),
             local_cut_age) : now-r->created_at;
         d->feedback_age_seconds = maximum(0, age);
+        int cut_ordered = cut && f->app_cost_known
+            ? cut->A_ns >= f->cut.A_ns : A >= feedback_app_cut(f);
+        int latest_ordered = cut && f->app_cost_known
+            ? cut->A_ns >= f->local_latest_A_ns : A >= feedback_latest_app(f);
         int fresh = r->have_feedback && !r->feedback_invalid &&
-            elapsed >= f->local_elapsed_at_cut && L >= f->L_cut &&
+            elapsed >= f->local_elapsed_at_cut && cut_ordered &&
             age <= 3*r->config.heartbeat_max_seconds;
         d->mode = r->have_feedback ? f->mode : PEAK_MPI_POLICY_COMPLETE;
         d->reason = r->have_feedback ? f->reason : PEAK_MPI_POLICY_UNKNOWN_MEMBERS;
         if (r->permanent_coarse) {
             d->mode = PEAK_MPI_POLICY_COARSE; d->reason = r->coarse_reason;
         } else if (!fresh && (r->feedback_invalid ||
-            (r->have_feedback && (elapsed < f->local_elapsed_at_cut || L < f->L_cut)) ||
+            (r->have_feedback && (elapsed < f->local_elapsed_at_cut || !cut_ordered)) ||
             age > 3*r->config.heartbeat_max_seconds)) {
             d->mode = PEAK_MPI_POLICY_STALE; d->reason = PEAK_MPI_POLICY_FEEDBACK_OLD;
         }
@@ -714,8 +780,9 @@ PeakMpiPolicyResult peak_mpi_policy_receiver_snapshot(PeakMpiPolicyReceiver *r,
             d->mode != PEAK_MPI_POLICY_STALE && r->membership_complete &&
             f->coverage_complete && f->risk_known && f->tails_complete;
         if (r->have_feedback && (f->coverage_complete || f->approximate) &&
-            d->mode != PEAK_MPI_POLICY_COARSE && L >= f->L_cut)
-            d->local_D_estimate = f->D_cut+(L-f->L_cut);
+            d->mode != PEAK_MPI_POLICY_COARSE && cut_ordered)
+            d->local_D_estimate = f->D_cut + (cut && f->app_cost_known
+                ? peak_mpi_cost_cut_seconds(cut->A_ns-f->cut.A_ns) : A-feedback_app_cut(f));
         else d->local_D_estimate = NAN;
         if (!isfinite(d->local_D_estimate)) d->local_D_estimate = NAN;
         if (fresh && matching_mode && !r->permanent_coarse &&
@@ -728,8 +795,9 @@ PeakMpiPolicyResult peak_mpi_policy_receiver_snapshot(PeakMpiPolicyReceiver *r,
         /* A finer tuple received after permanent coarse cannot establish a
          * coarse raw-sum risk; wait for another explicitly coarse tuple. */
         if (d->global_available && matching_mode && f->risk_known && f->tails_complete &&
-            L >= f->local_latest_L && elapsed >= f->local_elapsed_at_cut) {
-            double extra = L-f->local_latest_L;
+            latest_ordered && elapsed >= f->local_elapsed_at_cut) {
+            double extra = cut && f->app_cost_known
+                ? peak_mpi_cost_cut_seconds(cut->A_ns-f->local_latest_A_ns) : A-feedback_latest_app(f);
             double h = r->config.q*f->T_safe-f->risk-f->U_tail-extra;
             if (isfinite(h)) {
                 d->global_headroom = h; d->available_headroom = minimum(local_headroom, h);
@@ -742,4 +810,14 @@ PeakMpiPolicyResult peak_mpi_policy_receiver_snapshot(PeakMpiPolicyReceiver *r,
     d->detach_target = d->candidate_stop_target = d->cadence_target =
         d->reattach_future_rate_target = d->q_eff;
     return PEAK_MPI_POLICY_OK;
+}
+
+PeakMpiPolicyResult peak_mpi_policy_receiver_snapshot(PeakMpiPolicyReceiver *r,
+    double now, double elapsed, double A, double headroom, PeakMpiPolicyDecision *d) {
+    return receiver_snapshot(r, now, elapsed, A, NULL, headroom, d);
+}
+PeakMpiPolicyResult peak_mpi_policy_receiver_snapshot_cut(PeakMpiPolicyReceiver *r,
+    double now, double elapsed, PeakMpiCostCut cut, double headroom, PeakMpiPolicyDecision *d) {
+    if (cut.P_ns > cut.A_ns || cut.A_ns > cut.L_ns) return PEAK_MPI_POLICY_INVALID;
+    return receiver_snapshot(r, now, elapsed, peak_mpi_cost_cut_seconds(cut.A_ns), &cut, headroom, d);
 }

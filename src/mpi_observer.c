@@ -281,13 +281,15 @@ PeakMpiObserverStatus peak_mpi_observer_emit(PeakMpiObserver *o,
     }
     ++seq;
     atomic_store_explicit(&s->last_attempt, seq, memory_order_relaxed);
-    if (r->P_cut > r->L_cut || r->kind < PEAK_MPI_OBSERVER_EVENT_START ||
+    if (r->P_cut > r->L_cut ||
+        ((r->flags & PEAK_MPI_OBSERVER_APP_COST_KNOWN) && (r->P_cut > r->A_cut || r->A_cut > r->L_cut)) || r->kind < PEAK_MPI_OBSERVER_EVENT_START ||
         r->kind > PEAK_MPI_OBSERVER_EVENT_BATCH_END ||
         ((r->kind == PEAK_MPI_OBSERVER_EVENT_START ||
           r->kind == PEAK_MPI_OBSERVER_EVENT_COMPLETE ||
           r->kind == PEAK_MPI_OBSERVER_EVENT_PROGRESS) && !r->op_uid)) {
         lose_record(s, seq);
-        fail_at(o, r->P_cut > r->L_cut ? PEAK_MPI_OBSERVER_REASON_INVALID_COST :
+        fail_at(o, (r->P_cut > r->L_cut || ((r->flags & PEAK_MPI_OBSERVER_APP_COST_KNOWN) &&
+                  (r->P_cut > r->A_cut || r->A_cut > r->L_cut))) ? PEAK_MPI_OBSERVER_REASON_INVALID_COST :
                 PEAK_MPI_OBSERVER_REASON_IDENTITY, p->slot, p->generation, seq);
         return PEAK_MPI_OBSERVER_BAD_ARGUMENT;
     }
