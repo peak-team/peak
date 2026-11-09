@@ -18,6 +18,9 @@ typedef struct {
   int color, size, parts, got;
   unsigned canonical;
   size_t offset;
+  unsigned member_context, member_owner;
+  int member_kind, member_complete, member_spare;
+  size_t member_offset, member_capacity;
 } Comm;
 typedef struct {
   unsigned parent, kind;
@@ -155,6 +158,7 @@ struct PeakMpiCausalService {
   unsigned *comm_ranks;
   size_t comm_count;
   int *members;
+  size_t members_used;
   Context *contexts;
   size_t context_count;
   PeakMpiPolicySample *samples;
@@ -409,6 +413,10 @@ static void buffer_release(PeakMpiCausalService *s, size_t slot) {
   s->free_buffer = slot;
 }
 static PeakMpiCostRef progress_input(PeakMpiCausalService *s, Operation *o) {
+  if ((o->end.flags & PEAK_MPI_OBSERVER_PROGRESS_ESTIMATED) &&
+      (o->begin.flags & PEAK_MPI_CAUSAL_NONBLOCKING) && !o->immediate &&
+      !o->result_defined)
+    return o->entry; /* Delivery estimate, not request completion. */
   if (o->buffer != SIZE_MAX)
     return s->buffers[o->buffer].seal;
   if (o->end.progress_scope == PEAK_MPI_OBSERVER_SCOPE_INTERVAL &&
@@ -509,12 +517,73 @@ static unsigned canonical(PeakMpiCausalService *s, unsigned rank, Comm *c) {
   *x = (Context){parent, c->kind, c->ordinal, c->color, c->size, self};
   return (unsigned)s->context_count;
 }
-/* WORLD membership is intrinsic; retain only unique-position receipts. */
-_Static_assert(sizeof(int) == sizeof(uint32_t), "WORLD receipt word size");
-static size_t comm_storage_words(unsigned kind, size_t size) {
-  return kind == PEAK_MPI_CAUSAL_COMM_WORLD
-             ? size / 32 + (size % 32 != 0)
-             : size;
+/* Membership and local receipt state are separate from communication context.
+ * Lists become immutable after one binding has validated every position. */
+_Static_assert(sizeof(int) == sizeof(uint32_t), "membership receipt word size");
+static size_t member_root(PeakMpiCausalService *s, size_t i) {
+  while (s->comms[i].member_owner != i)
+    i = s->comms[i].member_owner;
+  return i;
+}
+static int member_value(PeakMpiCausalService *s, size_t i, size_t position) {
+  Comm *c = &s->comms[member_root(s, i)];
+  if (c->member_kind == PEAK_MPI_CAUSAL_COMM_WORLD)
+    return (int)position;
+  if (c->member_kind == PEAK_MPI_CAUSAL_COMM_SELF)
+    return (int)s->comm_ranks[c - s->comms];
+  return s->members[c->member_offset + position];
+}
+static int member_space(PeakMpiCausalService *s, size_t words, size_t *off) {
+  size_t capacity = s->config.max_context_parts * 16;
+  if (words > capacity - s->members_used)
+    return 0;
+  *off = s->members_used;
+  s->members_used += words;
+  return 1;
+}
+static int member_list(PeakMpiCausalService *s, size_t i) {
+  Comm *c = &s->comms[i];
+  /* Only abandoned duplicate candidate buffers are reusable. Immutable lists
+   * and private receipt bitmaps are retained with their existing owners. */
+  for (size_t j = 0; j < i; ++j) {
+    Comm *old = &s->comms[j];
+    if (old->member_spare && old->member_capacity >= (size_t)c->size) {
+      c->member_offset = old->member_offset;
+      c->member_capacity = old->member_capacity;
+      old->member_capacity = 0;
+      old->member_spare = 0;
+      goto initialize;
+    }
+  }
+  if (!member_space(s, (size_t)c->size, &c->member_offset))
+    return 0;
+  c->member_capacity = (size_t)c->size;
+initialize:
+  for (int k = 0; k < c->size; ++k)
+    s->members[c->member_offset + (size_t)k] = -1;
+  return 1;
+}
+static void member_intern(PeakMpiCausalService *s, size_t i) {
+  size_t source = member_root(s, i);
+  Comm *c = &s->comms[source];
+  if (c->member_complete)
+    return;
+  c->member_complete = 1;
+  for (size_t j = 0; j < s->comm_count; ++j) {
+    if (j == source)
+      continue;
+    if (member_root(s, j) != j || !s->comms[j].member_complete ||
+        s->comms[j].size != c->size)
+      continue;
+    int equal = 1;
+    for (int k = 0; k < c->size && equal; ++k)
+      equal = member_value(s, source, (size_t)k) == member_value(s, j, (size_t)k);
+    if (equal) {
+      c->member_owner = (unsigned)j;
+      c->member_spare = c->member_capacity != 0;
+      return;
+    }
+  }
 }
 int peak_mpi_causal_service_ingest_object(PeakMpiCausalService *s, unsigned r,
                                           uint64_t inc,
@@ -536,7 +605,8 @@ int peak_mpi_causal_service_ingest_object(PeakMpiCausalService *s, unsigned r,
       p.member_offset > (unsigned)p.local_size ||
       p.member_count > (unsigned)p.local_size - p.member_offset ||
       (p.creation_kind == PEAK_MPI_CAUSAL_COMM_WORLD &&
-       p.local_size != (int)s->config.world_size)) {
+       p.local_size != (int)s->config.world_size) ||
+      (p.creation_kind == PEAK_MPI_CAUSAL_COMM_SELF && p.local_size != 1)) {
     coarse(s, r, PEAK_MPI_POLICY_BAD_IDENTITY, 0);
     return 1;
   }
@@ -545,37 +615,55 @@ int peak_mpi_causal_service_ingest_object(PeakMpiCausalService *s, unsigned r,
     if (s->comm_ranks[i] == r && s->comms[i].uid == p.local_uid)
       break;
   if (i == s->comm_count) {
-    size_t capacity = s->config.max_context_parts * 16;
-    size_t words = comm_storage_words(p.creation_kind, (size_t)p.local_size);
-    if (i >= s->config.max_context_parts || words > capacity) {
-      coarse(s, r, PEAK_MPI_POLICY_RESOURCE_LIMIT, 0);
-      return 1;
-    }
-    size_t off = 0;
-    for (size_t j = 0; j < i; j++) {
-      size_t stored = comm_storage_words(s->comms[j].kind,
-                                        (size_t)s->comms[j].size);
-      if (stored > capacity - off) {
-        coarse(s, r, PEAK_MPI_POLICY_RESOURCE_LIMIT, 0);
-        return 1;
-      }
-      off += stored;
-    }
-    if (words > capacity - off) {
+    if (i >= s->config.max_context_parts) {
       coarse(s, r, PEAK_MPI_POLICY_RESOURCE_LIMIT, 0);
       return 1;
     }
     s->comm_ranks[i] = r;
-    s->comms[i] =
-        (Comm){p.local_uid, p.parent_uid, p.creation_ordinal,   p.creation_kind,
-               p.color,     p.local_size, (int)obj->part_count, 0,
-               0,           off};
+    s->comms[i] = (Comm){.uid = p.local_uid, .parent = p.parent_uid,
+        .ordinal = p.creation_ordinal, .kind = p.creation_kind, .color = p.color,
+        .size = p.local_size, .parts = (int)obj->part_count,
+        .member_owner = (unsigned)i};
+    Comm *created = &s->comms[i];
+    created->member_context = canonical(s, r, created);
+    size_t receipt_words = (size_t)p.local_size / 32 + (p.local_size % 32 != 0);
+    if (!member_space(s, receipt_words, &created->offset)) {
+      coarse(s, r, PEAK_MPI_POLICY_RESOURCE_LIMIT, 0);
+      return 1;
+    }
+    for (size_t j = 0; j < receipt_words; ++j)
+      s->members[created->offset + j] = 0;
     s->comm_count++;
-    for (size_t j = 0; j < words; j++)
-      s->members[off + j] = p.creation_kind == PEAK_MPI_CAUSAL_COMM_WORLD ? 0 : -1;
+    if (p.creation_kind == PEAK_MPI_CAUSAL_COMM_WORLD ||
+        p.creation_kind == PEAK_MPI_CAUSAL_COMM_SELF) {
+      created->member_kind = (int)p.creation_kind;
+      created->member_complete = 1;
+    } else {
+      size_t shared = SIZE_MAX;
+      for (size_t j = 0; j < i; ++j) {
+        Comm *old = &s->comms[j];
+        if (p.creation_kind == PEAK_MPI_CAUSAL_COMM_DUPLICATED &&
+            s->comm_ranks[j] == r && old->uid == p.parent_uid &&
+            old->got == old->size && old->canonical && old->size == p.local_size) {
+          shared = member_root(s, j);
+          break;
+        }
+        if (created->member_context &&
+            old->member_context == created->member_context && old->size == created->size)
+          shared = member_root(s, j);
+      }
+      if (shared != SIZE_MAX)
+        created->member_owner = (unsigned)shared;
+      else if (!member_list(s, i)) {
+        coarse(s, r, PEAK_MPI_POLICY_RESOURCE_LIMIT, 0);
+        return 1;
+      }
+    }
   }
   Comm *c = &s->comms[i];
-  if (c->kind != p.creation_kind || c->size != p.local_size) {
+  if (c->kind != p.creation_kind || c->size != p.local_size ||
+      c->parent != p.parent_uid || c->ordinal != p.creation_ordinal ||
+      c->color != p.color) {
     coarse(s, r, PEAK_MPI_POLICY_BAD_IDENTITY, 0);
     return 1;
   }
@@ -585,32 +673,31 @@ int peak_mpi_causal_service_ingest_object(PeakMpiCausalService *s, unsigned r,
       coarse(s, r, PEAK_MPI_POLICY_UNKNOWN_MEMBERS, 0);
       continue;
     }
-    if (c->kind == PEAK_MPI_CAUSAL_COMM_WORLD) {
-      unsigned position = p.member_offset + j;
-      if (v != (int)position) {
-        coarse(s, r, PEAK_MPI_POLICY_BAD_IDENTITY, 0);
-        continue;
-      }
-      uint32_t word;
-      int *dst = &s->members[c->offset + position / 32];
-      memcpy(&word, dst, sizeof word);
-      uint32_t mask = UINT32_C(1) << (position % 32);
-      if (!(word & mask)) {
-        word |= mask;
-        memcpy(dst, &word, sizeof word);
-        c->got++;
-      }
+    unsigned position = p.member_offset + j;
+    size_t owner = member_root(s, i);
+    Comm *membership = &s->comms[owner];
+    int expected = member_value(s, owner, position);
+    if (expected >= 0 && expected != v) {
+      coarse(s, r, PEAK_MPI_POLICY_BAD_IDENTITY, 0);
       continue;
     }
-    int *dst = &s->members[c->offset + p.member_offset + j];
-    if (*dst < 0) {
-      *dst = v;
+    if (expected < 0)
+      s->members[membership->member_offset + position] = v;
+    uint32_t word;
+    int *dst = &s->members[c->offset + position / 32];
+    memcpy(&word, dst, sizeof word);
+    uint32_t mask = UINT32_C(1) << (position % 32);
+    if (!(word & mask)) {
+      word |= mask;
+      memcpy(dst, &word, sizeof word);
       c->got++;
-    } else if (*dst != v)
-      coarse(s, r, PEAK_MPI_POLICY_BAD_IDENTITY, 0);
+    }
   }
-  if (c->got == c->size)
+  if (c->got == c->size) {
+    member_intern(s, i);
     c->canonical = canonical(s, r, c);
+    c->member_context = c->canonical;
+  }
   return 1;
 }
 static uint64_t prefix_sum(const uint64_t *prefix, size_t slots) {
@@ -1221,6 +1308,8 @@ static int parse_record(PeakMpiCausalService *s, unsigned r,
       }
     }
     if ((rec->flags & PEAK_MPI_CAUSAL_BUFFERED) &&
+        !(rec->flags & PEAK_MPI_OBSERVER_PROGRESS_ESTIMATED) &&
+        rec->capability_uid != PEAK_MPI_PROGRESS_INTEL_2021_11_ASYNC &&
         rec->progress_scope == PEAK_MPI_OBSERVER_SCOPE_INTERVAL) {
       BufferInterval *b = buffer_interval(s, r, rec->progress_begin, 1);
       if (b) {
@@ -1228,7 +1317,8 @@ static int parse_record(PeakMpiCausalService *s, unsigned r,
         ++b->references;
       }
     }
-    if (rec->capability_uid == PEAK_MPI_PROGRESS_INTEL_2021_11_OPX_ASYNC0_APPROX)
+    if ((rec->flags & PEAK_MPI_OBSERVER_PROGRESS_ESTIMATED) ||
+        rec->capability_uid == PEAK_MPI_PROGRESS_INTEL_2021_11_OPX_ASYNC0_APPROX)
       mark_progress_estimate(s, r);
     if (remote_op(rec) && !o->context)
       coarse(s, r, PEAK_MPI_POLICY_BAD_IDENTITY, 0);
@@ -1807,8 +1897,22 @@ static void matcher_work(PeakMpiCausalService *s, size_t budget) {
       if (x->buffer == SIZE_MAX &&
           x->end.progress_scope == PEAK_MPI_OBSERVER_SCOPE_INTERVAL &&
           (x->begin.flags & PEAK_MPI_CAUSAL_NONBLOCKING) && !x->immediate &&
-          !x->result_defined)
-        s->task_ready = 0;
+          !x->result_defined) {
+        if (!probe_op(o->begin.operation) &&
+            (x->begin.operation == PEAK_MPI_CAUSAL_SEND ||
+             (x->begin.operation == PEAK_MPI_CAUSAL_BSEND &&
+              (x->begin.flags & PEAK_MPI_OBSERVER_PROGRESS_ESTIMATED))) &&
+            (x->begin.capability_uid ==
+                 PEAK_MPI_PROGRESS_OMPI_5_0_5_UCX_1_17_RC_PROTO2_HOST_OBSERVED ||
+             x->begin.capability_uid ==
+                 PEAK_MPI_PROGRESS_INTEL_2021_11_OPX_ASYNC0_APPROX)) {
+          /* A consuming receive witnesses delivery, not native request
+           * completion or the end of unobservable progress responsibility. */
+          x->end.flags |= PEAK_MPI_OBSERVER_PROGRESS_ESTIMATED;
+          mark_progress_estimate(s, x->rank);
+        } else
+          s->task_ready = 0;
+      }
     } else if (s->task_stage == TASK_EARLIER) {
       if (s->task_cursor == SIZE_MAX && s->task_receive_class < 3) {
         s->task_cursor = s->task_receive_head[++s->task_receive_class];

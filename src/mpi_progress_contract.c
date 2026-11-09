@@ -191,9 +191,6 @@ int peak_mpi_progress_contract_supports(const PeakMpiProgressContract *c,
     return 0;
   int observed = c->progress_estimate || c->profile ==
                  PEAK_MPI_PROGRESS_OMPI_5_0_5_UCX_1_17_RC_PROTO2_HOST_OBSERVED;
-  if (c->progress_estimate && (op == PEAK_MPI_CAUSAL_BSEND ||
-                              (flags & PEAK_MPI_CAUSAL_BUFFERED)))
-    return 0;
   if (observed && (flags & PEAK_MPI_CAUSAL_VARIABLE_COUNT))
     return 0;
   switch (op) {
@@ -258,13 +255,21 @@ int peak_mpi_progress_contract_collective_allowed(
   }
   return 1;
 }
+int peak_mpi_progress_contract_estimated_delivery(
+    const PeakMpiProgressContract *c, PeakMpiCausalOperation op, unsigned flags) {
+  return peak_mpi_progress_contract_supports(c, op, flags) &&
+         (op == PEAK_MPI_CAUSAL_BSEND || (flags & PEAK_MPI_CAUSAL_BUFFERED)) &&
+         (c->progress_estimate || c->profile ==
+              PEAK_MPI_PROGRESS_OMPI_5_0_5_UCX_1_17_RC_PROTO2_HOST_OBSERVED);
+}
 unsigned peak_mpi_progress_contract_result_flags(
     const PeakMpiProgressContract *c, PeakMpiCausalOperation op, unsigned flags,
     int observed_completion, PeakMpiObserverProgressScope *scope) {
   *scope = PEAK_MPI_OBSERVER_SCOPE_UNKNOWN;
   if (!peak_mpi_progress_contract_supports(c, op, flags))
     return 0;
-  if (c->progress_estimate) {
+  if (c->progress_estimate ||
+      peak_mpi_progress_contract_estimated_delivery(c, op, flags)) {
     *scope = PEAK_MPI_OBSERVER_SCOPE_INTERVAL;
     return PEAK_MPI_OBSERVER_PROGRESS_ESTIMATED;
   }

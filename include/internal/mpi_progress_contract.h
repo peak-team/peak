@@ -41,6 +41,9 @@ peak_mpi_progress_contract_select_public(const char *version,
 int peak_mpi_progress_contract_collective_allowed(
     const PeakMpiProgressContract *, PeakMpiCausalOperation, unsigned flags,
     int size);
+/* Delivery estimates do not seal attached-buffer progress/resource lifetime. */
+int peak_mpi_progress_contract_estimated_delivery(
+    const PeakMpiProgressContract *, PeakMpiCausalOperation, unsigned flags);
 unsigned peak_mpi_progress_contract_result_flags(
     const PeakMpiProgressContract *, PeakMpiCausalOperation, unsigned flags,
     int observed_completion, PeakMpiObserverProgressScope *scope);

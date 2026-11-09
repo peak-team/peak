@@ -25,6 +25,9 @@ typedef struct {
 } Comm;
 typedef struct {
   MPI_Request handle;
+  uintptr_t storage; /* Address hint only; never dereferenced. */
+  unsigned registry_slot;
+  int selected; /* Reserved internal identity through one native call. */
   uint64_t graph_epoch;
   uint64_t uid, generation, activation, start_uid, comm_uid, ordinal,
       lineage_ordinal;
@@ -59,6 +62,7 @@ static _Thread_local unsigned depth;
 static _Thread_local int internal_previous, internal_active;
 static Context *contexts;
 static size_t context_count, request_capacity, completion_capacity;
+static size_t request_used; /* Occupied-prefix upper bound, under metadata. */
 static Request *completion_requests;
 static MPI_Status *completion_statuses;
 static Request *requests;
@@ -72,7 +76,8 @@ typedef struct {
   uint64_t ordinal, ticket;
 } RecoveryWitness;
 static RecoveryWitness recovery_witnesses[RECOVERY_COMM_CAP];
-static _Thread_local Context *current_call;
+static _Thread_local Context *current_call, *pending_requests;
+static void release_requests(const Request *snapshots, unsigned count);
 static void submit_event(PeakMpiObserverRecord *r, int actual) {
   if (current_call && current_call->observing &&
       (!current_call->capture_epoch ||
@@ -127,6 +132,11 @@ static int wrapper_enter(void) {
   return observe;
 }
 static void wrapper_leave(void) {
+  if (depth == 1 && pending_requests) {
+    release_requests(pending_requests->requests, pending_requests->count);
+    pending_requests->count = 0;
+    pending_requests = NULL;
+  }
   if (depth == 1 && internal_active) {
     peak_mpi_causal_runtime_internal_leave(internal_previous);
     internal_active = 0;
@@ -519,7 +529,8 @@ static Context *begin_call(PeakMpiCausalOperation op, const Comm *comm,
   r->tag = tag;
   r->root = root;
   r->flags = flags | ordered_caller;
-  if (contract.progress_estimate)
+  if (contract.progress_estimate ||
+      peak_mpi_progress_contract_estimated_delivery(&contract, op, flags))
     r->flags |= PEAK_MPI_OBSERVER_PROGRESS_ESTIMATED;
   r->capability_uid = (uint64_t)contract.profile;
   r->progress_scope = PEAK_MPI_OBSERVER_SCOPE_INTERVAL;
@@ -1136,63 +1147,123 @@ void peak_mpi_causal_events_finalize_begin(void) {
                             : MPI_ERR_OTHER;                                   \
   }
 
-static int request_index(MPI_Request handle) {
-  if (handle == MPI_REQUEST_NULL)
-    return -1;
-  size_t inspected = 0;
-  for (size_t i = 0; i < request_capacity; ++i) {
-    ++inspected;
-    if (requests[i].occupied && requests[i].handle == handle) {
-      peak_mpi_causal_runtime_observer_work(PEAK_MPI_CAUSAL_WORK_LOOKUP,
-                                            inspected);
-      return (int)i;
-    }
-  }
-  peak_mpi_causal_runtime_observer_work(PEAK_MPI_CAUSAL_WORK_LOOKUP, inspected);
-  return -1;
+/* Snapshot identities survive shared native completed handles and slot reuse. */
+static int request_exact_index(const Request *old) {
+  size_t i = old->registry_slot;
+  return old->occupied && i < request_capacity && requests[i].occupied &&
+                 requests[i].uid == old->uid &&
+                 requests[i].generation == old->generation &&
+                 requests[i].activation == old->activation
+             ? (int)i : -1;
 }
-static int snapshot_request(MPI_Request handle, Request *out) {
-  if (!peak_mpi_causal_runtime_metadata_enabled()) {
-    memset(out, 0, sizeof(*out));
-    if (handle != MPI_REQUEST_NULL)
-      peak_mpi_causal_runtime_note_peer(-1);
-    return 0;
+static void release_requests(const Request *snapshots, unsigned count) {
+  pthread_mutex_lock(&metadata);
+  for (unsigned k = 0; k < count; ++k) {
+    int i = request_exact_index(&snapshots[k]);
+    if (i >= 0 && snapshots[k].selected)
+      requests[i].selected = 0;
   }
+  pthread_mutex_unlock(&metadata);
+}
+static void remember_request(Context *c, const Request *old) {
+  if (!old->occupied || !old->selected)
+    return;
+  if (c) {
+    c->requests[0] = *old;
+    c->count = 1;
+    pending_requests = c;
+  } else
+    release_requests(old, 1);
+}
+/* The caller holds metadata; reservations are released at wrapper_leave. */
+static int snapshot_request_locked(MPI_Request handle,
+                                   const MPI_Request *storage, int reserve,
+                                   Request *out) {
   memset(out, 0, sizeof(*out));
   if (handle == MPI_REQUEST_NULL)
     return 1;
   out->handle = handle;
+  int chosen = -1, have_hint = 0;
+  size_t inspected = 0;
+  for (size_t i = 0; i < request_used; ++i) {
+    ++inspected;
+    Request *candidate = &requests[i];
+    if (!candidate->occupied || candidate->handle != handle ||
+        (reserve && candidate->selected))
+      continue;
+    if (storage && candidate->storage == (uintptr_t)storage) {
+      if (!have_hint || candidate->generation > requests[chosen].generation)
+        chosen = (int)i;
+      have_hint = 1;
+      if (candidate->generation == request_generation)
+        break; /* No newer incarnation of this storage can exist. */
+    } else if (!have_hint &&
+               (chosen < 0 || candidate->generation < requests[chosen].generation))
+      chosen = (int)i;
+  }
+  peak_mpi_causal_runtime_observer_work(PEAK_MPI_CAUSAL_WORK_LOOKUP, inspected);
+  /* Copied/moved handles remain valid. Without an origin-address hint, choose
+   * one distinct oldest matching operation, retaining its immutable identity. */
+  if (chosen >= 0) {
+    if (reserve)
+      requests[chosen].selected = 1;
+    *out = requests[chosen];
+  }
+  return chosen >= 0;
+}
+static int snapshot_request_select(MPI_Request handle, const MPI_Request *storage,
+                                   int reserve, Request *out) {
+  memset(out, 0, sizeof(*out));
+  if (!peak_mpi_causal_runtime_metadata_enabled()) {
+    if (handle != MPI_REQUEST_NULL)
+      peak_mpi_causal_runtime_note_peer(-1);
+    return 0;
+  }
   pthread_mutex_lock(&metadata);
-  int i = request_index(handle);
-  if (i >= 0)
-    *out = requests[i];
+  int found = snapshot_request_locked(handle, storage, reserve, out);
   pthread_mutex_unlock(&metadata);
-  if (i < 0)
+  if (!found)
     fail(PEAK_MPI_OBSERVER_REASON_IDENTITY);
-  return i >= 0;
+  return found;
+}
+static int snapshot_request_at(MPI_Request handle, const MPI_Request *storage,
+                               Request *out) {
+  return snapshot_request_select(handle, storage, 0, out);
+}
+static int snapshot_request_claimed(MPI_Request handle,
+                                    const MPI_Request *storage, Request *out) {
+  return snapshot_request_select(handle, storage, 1, out);
 }
 static void forget_request(const Request *old) {
   unsigned slot = COMM_CAP;
   pthread_mutex_lock(&metadata);
-  int i = request_index(old->handle);
+  int i = request_exact_index(old);
   if (i >= 0 && requests[i].generation == old->generation) {
     slot = requests[i].comm_slot;
+    requests[i].selected = 0;
     requests[i].occupied = 0;
+    size_t trimmed = 0;
+    while (request_used && !requests[request_used - 1].occupied) {
+      --request_used;
+      ++trimmed;
+    }
+    peak_mpi_causal_runtime_observer_work(PEAK_MPI_CAUSAL_WORK_LOOKUP, trimmed);
   }
   pthread_mutex_unlock(&metadata);
   if (slot != COMM_CAP)
     put_comm(slot);
 }
-static void install_request(MPI_Request handle, const Comm *comm,
+static int install_request(MPI_Request *storage, const Comm *comm,
                             unsigned comm_slot, PeakMpiCausalOperation op,
                             unsigned flags, int peer, int tag, int root,
                             uint64_t ordinal, uint64_t start, int persistent,
                             PeakMpiObserverRecord *details) {
   if (!peak_mpi_causal_runtime_metadata_enabled())
-    return;
+    return -1;
+  MPI_Request handle = *storage;
   if (handle == MPI_REQUEST_NULL) {
     details->flags |= PEAK_MPI_CAUSAL_INACTIVE_REQUEST;
-    return;
+    return -1;
   }
   size_t empty = request_capacity;
   pthread_mutex_lock(&metadata);
@@ -1207,11 +1278,15 @@ static void install_request(MPI_Request handle, const Comm *comm,
   if (empty == request_capacity || request_generation == UINT64_MAX) {
     pthread_mutex_unlock(&metadata);
     fail(PEAK_MPI_OBSERVER_REASON_OBJECT_CAPACITY);
-    return;
+    return -1;
   }
   Request *r = &requests[empty];
   memset(r, 0, sizeof(*r));
   r->handle = handle;
+  r->storage = (uintptr_t)storage;
+  r->registry_slot = (unsigned)empty;
+  if (request_used <= empty)
+    request_used = empty + 1;
   r->uid = peak_mpi_causal_runtime_operation_id();
   r->generation = ++request_generation;
   r->activation = persistent ? 0 : 1;
@@ -1239,6 +1314,7 @@ static void install_request(MPI_Request handle, const Comm *comm,
   details->request_generation = r->generation;
   details->activation = r->activation;
   pthread_mutex_unlock(&metadata);
+  return (int)empty;
 }
 static int actual_peer(int peer) { return peer >= 0 && peer != world_rank; }
 static void note_peer(int peer) {
@@ -1263,7 +1339,11 @@ static unsigned complete_request(Context *c, const Request *old,
   peak_mpi_causal_runtime_observer_work(PEAK_MPI_CAUSAL_WORK_COMPLETION, 1);
   int observed = old->observed;
   pthread_mutex_lock(&metadata);
-  int claim = request_index(old->handle);
+  int claim = request_exact_index(old);
+  if (claim < 0) {
+    pthread_mutex_unlock(&metadata);
+    return 0;
+  }
   if (claim >= 0 && requests[claim].generation == old->generation) {
     observed = requests[claim].observed;
     if (old->active && !observed) {
@@ -1345,7 +1425,7 @@ static unsigned complete_request(Context *c, const Request *old,
     submit_event(&r, 0);
   }
   pthread_mutex_lock(&metadata);
-  int i = request_index(old->handle);
+  int i = request_exact_index(old);
   if (i >= 0 && requests[i].generation == old->generation) {
     if (old->active)
       requests[i].observed = 1;
@@ -1422,7 +1502,7 @@ BLOCK_SEND(Rsend, PEAK_MPI_CAUSAL_RSEND)
     NATIVE(rc, real(buf, count, type, dest, tag, comm, request));              \
     PeakMpiObserverRecord d = {0};                                             \
     if (c && rc == MPI_SUCCESS && request)                                     \
-      install_request(*request, &m, slot, operation,                           \
+      install_request(request, &m, slot, operation,                           \
                       PEAK_MPI_CAUSAL_NONBLOCKING, peer, normalized_tag(tag),  \
                       -1, 0, c->begin.op_uid, 0, &d);                          \
     if (c)                                                                     \
@@ -1512,7 +1592,7 @@ static int wrap_Irecv(Fn_Irecv real, void *buf, int count, MPI_Datatype type,
   NATIVE(rc, real(buf, count, type, source, tag, comm, request));
   PeakMpiObserverRecord d = {0};
   if (c && rc == MPI_SUCCESS && request)
-    install_request(*request, &m, slot, PEAK_MPI_CAUSAL_RECV,
+    install_request(request, &m, slot, PEAK_MPI_CAUSAL_RECV,
                     PEAK_MPI_CAUSAL_NONBLOCKING | PEAK_MPI_CAUSAL_RECEIVE, peer,
                     normalized_tag(tag), -1, 0, c->begin.op_uid, 0, &d);
   if (c)
@@ -1593,8 +1673,9 @@ static int wrap_Wait(Fn_Wait real, MPI_Request *request, MPI_Status *status) {
   MPI_Status scratch;
   MPI_Status *native = status;
   if (observe && request) {
-    snapshot_request(*request, &old);
+    snapshot_request_claimed(*request, request, &old);
     c = begin_call(PEAK_MPI_CAUSAL_WAIT, NULL, 0, -1, -1, -1, 0);
+    remember_request(c, &old);
     if (status == MPI_STATUS_IGNORE)
       native = &scratch;
   }
@@ -1619,8 +1700,9 @@ static int wrap_Test(Fn_Test real, MPI_Request *request, int *flag,
   MPI_Status scratch;
   MPI_Status *native = status;
   if (observe && request) {
-    snapshot_request(*request, &old);
+    snapshot_request_claimed(*request, request, &old);
     c = begin_call(PEAK_MPI_CAUSAL_TEST, NULL, 0, -1, -1, -1, 1);
+    remember_request(c, &old);
     if (status == MPI_STATUS_IGNORE)
       native = &scratch;
   }
@@ -1653,11 +1735,20 @@ static Context *prepare_many(int count, MPI_Request array[],
     fail(PEAK_MPI_OBSERVER_REASON_OBJECT_CAPACITY);
     return NULL;
   }
+  int missing = 0;
+  pthread_mutex_lock(&metadata);
   for (int i = 0; i < count; ++i)
-    snapshot_request(array[i], &c->requests[i]);
+    missing |= !snapshot_request_locked(array[i], &array[i], 1, &c->requests[i]);
+  pthread_mutex_unlock(&metadata);
+  if (missing)
+    fail(PEAK_MPI_OBSERVER_REASON_IDENTITY);
+  Context *snapshots = c;
   c = begin_call(op, NULL, 0, -1, -1, -1, deferred);
-  if (c)
+  if (c) {
     c->count = (unsigned)count;
+    pending_requests = c;
+  } else
+    release_requests(snapshots->requests, (unsigned)count);
   return c;
 }
 static int completion_error(int rc, const MPI_Status *s) {
@@ -1837,8 +1928,9 @@ static int wrap_Request_get_status(Fn_Request_get_status real,
   MPI_Status scratch;
   MPI_Status *native = status;
   if (observe) {
-    snapshot_request(request, &old);
+    snapshot_request_claimed(request, NULL, &old);
     c = begin_call(PEAK_MPI_CAUSAL_TEST, NULL, 0, -1, -1, -1, 1);
+    remember_request(c, &old);
     if (status == MPI_STATUS_IGNORE)
       native = &scratch;
   }
@@ -1867,12 +1959,12 @@ static int wrap_Cancel(Fn_Cancel real, MPI_Request *request) {
     fail(PEAK_MPI_OBSERVER_REASON_CAPABILITY);
   Request old = {0};
   if (observe && request)
-    snapshot_request(*request, &old);
+    snapshot_request_at(*request, request, &old);
   int rc;
   NATIVE(rc, real(request));
   if (observe && rc == MPI_SUCCESS && old.occupied) {
     pthread_mutex_lock(&metadata);
-    int i = request_index(old.handle);
+    int i = request_exact_index(&old);
     if (i >= 0 && requests[i].generation == old.generation)
       requests[i].cancelled = 1;
     pthread_mutex_unlock(&metadata);
@@ -1888,8 +1980,9 @@ static int wrap_Request_free(Fn_Request_free real, MPI_Request *request) {
   Request old = {0};
   Context *c = NULL;
   if (observe && request) {
-    snapshot_request(*request, &old);
+    snapshot_request_claimed(*request, request, &old);
     c = begin_call(PEAK_MPI_CAUSAL_REQUEST_FREE, NULL, 0, -1, -1, -1, 0);
+    remember_request(c, &old);
     if (old.active && !old.observed)
       fail(PEAK_MPI_OBSERVER_REASON_CAPABILITY);
   }
@@ -1931,7 +2024,7 @@ FORWARD_BOTH(Request_free, (MPI_Request * request), request)
         rc == MPI_SUCCESS && request) {                                        \
       PeakMpiObserverRecord d = {0};                                           \
       install_request(                                                         \
-          *request, &m, slot, operation,                                       \
+          request, &m, slot, operation,                                       \
           PEAK_MPI_CAUSAL_NONBLOCKING | PEAK_MPI_CAUSAL_PERSISTENT,            \
           world_peer(&m, dest), normalized_tag(tag), -1, 0, 0, 1, &d);         \
     }                                                                          \
@@ -1967,7 +2060,7 @@ static int wrap_Recv_init(Fn_Recv_init real, void *buf, int count,
   if (known && peak_mpi_causal_runtime_metadata_enabled() &&
       rc == MPI_SUCCESS && request) {
     PeakMpiObserverRecord d = {0};
-    install_request(*request, &m, slot, PEAK_MPI_CAUSAL_RECV,
+    install_request(request, &m, slot, PEAK_MPI_CAUSAL_RECV,
                     PEAK_MPI_CAUSAL_NONBLOCKING | PEAK_MPI_CAUSAL_PERSISTENT |
                         PEAK_MPI_CAUSAL_RECEIVE,
                     world_peer(&m, source), normalized_tag(tag), -1, 0, 0, 1,
@@ -1995,7 +2088,7 @@ static unsigned activate_requests(Context *c, unsigned count) {
     }
     uint64_t start = peak_mpi_causal_runtime_operation_id();
     pthread_mutex_lock(&metadata);
-    int i = request_index(old->handle);
+    int i = request_exact_index(old);
     if (i >= 0 && requests[i].generation == old->generation) {
       requests[i].active = 1;
       requests[i].observed = 0;
@@ -2021,6 +2114,9 @@ static unsigned activate_requests(Context *c, unsigned count) {
     r.phase = PEAK_MPI_CAUSAL_REQUEST_ACTIVATE;
     r.operation = old->operation;
     r.flags |= old->flags;
+    if (peak_mpi_progress_contract_estimated_delivery(&contract, old->operation,
+                                                      r.flags))
+      r.flags |= PEAK_MPI_OBSERVER_PROGRESS_ESTIMATED;
     r.communicator_uid = old->comm_uid;
     r.request_uid = old->uid;
     r.request_generation = old->generation;
@@ -2337,7 +2433,7 @@ static int wrap_Imrecv(Fn_Imrecv real, void *buf, int count, MPI_Datatype type,
   NATIVE(rc, real(buf, count, type, message, request));
   PeakMpiObserverRecord d = {0};
   if (c && rc == MPI_SUCCESS && request)
-    install_request(*request, &m, slot, PEAK_MPI_CAUSAL_MRECV,
+    install_request(request, &m, slot, PEAK_MPI_CAUSAL_MRECV,
                     PEAK_MPI_CAUSAL_RECEIVE | PEAK_MPI_CAUSAL_NONBLOCKING,
                     msg.peer, msg.tag, -1, 0, c->begin.op_uid, 0, &d);
   if (c)
@@ -2413,6 +2509,10 @@ static Context *collective_begin(PeakMpiCausalOperation op, MPI_Comm handle,
     comm->recovery_operation = (unsigned)op;
   if (overlap)
     fail(PEAK_MPI_OBSERVER_REASON_IDENTITY);
+  /* A blocking singleton collective has no communication edge. Its costs
+   * remain in the cumulative next cut; do not fill a ring no peer drains. */
+  if (!actual && !(flags & PEAK_MPI_CAUSAL_NONBLOCKING))
+    return NULL;
   flags |= PEAK_MPI_CAUSAL_COLLECTIVE;
   if (comm->inter)
     flags |= PEAK_MPI_CAUSAL_INTERCOMM;
@@ -2449,7 +2549,7 @@ static void collective_end(Context *c, Comm *comm, unsigned slot, int rc,
     d.collective_ordinal = c->begin.collective_ordinal;
     if (rc == MPI_SUCCESS && request)
       install_request(
-          *request, comm, slot, (PeakMpiCausalOperation)c->begin.operation,
+          request, comm, slot, (PeakMpiCausalOperation)c->begin.operation,
           c->begin.flags & ~PEAK_MPI_CAUSAL_CUT_PRECAPTURED, -1, -1,
           c->begin.root, c->begin.collective_ordinal, c->begin.op_uid, 0, &d);
     end_call(c, rc, &d, comm->size > 1 || comm->inter, 0);
@@ -3599,12 +3699,12 @@ static int wrap_Comm_idup(Fn_Comm_idup real, MPI_Comm comm, MPI_Comm *newcomm,
     if (*request == MPI_REQUEST_NULL)
       define_comm(*newcomm, m.uid, ordinal, PEAK_MPI_CAUSAL_COMM_IDUP_CREATED,
                   0);
-    install_request(*request, &m, slot, PEAK_MPI_CAUSAL_COMM_IDUP,
+    int i = install_request(request, &m, slot, PEAK_MPI_CAUSAL_COMM_IDUP,
                     PEAK_MPI_CAUSAL_NONBLOCKING | PEAK_MPI_CAUSAL_COLLECTIVE, 0,
                     0, 0, c->begin.collective_ordinal, c->begin.op_uid, 0, &d);
     pthread_mutex_lock(&metadata);
-    int i = request_index(*request);
-    if (i >= 0) {
+    if (i >= 0 && requests[i].uid == d.request_uid &&
+        requests[i].generation == d.request_generation) {
       requests[i].idup_comm = *newcomm;
       requests[i].lineage_ordinal = ordinal;
     }
@@ -4202,7 +4302,7 @@ static int wrap_Irecv_c(Fn_Irecv_c real, void *buf, MPI_Count count,
   NATIVE(rc, real(buf, count, type, source, tag, comm, request));
   PeakMpiObserverRecord d = {0};
   if (c && rc == MPI_SUCCESS && request)
-    install_request(*request, &m, slot, PEAK_MPI_CAUSAL_RECV,
+    install_request(request, &m, slot, PEAK_MPI_CAUSAL_RECV,
                     PEAK_MPI_CAUSAL_NONBLOCKING | PEAK_MPI_CAUSAL_RECEIVE, peer,
                     normalized_tag(tag), -1, 0, c->begin.op_uid, 0, &d);
   if (c)
@@ -4292,7 +4392,7 @@ static int wrap_Recv_init_c(Fn_Recv_init_c real, void *buf, MPI_Count count,
   if (known && peak_mpi_causal_runtime_metadata_enabled() &&
       rc == MPI_SUCCESS && request) {
     PeakMpiObserverRecord d = {0};
-    install_request(*request, &m, slot, PEAK_MPI_CAUSAL_RECV,
+    install_request(request, &m, slot, PEAK_MPI_CAUSAL_RECV,
                     PEAK_MPI_CAUSAL_NONBLOCKING | PEAK_MPI_CAUSAL_PERSISTENT |
                         PEAK_MPI_CAUSAL_RECEIVE,
                     world_peer(&m, source), normalized_tag(tag), -1, 0, 0, 1,
@@ -4440,7 +4540,7 @@ static int wrap_Imrecv_c(Fn_Imrecv_c real, void *buf, MPI_Count count,
   NATIVE(rc, real(buf, count, type, message, request));
   PeakMpiObserverRecord d = {0};
   if (c && rc == MPI_SUCCESS && request)
-    install_request(*request, &m, slot, PEAK_MPI_CAUSAL_MRECV,
+    install_request(request, &m, slot, PEAK_MPI_CAUSAL_MRECV,
                     PEAK_MPI_CAUSAL_RECEIVE | PEAK_MPI_CAUSAL_NONBLOCKING,
                     msg.peer, msg.tag, -1, 0, c->begin.op_uid, 0, &d);
   if (c)

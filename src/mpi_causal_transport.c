@@ -41,6 +41,7 @@ struct PeakMpiCausalTransport {
   int raw_pending, raw_seen, held, object_done, have_feedback;
   /* Buffered dispatch advances a turn without charging network bytes again. */
   int receive_progress;
+  int capture_first;
   PeakMpiObserverRecord record;
   PeakMpiPolicyFeedback feedback;
   PeakMpiCausalServiceStats stats;
@@ -1040,12 +1041,52 @@ static void client_tick(PeakMpiCausalTransport *t, double now, size_t *budget) {
     }
   }
 }
+static void transport_io(PeakMpiCausalTransport *t,
+                         const PeakMpiCausalRaw *raw, double now,
+                         size_t *budget) {
+  int owner = t->c.rank == t->c.owner_rank;
+  size_t rounds, before;
+  if (owner) {
+    for (rounds = 0; rounds < t->c.queue_frames + 2; ++rounds) {
+      before = *budget;
+      t->receive_progress = 0;
+      owner_tick(t, now, budget);
+      if (!*budget || (before == *budget && !t->receive_progress))
+        break;
+    }
+    /* A bounded end-of-heartbeat tailflush. If the shared allowance is
+     * exhausted, preserve the queued ACK or due flag for the next turn. */
+    for (size_t peer = 0; peer < t->peer_n; peer++) {
+      Peer *p = &t->peers[peer];
+      if (p->fd < 0 || !p->ready)
+        continue;
+      if (p->ack_count) {
+        p->ack_due = 1;
+      }
+      prepare_ack(t, p, 1);
+      if (p->out_n && *budget) {
+        int rc = write_buf(t, p->fd, p->out, p->out_n, &p->out_at, budget);
+        if (rc < 0)
+          close_peer(p);
+        else if (rc)
+          p->out_n = p->out_at = 0;
+      }
+    }
+  } else if (raw->active) {
+    for (rounds = 0; rounds < t->c.queue_frames + 2; ++rounds) {
+      before = *budget;
+      t->receive_progress = 0;
+      client_tick(t, now, budget);
+      if (!*budget || (before == *budget && !t->receive_progress))
+        break;
+    }
+  }
+}
 void peak_mpi_causal_transport_tick(PeakMpiCausalTransport *t,
                                     PeakMpiObserver *o,
                                     const PeakMpiCausalRaw *raw, double now,
                                     size_t budget) {
   int owner;
-  size_t rounds, before;
   if (!t || !raw)
     return;
   owner = t->c.rank == t->c.owner_rank;
@@ -1080,49 +1121,33 @@ void peak_mpi_causal_transport_tick(PeakMpiCausalTransport *t,
           (!t->sink.raw ||
            t->sink.raw(t->sink.context, t->c.rank, &t->raw, now)))
         t->raw_pending = 0;
-      capture(t, o, &budget, 1);
-    } else {
-      capture(t, o, &budget, 0);
     }
   }
+  /* Keep a local-record quantum available without starving readable peers or
+   * control. Unused IO allowance is lent to the single frozen capture, then
+   * unused capture allowance returns to IO. The total allowance never grows. */
+  size_t local_budget = 0;
+  if (raw->active && o) {
+    if (budget >= 512)
+      local_budget = budget / 2;
+    else if (budget >= 256) {
+      t->capture_first = !t->capture_first;
+      local_budget = t->capture_first ? 256 : 0;
+    }
+  }
+  size_t io_budget = budget - local_budget;
+  transport_io(t, raw, now, &io_budget);
+  local_budget += io_budget;
+  if (raw->active && o) {
+    capture(t, o, &local_budget, owner);
+    if (local_budget)
+      transport_io(t, raw, now, &local_budget);
+  }
   if (owner) {
-    for (rounds = 0; rounds < t->c.queue_frames + 2; ++rounds) {
-      before = budget;
-      t->receive_progress = 0;
-      owner_tick(t, now, &budget);
-      if (!budget || (before == budget && !t->receive_progress))
-        break;
-    }
-    /* A bounded end-of-heartbeat tailflush. If the shared allowance is
-     * exhausted, preserve the queued ACK or due flag for the next turn. */
-    for (size_t peer = 0; peer < t->peer_n; peer++) {
-      Peer *p = &t->peers[peer];
-      if (p->fd < 0 || !p->ready)
-        continue;
-      if (p->ack_count) {
-        p->ack_due = 1;
-      }
-      prepare_ack(t, p, 1);
-      if (p->out_n && budget) {
-        int rc = write_buf(t, p->fd, p->out, p->out_n, &p->out_at, &budget);
-        if (rc < 0)
-          close_peer(p);
-        else if (rc)
-          p->out_n = p->out_at = 0;
-      }
-    }
     if (raw->active && t->sink.feedback &&
         t->sink.feedback(t->sink.context, t->c.rank, now, &t->feedback)) {
       t->have_feedback = 1;
       t->stats.feedbacks++;
-    }
-  } else if (raw->active) {
-    for (rounds = 0; rounds < t->c.queue_frames + 2; ++rounds) {
-      before = budget;
-      t->receive_progress = 0;
-      client_tick(t, now, &budget);
-      if (!budget || (before == budget && !t->receive_progress))
-        break;
     }
   }
   t->stats.pending_records = t->count + (size_t)t->held;
