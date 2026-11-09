@@ -162,7 +162,6 @@ def main():
     ]
     support_sources = {
         "src/dlopen_interceptor.c": ["dlopen"],
-        "src/mpi_interceptor.c": ["PMPI_Finalize"],
         "src/pthread_listener.c": ["pthread_create", "pthread_join"],
     }
 
@@ -203,6 +202,22 @@ def main():
                     f"{relpath} must use Frida-native support lookup for {symbol}")
             require(f'gum_find_function("{symbol}")' not in source,
                     f"{relpath} must not broad-scan support hook {symbol}")
+
+    mpi_interceptor = (repo_root / "src" / "mpi_interceptor.c").read_text(
+        encoding="utf-8")
+    finalize_resolver = function_body(
+        mpi_interceptor, "mpi_interceptor_resolve_pmpi_finalize_once")
+    require('dlsym(RTLD_NEXT, "PMPI_Finalize")' in finalize_resolver,
+            "PMPI_Finalize must resolve the next native MPI implementation")
+    require('peak_general_listener_find_function("PMPI_Finalize")' not in
+            mpi_interceptor and 'gum_find_function("PMPI_Finalize")' not in
+            mpi_interceptor,
+            "PMPI_Finalize support must not resolve the exported interposer")
+    mpi_attach = function_body(mpi_interceptor, "mpi_interceptor_attach")
+    require("hook_address = (gpointer)real_pmpi_finalize;" in mpi_attach and
+            "gum_interceptor_replace_fast(mpi_interceptor," in mpi_attach and
+            "hook_address, &peak_pmpi_finalize" in mpi_attach,
+            "Gum must replace the resolved native PMPI_Finalize target")
 
     peak = (repo_root / "src/peak.c").read_text(encoding="utf-8")
     require(re.search(r"PEAK_API\s+void\s+exit\s*\(", peak) is not None,
