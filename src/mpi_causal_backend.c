@@ -43,6 +43,7 @@ typedef struct {
   uint64_t dep_gc_stamp;
   double created_at;
   uint64_t group_index, completion_index, consumer_index;
+  uint64_t ordered_completion_sequence;
   unsigned consumer_rank;
   size_t analysis_next, analysis_previous;
   int analysis_queued, analysis_waiting;
@@ -1283,6 +1284,15 @@ static int parse_record(PeakMpiCausalService *s, unsigned r,
     o->completion_index = wait->group_index;
     o->result_defined = 1;
     o->completed = 1;
+    /* Identity witness only: keep the immutable launch endpoint and progress
+     * branches. A successful initiation is not a successful completion. */
+    if ((rec->flags & PEAK_MPI_CAUSAL_STATUS_OBSERVED) &&
+        (rec->flags & PEAK_MPI_CAUSAL_SUCCESS) && !rec->mpi_error &&
+        !(rec->flags & PEAK_MPI_OBSERVER_CANCELLED) &&
+        rec->thread_uid == o->begin.thread_uid &&
+        rec->thread_generation == o->begin.thread_generation &&
+        rec->sequence > o->end.sequence)
+      o->ordered_completion_sequence = rec->sequence;
     o->retired = (rec->flags & PEAK_MPI_CAUSAL_RECLAIMED) != 0;
     o->end.actual_source = rec->actual_source;
     o->end.actual_tag = rec->actual_tag;
@@ -1434,12 +1444,16 @@ static int ordered_caller(PeakMpiCausalService *s, const Operation *o) {
   const Rank *r = &s->ranks[o->rank];
   return !s->approximate && !r->coarse && o->ended && o->completed &&
          (o->begin.flags & PEAK_MPI_CAUSAL_ORDERED_CALLER) &&
-         !(o->begin.flags & PEAK_MPI_CAUSAL_NONBLOCKING) &&
+         (!(o->begin.flags & PEAK_MPI_CAUSAL_NONBLOCKING) ||
+          o->ordered_completion_sequence) &&
          !(o->end.flags & PEAK_MPI_OBSERVER_CANCELLED) && !o->end.mpi_error &&
          r->mpi_thread == o->begin.thread_uid &&
          r->mpi_thread_generation == o->begin.thread_generation &&
          o->begin.thread_uid && o->begin.thread_uid <= s->config.slots &&
-         r->processed[o->begin.thread_uid - 1] >= o->end.sequence;
+         r->processed[o->begin.thread_uid - 1] >=
+             ((o->begin.flags & PEAK_MPI_CAUSAL_NONBLOCKING)
+                  ? o->ordered_completion_sequence
+                  : o->end.sequence);
 }
 static int ordered_receive(PeakMpiCausalService *s, Operation *o) {
   int peer = o->begin.operation == PEAK_MPI_CAUSAL_SENDRECV ? o->begin.root
@@ -1466,7 +1480,9 @@ static size_t ordered_send_head(PeakMpiCausalService *s, Operation *o) {
   Operation *send = &s->operations[head];
   if (!ordered_caller(s, send) || !same_message(send, o) || send->send_matched ||
       send->send_ambiguous || send->reserved_by != SIZE_MAX ||
-      (send->begin.operation != PEAK_MPI_CAUSAL_BSEND &&
+      (send->begin.operation != PEAK_MPI_CAUSAL_SEND &&
+       (send->begin.operation != PEAK_MPI_CAUSAL_BSEND ||
+        (send->begin.flags & PEAK_MPI_CAUSAL_NONBLOCKING)) &&
        send->begin.operation != PEAK_MPI_CAUSAL_SENDRECV))
     return SIZE_MAX;
   return head;
