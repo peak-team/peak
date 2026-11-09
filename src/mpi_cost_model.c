@@ -80,6 +80,7 @@ struct PeakMpiCostModel {
     uint32_t *node_ids, *owner_ids, *edge_ids, *branch_ids, *continuation_ids;
     uint64_t *rank_seen;
     uint32_t hash_capacity, free_node, free_owner, free_edge, free_branch;
+    uint32_t unused_node, unused_owner, unused_edge, unused_branch;
     uint32_t cursor, stack_size, finish_count, component_count, reverse_index;
     uint32_t scc_current, queue_head, queue_tail, search_edge, search_candidate;
     uint32_t topology_current, topology_edge, topology_done;
@@ -216,14 +217,9 @@ PeakMpiCostModel *peak_mpi_cost_model_create(const PeakMpiCostConfig *config)
         peak_mpi_cost_model_destroy(m);
         return NULL;
     }
-    for (uint32_t i = 0; i < config->max_nodes; ++i)
-        m->nodes[i].free_next = i + 1u == config->max_nodes ? NONE : i + 1u;
-    for (uint32_t i = 0; i < config->max_owners; ++i)
-        m->owners[i].free_next = i + 1u == config->max_owners ? NONE : i + 1u;
-    for (uint32_t i = 0; i < config->max_edges; ++i)
-        m->edges[i].free_next = i + 1u == config->max_edges ? NONE : i + 1u;
-    for (uint32_t i = 0; i < config->max_branches; ++i)
-        m->branches[i].free_next = i + 1u == config->max_branches ? NONE : i + 1u;
+    /* Virgin slots are already zeroed. Build links only when an allocated
+     * slot is reclaimed; untouched capacity needs no eager list sweep. */
+    m->free_node = m->free_owner = m->free_edge = m->free_branch = NONE;
     for (uint32_t i = 0; i < m->hash_capacity; ++i) m->edge_hash[i] = NONE;
     m->frontier_valid = true;
     m->last_result = PEAK_MPI_COST_OK;
@@ -247,12 +243,14 @@ PeakMpiCostStatus peak_mpi_cost_model_reserve_owner(PeakMpiCostModel *m,
     PeakMpiCostStatus status = writable(m);
     if (status != PEAK_MPI_COST_OK) return status;
     if (!out) return PEAK_MPI_COST_INVALID;
-    if (m->free_owner == NONE) return fail(m, PEAK_MPI_COST_OWNER_CAPACITY);
-    uint32_t i = m->free_owner;
+    if (m->free_owner == NONE && m->unused_owner == m->config.max_owners)
+        return fail(m, PEAK_MPI_COST_OWNER_CAPACITY);
+    uint32_t i = m->free_owner != NONE ? m->free_owner : m->unused_owner;
     CostOwner *o = &m->owners[i];
     if (o->generation == UINT64_MAX) return fail(m, PEAK_MPI_COST_GENERATION_OVERFLOW);
     uint64_t generation = o->generation + 1;
-    m->free_owner = o->free_next;
+    if (m->free_owner != NONE) m->free_owner = o->free_next;
+    else ++m->unused_owner;
     memset(o, 0, sizeof(*o));
     o->active = true;
     o->generation = generation;
@@ -293,12 +291,14 @@ PeakMpiCostStatus peak_mpi_cost_model_reserve_node(PeakMpiCostModel *m,
     PeakMpiCostStatus status = writable(m);
     if (status != PEAK_MPI_COST_OK) return status;
     if (!out) return PEAK_MPI_COST_INVALID;
-    if (m->free_node == NONE) return fail(m, PEAK_MPI_COST_NODE_CAPACITY);
-    uint32_t i = m->free_node;
+    if (m->free_node == NONE && m->unused_node == m->config.max_nodes)
+        return fail(m, PEAK_MPI_COST_NODE_CAPACITY);
+    uint32_t i = m->free_node != NONE ? m->free_node : m->unused_node;
     CostNode *n = &m->nodes[i];
     if (n->generation == UINT64_MAX) return fail(m, PEAK_MPI_COST_GENERATION_OVERFLOW);
     uint64_t generation = n->generation + 1;
-    m->free_node = n->free_next;
+    if (m->free_node != NONE) m->free_node = n->free_next;
+    else ++m->unused_node;
     memset(n, 0, sizeof(*n));
     n->active = true; n->generation = generation;
     n->in = n->out = n->component = NONE;
@@ -386,13 +386,15 @@ PeakMpiCostStatus peak_mpi_cost_model_add_edge(PeakMpiCostModel *m,
                    fail(m, PEAK_MPI_COST_CONFLICTING_DEFINITION);
     }
     if (insertion == NONE) return fail(m, PEAK_MPI_COST_INDEX_CAPACITY);
-    if (m->free_edge == NONE) return fail(m, PEAK_MPI_COST_EDGE_CAPACITY);
+    if (m->free_edge == NONE && m->unused_edge == m->config.max_edges)
+        return fail(m, PEAK_MPI_COST_EDGE_CAPACITY);
     CostNode *a = &m->nodes[source.slot], *b = &m->nodes[target.slot];
     if (b->sealed || b->settled || b->retire || a->retire)
         return fail(m, PEAK_MPI_COST_CLOSED_DEPENDENCIES);
-    uint32_t i = m->free_edge;
+    uint32_t i = m->free_edge != NONE ? m->free_edge : m->unused_edge;
     CostEdge *e = &m->edges[i];
-    m->free_edge = e->free_next;
+    if (m->free_edge != NONE) m->free_edge = e->free_next;
+    else ++m->unused_edge;
     memset(e, 0, sizeof(*e));
     e->active = true; e->source = source.slot; e->target = target.slot;
     e->active_index = m->stats.active_edges;
@@ -1245,11 +1247,13 @@ PeakMpiCostStatus peak_mpi_cost_model_hold_branch(PeakMpiCostModel *m,
         return fail(m, PEAK_MPI_COST_CONFLICTING_DEFINITION);
     if (m->nodes[ref.slot].pins == UINT32_MAX)
         return fail(m, PEAK_MPI_COST_BRANCH_CAPACITY);
-    if (m->free_branch == NONE) return fail(m, PEAK_MPI_COST_BRANCH_CAPACITY);
-    uint32_t i = m->free_branch;
+    if (m->free_branch == NONE && m->unused_branch == m->config.max_branches)
+        return fail(m, PEAK_MPI_COST_BRANCH_CAPACITY);
+    uint32_t i = m->free_branch != NONE ? m->free_branch : m->unused_branch;
     CostBranch *b = &m->branches[i];
     if (b->generation == UINT64_MAX) return fail(m, PEAK_MPI_COST_GENERATION_OVERFLOW);
-    m->free_branch = b->free_next;
+    if (m->free_branch != NONE) m->free_branch = b->free_next;
+    else ++m->unused_branch;
     b->active = true; ++b->generation; b->node = ref; b->kind = kind;
     b->active_index = m->stats.active_branches;
     m->branch_ids[b->active_index] = i;
@@ -1482,7 +1486,9 @@ void peak_mpi_cost_model_stats(const PeakMpiCostModel *m, PeakMpiCostStats *out)
     }
 }
 
-/* Epoch reset reuses active-ID/free lists: no allocation or capacity sweep. */
+/* Epoch reset reuses active-ID/free lists: no allocation or capacity sweep.
+ * Virgin cursors stay at their high-water marks; only reclaimed slots return
+ * to the lists, preserving generations and the untouched suffix. */
 void peak_mpi_cost_model_reset_begin(PeakMpiCostModel *m) {
     if (!m)
         return;
