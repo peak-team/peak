@@ -94,6 +94,7 @@ static PeakMpiProgressContract contract = {
     .effective_async_progress = -1,
     .provided_thread_level = -1};
 static int single_flow;
+static unsigned ordered_caller;
 
 static uint64_t monotonic_ns(void) {
   struct timespec t;
@@ -517,7 +518,7 @@ static Context *begin_call(PeakMpiCausalOperation op, const Comm *comm,
   r->peer = peer;
   r->tag = tag;
   r->root = root;
-  r->flags = flags;
+  r->flags = flags | ordered_caller;
   r->capability_uid = (uint64_t)contract.profile;
   r->progress_scope = PEAK_MPI_OBSERVER_SCOPE_INTERVAL;
   if (op == PEAK_MPI_CAUSAL_BSEND)
@@ -918,6 +919,10 @@ void peak_mpi_causal_events_init(void) {
   int native_thread = -1;
   if (PMPI_Query_thread(&native_thread) != MPI_SUCCESS)
     native_thread = -1;
+  ordered_caller = (native_thread == MPI_THREAD_SINGLE ||
+                    native_thread == MPI_THREAD_FUNNELED)
+                       ? PEAK_MPI_CAUSAL_ORDERED_CALLER
+                       : 0;
   PeakMpiProgressVerification verification = {
       .effective_async_progress = -1, .provided_thread_level = native_thread};
   const char *requested = getenv("PEAK_MPI_PROGRESS_PROFILE");

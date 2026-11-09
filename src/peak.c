@@ -1276,6 +1276,7 @@ peak_initialize_mpi_causal_runtime_if_ready(void)
 static void
 peak_activate_mpi_service_only_runtime(void)
 {
+    mpi_interceptor_prepare_service_only_finalize();
     atomic_store_explicit(&peak_runtime_owner_pid, getpid(), memory_order_release);
     peak_mpi_causal_runtime_configure_control(heartbeat_time != 0, FALSE);
     peak_initialize_mpi_causal_runtime_if_ready();

@@ -172,6 +172,7 @@ struct PeakMpiCausalService {
   size_t *candidates;
   size_t task_receive_head[4];
   unsigned task_receive_class;
+  int task_identity_ordered;
   int task_ordered, task_was_ambiguous, task_ambiguous, task_ready, task_s1,
       task_all, task_root_only, task_from_root, task_have_data;
   size_t task_receives, task_sends;
@@ -902,8 +903,7 @@ static void match_index_insert(PeakMpiCausalService *s, Operation *o) {
     ok &= peak_mpi_causal_match_index_insert(
         s->matching, PEAK_MPI_CAUSAL_MATCH_SEND, slot, &key);
   }
-  if (recv_op(o->begin.operation) ||
-      o->begin.operation == PEAK_MPI_CAUSAL_MPROBE) {
+  if (recv_op(o->begin.operation) || probe_op(o->begin.operation)) {
     int peer = o->begin.operation == PEAK_MPI_CAUSAL_SENDRECV ? o->begin.root
                                                               : o->begin.peer;
     int tag = o->begin.operation == PEAK_MPI_CAUSAL_SENDRECV
@@ -1032,6 +1032,7 @@ static void analysis_enqueue(PeakMpiCausalService *s, Operation *o, int front) {
     s->analysis_tail = at;
   }
 }
+static size_t ordered_send_head(PeakMpiCausalService *, Operation *);
 static void analysis_wake(PeakMpiCausalService *s, Operation *o) {
   if (!o->analysis_waiting || !o->used)
     return;
@@ -1046,6 +1047,12 @@ static void analysis_wake(PeakMpiCausalService *s, Operation *o) {
           : o->end.actual_source;
   if (source < 0 || (unsigned)source >= s->config.world_size)
     return;
+  /* A newly arrived ordered head is an identity retry hint, not a proof or
+   * visibility update. The charged receive-head guards still run in MATCH. */
+  if (ordered_send_head(s, o) != SIZE_MAX) {
+    analysis_enqueue(s, o, 0);
+    return;
+  }
   Rank *remote = &s->ranks[(unsigned)source], *local = &s->ranks[o->rank];
   if (remote->verified_nonce >= o->match_nonce &&
       local->verified_nonce >= o->self_nonce)
@@ -1420,6 +1427,50 @@ static int eligible_send(Operation *send, Operation *recv) {
          send->ended && same_message(send, recv) && send->visible &&
          send->visible_nonce <= recv->candidate_epoch;
 }
+/* The flag is an immutable positive SINGLE/FUNNELED claim, independent of
+ * progress capability. A parsed single-caller prefix excludes unseen earlier
+ * posts; it never closes an open communication progress interval. */
+static int ordered_caller(PeakMpiCausalService *s, const Operation *o) {
+  const Rank *r = &s->ranks[o->rank];
+  return !s->approximate && !r->coarse && o->ended && o->completed &&
+         (o->begin.flags & PEAK_MPI_CAUSAL_ORDERED_CALLER) &&
+         !(o->begin.flags & PEAK_MPI_CAUSAL_NONBLOCKING) &&
+         !(o->end.flags & PEAK_MPI_OBSERVER_CANCELLED) && !o->end.mpi_error &&
+         r->mpi_thread == o->begin.thread_uid &&
+         r->mpi_thread_generation == o->begin.thread_generation &&
+         o->begin.thread_uid && o->begin.thread_uid <= s->config.slots &&
+         r->processed[o->begin.thread_uid - 1] >= o->end.sequence;
+}
+static int ordered_receive(PeakMpiCausalService *s, Operation *o) {
+  int peer = o->begin.operation == PEAK_MPI_CAUSAL_SENDRECV ? o->begin.root
+                                                            : o->begin.peer;
+  int tag = o->begin.operation == PEAK_MPI_CAUSAL_SENDRECV ? o->begin.actual_tag
+                                                           : o->begin.tag;
+  return ordered_caller(s, o) &&
+         (o->begin.operation == PEAK_MPI_CAUSAL_RECV ||
+          o->begin.operation == PEAK_MPI_CAUSAL_SENDRECV) && peer >= 0 &&
+         tag >= 0 && peer == o->end.actual_source && tag == o->end.actual_tag;
+}
+static size_t message_head(PeakMpiCausalService *s, Operation *o) {
+  PeakMpiCausalMatchKey key = {o->context, 0, o->end.actual_source,
+                              (int32_t)o->rank, o->end.actual_tag, 0};
+  return peak_mpi_causal_match_index_first(
+      s->matching, PEAK_MPI_CAUSAL_MATCH_SEND, &key);
+}
+static size_t ordered_send_head(PeakMpiCausalService *s, Operation *o) {
+  if (!ordered_receive(s, o))
+    return SIZE_MAX;
+  size_t head = message_head(s, o);
+  if (head == SIZE_MAX)
+    return SIZE_MAX;
+  Operation *send = &s->operations[head];
+  if (!ordered_caller(s, send) || !same_message(send, o) || send->send_matched ||
+      send->send_ambiguous || send->reserved_by != SIZE_MAX ||
+      (send->begin.operation != PEAK_MPI_CAUSAL_BSEND &&
+       send->begin.operation != PEAK_MPI_CAUSAL_SENDRECV))
+    return SIZE_MAX;
+  return head;
+}
 static int same_collective(const Operation *a, const Operation *b) {
   return b->used && (b->begin.flags & PEAK_MPI_CAUSAL_COLLECTIVE) &&
          a->context == b->context &&
@@ -1449,6 +1500,8 @@ static void collective_output(PeakMpiCausalService *s, Operation *o) {
 }
 enum {
   TASK_NONE,
+  TASK_IDENTITY,
+  TASK_NONCE,
   TASK_MESSAGES,
   TASK_EARLIER,
   TASK_EDGES,
@@ -1480,7 +1533,7 @@ static void matcher_work(PeakMpiCausalService *s, size_t budget) {
       s->task_limit = s->operation_count;
       s->task_best = s->task_bound = SIZE_MAX;
       s->task_ready = s->task_ordered = 1;
-      s->task_was_ambiguous = 0;
+      s->task_was_ambiguous = s->task_identity_ordered = 0;
       if (o->begin.flags & PEAK_MPI_CAUSAL_COLLECTIVE) {
         if (!o->ended)
           continue;
@@ -1550,6 +1603,51 @@ static void matcher_work(PeakMpiCausalService *s, size_t budget) {
         coarse(s, o->rank, PEAK_MPI_POLICY_UNKNOWN_MEMBERS, 0);
         continue;
       }
+      size_t head = ordered_send_head(s, o);
+      if (head != SIZE_MAX) {
+        s->task_identity_ordered = 1;
+        s->task_bound = head;
+        s->task_receive_class = 0;
+        s->task_stage = TASK_IDENTITY;
+      } else if (ordered_receive(s, o) && message_head(s, o) == SIZE_MAX) {
+        /* No send identity is available yet. Keep the receive unresolved;
+         * ordinary VERIFY/wakeup retries it without inventing fresh proofs. */
+        o->analysis_waiting = 1;
+      } else
+        s->task_stage = TASK_NONCE;
+      continue;
+    }
+    Operation *o = &s->operations[s->task_op];
+    if (s->task_stage == TASK_IDENTITY) {
+      if (s->task_receive_class == 4) {
+        s->task_cursor = s->task_bound;
+        s->task_stage = TASK_MESSAGES;
+        continue;
+      }
+      unsigned k = s->task_receive_class++;
+      PeakMpiCausalMatchKey key = {
+          o->context, 0,
+          k & 1 ? PEAK_MPI_CAUSAL_ANY_SOURCE : o->end.actual_source,
+          (int32_t)o->rank,
+          k & 2 ? PEAK_MPI_CAUSAL_ANY_TAG : o->end.actual_tag, 0};
+      size_t head = peak_mpi_causal_match_index_first(
+          s->matching, PEAK_MPI_CAUSAL_MATCH_RECEIVE, &key);
+      s->task_receive_head[k] = head;
+      if (head != SIZE_MAX) {
+        Operation *prior = &s->operations[head];
+        if (prior->begin.thread_uid != o->begin.thread_uid ||
+            prior->begin.thread_generation != o->begin.thread_generation ||
+            prior->begin.sequence < o->begin.sequence) {
+          s->task_identity_ordered = 0;
+          s->task_bound = SIZE_MAX;
+          s->task_stage = TASK_NONCE;
+        }
+      }
+      continue;
+    }
+    if (s->task_stage == TASK_NONCE) {
+      s->task_stage = TASK_NONE;
+      unsigned sender = (unsigned)o->end.actual_source;
       Rank *r = &s->ranks[sender];
       if (!o->match_nonce) {
         if (r->requested_nonce == UINT64_MAX) {
@@ -1569,6 +1667,7 @@ static void matcher_work(PeakMpiCausalService *s, size_t budget) {
       if (r->verified_nonce < o->match_nonce ||
           local->verified_nonce < o->self_nonce) {
         o->analysis_waiting = 1;
+        s->task_stage = TASK_NONE;
         continue;
       }
       if (!o->candidate_epoch)
@@ -1608,7 +1707,6 @@ static void matcher_work(PeakMpiCausalService *s, size_t budget) {
       s->task_stage = TASK_MESSAGES;
       continue;
     }
-    Operation *o = &s->operations[s->task_op];
     if (s->task_stage == TASK_MESSAGES) {
       if (s->task_cursor == SIZE_MAX) {
         if (!s->task_count || !s->task_ready) {
@@ -1632,7 +1730,9 @@ static void matcher_work(PeakMpiCausalService *s, size_t budget) {
       s->task_cursor = peak_mpi_causal_match_index_next(
           s->matching, PEAK_MPI_CAUSAL_MATCH_SEND, slot);
       Operation *x = &s->operations[slot];
-      if (!eligible_send(x, o) ||
+      if (!(s->task_identity_ordered && slot == s->task_bound
+                ? x->used && !x->send_matched && x->ended && same_message(x, o)
+                : eligible_send(x, o)) ||
           (s->task_bound != SIZE_MAX && slot != s->task_bound) ||
           (x->reserved_by != SIZE_MAX && s->task_bound == SIZE_MAX))
         continue;
@@ -1646,6 +1746,8 @@ static void matcher_work(PeakMpiCausalService *s, size_t budget) {
       } else
         s->task_best = slot;
       s->candidates[s->task_count++] = slot;
+      if (s->task_identity_ordered)
+        s->task_cursor = SIZE_MAX;
       s->task_was_ambiguous |= x->send_ambiguous;
       /* A single producer/generation containing only blocking Sendrecv P2P
        * calls has FIFO sends. With no earlier receive in any wildcard class,

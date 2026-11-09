@@ -177,11 +177,11 @@ int peak_mpi_causal_runtime_prepare(size_t n, double q, double hb, double ema) {
   configured_owner_byte_budget = owner_byte_budget_from_environment();
   effective_byte_budget = 65536;
   if (work_budget_env) {
-    if (parse_unsigned(work_budget_env, 1048576, &parsed_work_budget) &&
+    if (parse_unsigned(work_budget_env, 4194304, &parsed_work_budget) &&
         parsed_work_budget > 0)
       observer_work_budget = (size_t)parsed_work_budget;
     else
-      fprintf(stderr, "[peak mpi causal] invalid PEAK_MPI_OBSERVER_WORK_BUDGET; using 16384 (valid range 1..1048576)\n");
+      fprintf(stderr, "[peak mpi causal] invalid PEAK_MPI_OBSERVER_WORK_BUDGET; using 16384 (valid range 1..4194304)\n");
   }
   origin = begin;
   if (!peak_mpi_causal_cost_prepare(n)) {
