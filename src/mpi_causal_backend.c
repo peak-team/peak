@@ -490,6 +490,13 @@ static unsigned canonical(PeakMpiCausalService *s, unsigned rank, Comm *c) {
   *x = (Context){parent, c->kind, c->ordinal, c->color, c->size, self};
   return (unsigned)s->context_count;
 }
+/* WORLD membership is intrinsic; retain only unique-position receipts. */
+_Static_assert(sizeof(int) == sizeof(uint32_t), "WORLD receipt word size");
+static size_t comm_storage_words(unsigned kind, size_t size) {
+  return kind == PEAK_MPI_CAUSAL_COMM_WORLD
+             ? size / 32 + (size % 32 != 0)
+             : size;
+}
 int peak_mpi_causal_service_ingest_object(PeakMpiCausalService *s, unsigned r,
                                           uint64_t inc,
                                           const PeakMpiObserverObject *obj) {
@@ -507,7 +514,10 @@ int peak_mpi_causal_service_ingest_object(PeakMpiCausalService *s, unsigned r,
   memcpy(&p, obj->payload, sizeof p);
   if (p.local_size < 0 || p.world_size != s->config.world_size ||
       p.member_count > 16 ||
-      p.member_offset + p.member_count > (unsigned)p.local_size) {
+      p.member_offset > (unsigned)p.local_size ||
+      p.member_count > (unsigned)p.local_size - p.member_offset ||
+      (p.creation_kind == PEAK_MPI_CAUSAL_COMM_WORLD &&
+       p.local_size != (int)s->config.world_size)) {
     coarse(s, r, PEAK_MPI_POLICY_BAD_IDENTITY, 0);
     return 1;
   }
@@ -516,15 +526,23 @@ int peak_mpi_causal_service_ingest_object(PeakMpiCausalService *s, unsigned r,
     if (s->comm_ranks[i] == r && s->comms[i].uid == p.local_uid)
       break;
   if (i == s->comm_count) {
-    if (i >= s->config.max_context_parts ||
-        (size_t)p.local_size > s->config.max_context_parts * 16) {
+    size_t capacity = s->config.max_context_parts * 16;
+    size_t words = comm_storage_words(p.creation_kind, (size_t)p.local_size);
+    if (i >= s->config.max_context_parts || words > capacity) {
       coarse(s, r, PEAK_MPI_POLICY_RESOURCE_LIMIT, 0);
       return 1;
     }
     size_t off = 0;
-    for (size_t j = 0; j < i; j++)
-      off += (size_t)s->comms[j].size;
-    if (off + (size_t)p.local_size > s->config.max_context_parts * 16) {
+    for (size_t j = 0; j < i; j++) {
+      size_t stored = comm_storage_words(s->comms[j].kind,
+                                        (size_t)s->comms[j].size);
+      if (stored > capacity - off) {
+        coarse(s, r, PEAK_MPI_POLICY_RESOURCE_LIMIT, 0);
+        return 1;
+      }
+      off += stored;
+    }
+    if (words > capacity - off) {
       coarse(s, r, PEAK_MPI_POLICY_RESOURCE_LIMIT, 0);
       return 1;
     }
@@ -534,14 +552,35 @@ int peak_mpi_causal_service_ingest_object(PeakMpiCausalService *s, unsigned r,
                p.color,     p.local_size, (int)obj->part_count, 0,
                0,           off};
     s->comm_count++;
-    for (int j = 0; j < p.local_size; j++)
-      s->members[off + (size_t)j] = -1;
+    for (size_t j = 0; j < words; j++)
+      s->members[off + j] = p.creation_kind == PEAK_MPI_CAUSAL_COMM_WORLD ? 0 : -1;
   }
   Comm *c = &s->comms[i];
+  if (c->kind != p.creation_kind || c->size != p.local_size) {
+    coarse(s, r, PEAK_MPI_POLICY_BAD_IDENTITY, 0);
+    return 1;
+  }
   for (unsigned j = 0; j < p.member_count; j++) {
     int v = p.members[j];
     if (v < 0 || (unsigned)v >= s->config.world_size) {
       coarse(s, r, PEAK_MPI_POLICY_UNKNOWN_MEMBERS, 0);
+      continue;
+    }
+    if (c->kind == PEAK_MPI_CAUSAL_COMM_WORLD) {
+      unsigned position = p.member_offset + j;
+      if (v != (int)position) {
+        coarse(s, r, PEAK_MPI_POLICY_BAD_IDENTITY, 0);
+        continue;
+      }
+      uint32_t word;
+      int *dst = &s->members[c->offset + position / 32];
+      memcpy(&word, dst, sizeof word);
+      uint32_t mask = UINT32_C(1) << (position % 32);
+      if (!(word & mask)) {
+        word |= mask;
+        memcpy(dst, &word, sizeof word);
+        c->got++;
+      }
       continue;
     }
     int *dst = &s->members[c->offset + p.member_offset + j];
