@@ -2547,9 +2547,10 @@ static int publish_work(PeakMpiCausalService *s, size_t budget) {
                               1,
                               s->samples,
                               s->pub_count};
-        s->cache_dirty = 1;
         PeakMpiPolicyResult result =
             peak_mpi_policy_submit_cut(leader->policy, &c, s->now);
+        if (result != PEAK_MPI_POLICY_IGNORED)
+          s->cache_dirty = 1;
         if (result == PEAK_MPI_POLICY_INVALID ||
             result == PEAK_MPI_POLICY_CAPACITY)
           coarse(s, s->pub_root, PEAK_MPI_POLICY_BAD_CUT, 0);
@@ -2979,6 +2980,8 @@ static void parse_batches(PeakMpiCausalService *s, size_t budget) {
 }
 static size_t prepare_feedback_cache(PeakMpiCausalService *s,
                                      size_t allowance) {
+  if (!s->cache_dirty)
+    return 0;
   size_t used = 0;
   while (s->cache_root < s->config.world_size && used < allowance) {
     unsigned rank = s->cache_root;

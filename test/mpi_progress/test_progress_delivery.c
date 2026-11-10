@@ -196,7 +196,191 @@ static void buffered_delivery(void) {
          (test_profile != PEAK_MPI_PROGRESS_INTEL_2021_11_ASYNC));
   peak_mpi_causal_service_destroy(s);
 }
+static PeakMpiPolicyConfig stale_cfg = {2, .1, .1, .5, 0, 0, 1};
+static PeakMpiPolicyCohortKey stale_key = {99, 0, 1};
+static PeakMpiPolicyMemberId stale_ids[2] = {{0, 99}, {1, 99}};
+static void stale_samples(PeakMpiPolicySample s[2], unsigned gen, double A,
+                          double L, double elapsed) {
+  for (unsigned i = 0; i < 2; i++) {
+    s[i] = (PeakMpiPolicySample){0};
+    s[i].member = stale_ids[i];
+    s[i].generation = gen;
+    s[i].event_cut = 1;
+    s[i].L = L;
+    s[i].P = s[i].A = s[i].D = A;
+    s[i].elapsed = elapsed;
+    s[i].app_cost_known = 1;
+    s[i].cut =
+        (PeakMpiCostCut){(uint64_t)(A * 1e9 + .5), (uint64_t)(A * 1e9 + .5),
+                         (uint64_t)(L * 1e9 + .5)};
+  }
+}
+static PeakMpiPolicyCut stale_cut(PeakMpiPolicySample *s, unsigned gen,
+                                  double age) {
+  return (PeakMpiPolicyCut){stale_key, gen, gen, 1,
+                            .01,       age, 0,   PEAK_MPI_POLICY_COMPLETE_CUT,
+                            1,         s,   2};
+}
+static void test_stale_feedback(void) {
+  PeakMpiPolicySample s[2], raw[2];
+  stale_samples(s, 1, .01, .01, 1);
+  PeakMpiPolicy *p =
+      peak_mpi_policy_create(&stale_cfg, stale_key, stale_ids, 2, 1, 1, 0);
+  assert(p);
+  for (unsigned i = 0; i < 2; i++)
+    assert(peak_mpi_policy_record_raw(p, stale_key, &s[i], 1) ==
+           PEAK_MPI_POLICY_OK);
+  PeakMpiPolicyCut c = stale_cut(s, 1, 0);
+  assert(peak_mpi_policy_submit_cut(p, &c, 1) == PEAK_MPI_POLICY_OK);
+  PeakMpiPolicyFeedback f, old;
+  assert(peak_mpi_policy_feedback(p, stale_ids[0], 1, &f) ==
+         PEAK_MPI_POLICY_OK);
+  PeakMpiPolicyReceiver r;
+  PeakMpiPolicyDecision d;
+  assert(peak_mpi_policy_receiver_init(&r, &stale_cfg, stale_key, stale_ids[0],
+                                       1) == PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_receiver_rebind(&r, stale_key, 2, 1, 1) ==
+         PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_receiver_accept(&r, &f, 1) == PEAK_MPI_POLICY_OK);
+  stale_samples(raw, 2, .01, .011, 2);
+  for (unsigned i = 0; i < 2; i++)
+    assert(peak_mpi_policy_record_raw(p, stale_key, &raw[i], 2) ==
+           PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_feedback(p, stale_ids[0], 2, &old) ==
+         PEAK_MPI_POLICY_OK);
+  assert(old.mode == PEAK_MPI_POLICY_STALE && old.received_raw_sum == .022 &&
+         old.received_app_sum == .02);
+  c = stale_cut(s, 2, 1);
+  PeakMpiPolicyResult status = peak_mpi_policy_submit_cut(p, &c, 2);
+  fprintf(stderr, "repeatSTALE status=%d expectedIGNORED=%d\n", status,
+          PEAK_MPI_POLICY_IGNORED);
+  assert(status == PEAK_MPI_POLICY_IGNORED);
+  assert(peak_mpi_policy_feedback(p, stale_ids[0], 2, &f) ==
+             PEAK_MPI_POLICY_OK &&
+         f.generation == old.generation && f.event_cut == old.event_cut);
+  assert(peak_mpi_policy_receiver_snapshot_cut(&r, 2, 2, raw[0].cut, 1, &d) ==
+             PEAK_MPI_POLICY_OK &&
+         d.mode == PEAK_MPI_POLICY_STALE && !d.global_available);
+  stale_samples(s, 3, .011, .012, 2.1);
+  for (unsigned i = 0; i < 2; i++)
+    assert(peak_mpi_policy_record_raw(p, stale_key, &s[i], 2.1) ==
+           PEAK_MPI_POLICY_OK);
+  c = stale_cut(s, 3, 0);
+  c.F = .011;
+  assert(peak_mpi_policy_submit_cut(p, &c, 2.1) == PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_feedback(p, stale_ids[0], 2.1, &f) ==
+             PEAK_MPI_POLICY_OK &&
+         f.mode == PEAK_MPI_POLICY_COMPLETE && f.event_cut == 1 &&
+         f.A_cut == .011);
+  assert(peak_mpi_policy_receiver_accept(&r, &f, 2.1) == PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_receiver_snapshot_cut(&r, 2.1, 2.1, s[0].cut, 1, &d) ==
+             PEAK_MPI_POLICY_OK &&
+         d.global_available);
+  peak_mpi_policy_free(p);
+  p = peak_mpi_policy_create(&stale_cfg, stale_key, stale_ids, 2, 1, 1, 0);
+  assert(p);
+  c = stale_cut(s, 1, 1);
+  assert(peak_mpi_policy_submit_cut(p, &c, 2.1) == PEAK_MPI_POLICY_OK);
+  c.generation = c.cut_id = 2;
+  assert(peak_mpi_policy_submit_cut(p, &c, 2.1) == PEAK_MPI_POLICY_IGNORED);
+  c.generation = c.cut_id = 3;
+  c.policy_generation = 2;
+  assert(peak_mpi_policy_submit_cut(p, &c, 2.1) == PEAK_MPI_POLICY_OK);
+  c.generation = c.cut_id = 4;
+  c.quality = PEAK_MPI_POLICY_OBSERVED_PROGRESS_CUT;
+  assert(peak_mpi_policy_submit_cut(p, &c, 2.1) == PEAK_MPI_POLICY_OK);
+  c.generation = c.cut_id = 5;
+  assert(peak_mpi_policy_submit_cut(p, &c, 2.1) == PEAK_MPI_POLICY_IGNORED);
+  peak_mpi_policy_recover(p, 2.1, 1);
+  c.generation = c.cut_id = 6;
+  assert(peak_mpi_policy_submit_cut(p, &c, 2.1) == PEAK_MPI_POLICY_OK);
+  peak_mpi_policy_free(p);
+  PeakMpiPolicyCohortKey rightkey = {99, 1, 1}, merged = {99, 0, 2};
+  p = peak_mpi_policy_create(&stale_cfg, stale_key, &stale_ids[0], 1, 1, 1, 0);
+  PeakMpiPolicy *right =
+      peak_mpi_policy_create(&stale_cfg, rightkey, &stale_ids[1], 1, 1, 1, 0);
+  assert(p && right);
+  c = stale_cut(s, 1, 1);
+  c.sample_count = 1;
+  assert(peak_mpi_policy_submit_cut(p, &c, 2.1) == PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_merge(p, right, merged, 2.1) == PEAK_MPI_POLICY_OK);
+  c = stale_cut(s, 2, 1);
+  c.cohort = merged;
+  assert(peak_mpi_policy_submit_cut(p, &c, 2.1) == PEAK_MPI_POLICY_OK);
+  peak_mpi_policy_free(right);
+  peak_mpi_policy_free(p);
+  puts("repeatedSTALE nofeedbackrevision; rawfees retained; cachedSTALE "
+       "staysblocked; freshsameevent/recovery policyqualitytransitions publish "
+       "PASS");
+  return;
+}
+
+static void test_feedback_cache_guard(void) {
+  PeakMpiCausalService *s = make();
+  assert(merge(s, 0, 1));
+  PeakMpiPolicy *p = s->ranks[root(s, 0)].policy;
+  PeakMpiPolicyCohortKey key = s->ranks[root(s, 0)].key;
+  PeakMpiPolicySample samples[2];
+  stale_samples(samples, 1, .01, .01, 1);
+  for (unsigned i = 0; i < 2; ++i)
+    assert(peak_mpi_policy_record_raw(p, key, &samples[i], 1) ==
+           PEAK_MPI_POLICY_OK);
+  PeakMpiPolicyCut cut = stale_cut(samples, 1, 0);
+  cut.cohort = key;
+  assert(peak_mpi_policy_submit_cut(p, &cut, 1) == PEAK_MPI_POLICY_OK);
+  s->now = 1;
+  assert(prepare_feedback_cache(s, 100000) > 0 && !s->cache_dirty);
+  PeakMpiPolicyFeedback cached = s->feedback_cache[0], live;
+  PeakMpiPolicyReceiver receiver;
+  PeakMpiPolicyDecision decision;
+  assert(peak_mpi_policy_receiver_init(&receiver, &stale_cfg, key, stale_ids[0],
+                                       1) == PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_receiver_rebind(&receiver, key, 2, 1, 1) ==
+         PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_receiver_accept(&receiver, &cached, 1) ==
+         PEAK_MPI_POLICY_OK);
+  stale_samples(samples, 2, .01, .011, 2);
+  for (unsigned i = 0; i < 2; ++i)
+    assert(peak_mpi_policy_record_raw(p, key, &samples[i], 2) ==
+           PEAK_MPI_POLICY_OK);
+  s->now = 2;
+  assert(prepare_feedback_cache(s, 100000) == 0);
+  assert(s->feedback_cache[0].generation == cached.generation &&
+         s->feedback_cache[0].event_cut == cached.event_cut);
+  assert(peak_mpi_policy_feedback(p, stale_ids[0], 2, &live) ==
+             PEAK_MPI_POLICY_OK &&
+         live.received_raw_sum == .022 && live.received_app_sum == .02);
+  assert(peak_mpi_policy_receiver_snapshot_cut(&receiver, 6, 6, samples[0].cut,
+                                               1, &decision) ==
+             PEAK_MPI_POLICY_OK &&
+         decision.mode == PEAK_MPI_POLICY_STALE && !decision.global_available);
+  stale_samples(samples, 3, .011, .012, 6);
+  for (unsigned i = 0; i < 2; ++i)
+    assert(peak_mpi_policy_record_raw(p, key, &samples[i], 6) ==
+           PEAK_MPI_POLICY_OK);
+  cut = stale_cut(samples, 2, 0);
+  cut.cohort = key;
+  cut.F = .011;
+  assert(peak_mpi_policy_submit_cut(p, &cut, 6) == PEAK_MPI_POLICY_OK);
+  s->now = 6;
+  s->cache_dirty = 1;
+  assert(prepare_feedback_cache(s, 1) == 0 && s->cache_dirty);
+  assert(prepare_feedback_cache(s, 100000) > 0 && !s->cache_dirty);
+  live = s->feedback_cache[0];
+  assert(live.generation > cached.generation && live.A_cut == .011);
+  assert(peak_mpi_policy_receiver_accept(&receiver, &live, 6) ==
+         PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_receiver_snapshot_cut(&receiver, 6, 6, samples[0].cut,
+                                               1, &decision) ==
+             PEAK_MPI_POLICY_OK &&
+         decision.global_available);
+  peak_mpi_causal_service_destroy(s);
+  puts("clean feedback cache retains tuple/raw fees; aged receiver blocks; "
+       "dirty fresh cut recovers PASS");
+}
 int main(void) {
+  test_stale_feedback();
+  test_feedback_cache_guard();
   test_profile = PEAK_MPI_PROGRESS_INTEL_2021_11_ASYNC;
   buffered_delivery();
   test_profile = PEAK_MPI_PROGRESS_OMPI_5_0_5_UCX_1_17_RC_PROTO2_HOST_OBSERVED;

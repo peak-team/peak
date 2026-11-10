@@ -312,6 +312,10 @@ PeakMpiPolicyResult peak_mpi_policy_submit_cut(PeakMpiPolicy *p,
         if (p->baseline_valid && s->control_generation != m->baseline_control_generation)
             mixed = 1;
     }
+    int repeat_stale = p->mode == PEAK_MPI_POLICY_STALE &&
+        p->reason == PEAK_MPI_POLICY_FEEDBACK_OLD && p->have_input_generation;
+    int progress_change = c->quality == PEAK_MPI_POLICY_OBSERVED_PROGRESS_CUT &&
+        !p->progress_estimate;
     p->last_input_generation = c->generation; p->have_input_generation = 1;
     int policy_change = c->policy_generation != p->policy_generation;
     p->policy_generation = c->policy_generation;
@@ -324,6 +328,11 @@ PeakMpiPolicyResult peak_mpi_policy_submit_cut(PeakMpiPolicy *p,
     int fresh = age <= 3*p->config.heartbeat_max_seconds;
     if (!full || !fresh || (p->mode != PEAK_MPI_POLICY_COARSE && !fine_complete)) {
         make_stale(p); p->baseline_valid = 0;
+        /* A rejected aged cut has no new settled history or usable pressure.
+         * Keep raw fees current without rebroadcasting the same stale state. */
+        if (repeat_stale && full && fine_complete && !fresh &&
+            !policy_change && !progress_change)
+            return PEAK_MPI_POLICY_IGNORED;
         return bump(p) ? PEAK_MPI_POLICY_OK : PEAK_MPI_POLICY_CAPACITY;
     }
     /* Retain a valid local cut's actual history without inventing an actual
