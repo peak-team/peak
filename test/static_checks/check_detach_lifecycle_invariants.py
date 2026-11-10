@@ -2357,6 +2357,9 @@ def check_global_detach_overhead_selection(repo_root):
     heartbeat = extract_function(source, "peak_heartbeat_monitor")
     comparator = extract_function(source, "compare_ratio_de")
     wait_helper = extract_function(source, "peak_heartbeat_wait_us")
+    service_helper = extract_function(
+        source, "peak_heartbeat_wait_with_mpi_service"
+    )
 
     global_detach_marker = "/* 2) Global detach. */"
     reattach_marker = "/* 3) Reattach. */"
@@ -2372,12 +2375,33 @@ def check_global_detach_overhead_selection(repo_root):
             "global detach must sort candidates by actual overhead ratio")
     require(comparator.find("x->ratio") < comparator.find("x->rate"),
             "global detach comparator must prioritize ratio before rate")
-    initial_wait = heartbeat.find("peak_heartbeat_wait_us(initial_sleep_us)")
+    initial_wait = heartbeat.find(
+        "peak_heartbeat_wait_with_mpi_service(initial_sleep_us,"
+    )
     loop_start = heartbeat.find("while (atomic_load(&heartbeat_running))")
     require("pthread_cond_timedwait" in wait_helper,
             "heartbeat wait helper must use the existing condition wait")
     require(initial_wait != -1 and loop_start != -1 and initial_wait < loop_start,
             "heartbeat must wait one interval before the first detach decision")
+    due_capture = service_helper.find(
+        "const double due = peak_second() + (double)sleep_us / 1e6;"
+    )
+    service_loop = service_helper.find("for (;;)")
+    due_guard = service_helper.find("if (now >= due) return TRUE;")
+    service_tick = service_helper.find("peak_mpi_causal_runtime_tick(")
+    require(0 <= due_capture < service_loop and
+            service_loop < due_guard < service_tick,
+            "MPI service turns must preserve the absolute heartbeat deadline "
+            "before any runtime tick")
+    require(re.search(
+                r"\bpeak_general_controller_[A-Za-z0-9_]*\s*\(",
+                service_helper,
+            ) is None and
+            re.search(
+                r"\bgum_interceptor_(?:attach|detach)\s*\(",
+                service_helper,
+            ) is None,
+            "MPI service wait must not make controller decisions or mutate hooks")
     require("PEAK_HEARTBEAT_MIN_OBSERVATION_US" in source and
             "min_detach_observation_time" in heartbeat and
             "detach_observation_ready" in heartbeat and
