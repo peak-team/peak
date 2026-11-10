@@ -991,7 +991,7 @@ int peak_mpi_causal_service_ingest_record(PeakMpiCausalService *s, unsigned r,
   }
   if (!a->coarse && rec->kind != PEAK_MPI_OBSERVER_EVENT_OBJECT &&
       peak_mpi_causal_batches_backpressured(s->batches) &&
-      peak_mpi_causal_service_runnable(s))
+      !s->recovery_reset && peak_mpi_causal_service_runnable(s))
     return 0; /* Transport retains this exact, still-unacknowledged record. */
   if (!a->coarse && rec->kind != PEAK_MPI_OBSERVER_EVENT_OBJECT &&
       !peak_mpi_causal_batches_ingest(s->batches, r, rec))
@@ -3779,11 +3779,13 @@ int peak_mpi_causal_service_runnable(const PeakMpiCausalService *s) {
   /* Old closed history is not runnable while recovery waits for remote
    * witnesses or replaces the normal parser's state. */
   return s && s->config.rank == s->config.owner_rank && !s->hard_fault &&
-         !s->local_fault && !s->recovery_needed && !s->recovery_reset &&
-         !s->recovery_incomplete && !s->recovery_restart &&
-         (s->recovery.state == PEAK_MPI_RECOVERY_NONE ||
-          s->recovery.state == PEAK_MPI_RECOVERY_ACK) &&
-         peak_mpi_causal_batches_runnable(s->batches);
+         !s->local_fault && !s->recovery_restart &&
+         ((s->recovery_needed && s->recovery_reset &&
+           s->recovery.state == PEAK_MPI_RECOVERY_QUERY) ||
+          (!s->recovery_needed && !s->recovery_reset && !s->recovery_incomplete &&
+           (s->recovery.state == PEAK_MPI_RECOVERY_NONE ||
+            s->recovery.state == PEAK_MPI_RECOVERY_ACK) &&
+           peak_mpi_causal_batches_runnable(s->batches)));
 }
 int peak_mpi_causal_service_feedback(const PeakMpiCausalService *s,
                                      PeakMpiPolicyFeedback *f) {
