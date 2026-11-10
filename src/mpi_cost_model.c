@@ -88,7 +88,7 @@ struct PeakMpiCostModel {
     uint32_t continuation_count;
     uint32_t group_node, group_edge, group_inputs;
     bool group_unknown, ordering, has_reverse, has_owner_conflict;
-    bool requires_qualified_g_build;
+    bool requires_qualified_g_build, final_dag;
     uint64_t search_stamp, group_stamp;
     unsigned reset_stage;
     uint32_t reset_cursor;
@@ -448,6 +448,7 @@ static void search_start(PeakMpiCostModel *m, uint32_t i)
         return;
     }
     ++m->search_stamp;
+    m->final_dag = false;
     m->search_candidate = i;
     m->search_edge = NONE;
     m->queue_head = 0; m->queue_tail = 1;
@@ -731,6 +732,12 @@ static void run_step(PeakMpiCostModel *m)
                     ++m->stats.retained_candidates;
                 } else search_start(m, i);
             }
+            /* Strict G levels order every effective final edge, proving no
+             * final SCC can contain more than one node or a self-loop. */
+            CostEdge *edge = &m->edges[i];
+            if (m->final_dag && selected(m, edge) &&
+                m->nodes[edge->source].input_count >= m->nodes[edge->target].input_count)
+                m->final_dag = false;
         } else { m->phase = ORDER_RESET; m->cursor = 0; }
         break;
     case FILTER_SEARCH: search_step(m); break;
@@ -823,6 +830,7 @@ static void run_step(PeakMpiCostModel *m)
             n->input_count = (uint32_t)m->components[n->component].value;
             n->visited = false;
         } else {
+            m->final_dag = m->component_count == m->stats.active_nodes;
             m->ordering = false;
             m->component_count = 0;
             m->phase = FILTER_SCAN;
@@ -833,13 +841,18 @@ static void run_step(PeakMpiCostModel *m)
         if (m->cursor < m->stats.active_nodes) {
             uint32_t at = m->cursor++;
             CostNode *n = &m->nodes[m->node_ids[at]];
-            n->input_count = 0; n->component = NONE; n->visited = false;
+            n->input_count = 0; n->component = m->final_dag ? at : NONE; n->visited = false;
             memset(&m->components[at], 0, sizeof(m->components[at]));
             m->components[at].out = m->components[at].group = NONE;
             m->components[at].ready = m->components[at].all_slack = true;
             m->components[at].entries_qualified = true;
             m->components[at].min_wait = INFINITY;
-        } else { m->phase = DFS_SCAN; m->cursor = m->reverse_index = 0; }
+            if (m->final_dag) m->components[at].nodes = 1;
+        } else {
+            m->phase = m->final_dag ? AGG_NODES : DFS_SCAN;
+            if (m->final_dag) m->component_count = m->stats.active_nodes;
+            m->cursor = m->reverse_index = 0;
+        }
         break;
     case SCC_WALK: {
         /* Pop one member per work unit, including very large components. */
@@ -948,6 +961,7 @@ static PeakMpiCostStatus full_model_run(PeakMpiCostModel *m, size_t budget,
         if (m->graph_dirty) {
             m->phase = RESET_NODES;
             m->has_reverse = false; m->requires_qualified_g_build = false;
+            m->final_dag = false;
             m->finish_count = m->component_count = m->stack_size = 0;
             m->pending = m->root_projected && m->root_global_pending; m->all_closed = !m->root_projected || m->root_global_closed; m->has_owner_conflict = false;
             m->stats.scc_count = m->stats.excluded_candidates = m->stats.retained_candidates = 0;
