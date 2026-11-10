@@ -222,11 +222,22 @@ static unsigned root(PeakMpiCausalService *s, unsigned r) {
     r = s->ranks[r].parent;
   return r;
 }
+static void invalidate_feedback_cache(PeakMpiCausalService *s, unsigned cohort) {
+  s->cache_dirty = 1;
+  if (cohort < s->cache_root)
+    s->cache_root = cohort;
+}
 static void coarse(PeakMpiCausalService *s, unsigned r,
                    PeakMpiPolicyReason reason, uint64_t lost) {
   Rank *a = &s->ranks[r];
+  int prior_hard_fault = s->hard_fault;
   if (reason != PEAK_MPI_POLICY_EVENT_LOSS || !a->recovery.loss)
     s->hard_fault = 1;
+  unsigned cohort = root(s, r);
+  if (!a->coarse || a->reason != reason || lost ||
+      prior_hard_fault != s->hard_fault) {
+    invalidate_feedback_cache(s, cohort);
+  }
   if (!a->coarse &&
       (!s->recovery.state || s->recovery.state == PEAK_MPI_RECOVERY_ACK))
     s->recovery_g =
@@ -234,7 +245,6 @@ static void coarse(PeakMpiCausalService *s, unsigned r,
   a->coarse = 1;
   a->reason = reason;
   a->lost += lost;
-  unsigned cohort = root(s, r);
   for (unsigned j = 0; j < s->config.world_size; j++)
     if (root(s, j) == cohort)
       s->ranks[j].coarse = 1;
@@ -2554,7 +2564,7 @@ static int publish_work(PeakMpiCausalService *s, size_t budget) {
         PeakMpiPolicyResult result =
             peak_mpi_policy_submit_cut(leader->policy, &c, s->now);
         if (result != PEAK_MPI_POLICY_IGNORED)
-          s->cache_dirty = 1;
+          invalidate_feedback_cache(s, s->pub_root);
         if (result == PEAK_MPI_POLICY_INVALID ||
             result == PEAK_MPI_POLICY_CAPACITY)
           coarse(s, s->pub_root, PEAK_MPI_POLICY_BAD_CUT, 0);
@@ -3261,7 +3271,7 @@ static int recovery_work(PeakMpiCausalService *s, size_t budget, size_t *used) {
         s->recovery_reset = s->recovery_rank = 0;
         s->engine_phase = 0;
         s->parse_window_open = s->parse_finish_only = 0;
-        s->cache_dirty = 1;
+        invalidate_feedback_cache(s, 0);
         continue;
       }
       ++*used;

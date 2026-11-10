@@ -828,7 +828,182 @@ static void test_input_backpressure(void) {
        "boundedparse+exactretry+duplicate PASS");
 }
 
+static PeakMpiCausalService *fault_make_partial(void) {
+  PeakMpiCausalServiceConfig c = {0};
+  c.rank = c.owner_rank = 0;
+  c.world_size = 4;
+  c.job_context = 99;
+  c.incarnation = 100;
+  c.address = "127.0.0.1";
+  c.port = 39878;
+  c.slots = 2;
+  c.queue_frames = 16;
+  c.max_operations = 64;
+  c.max_context_parts = 32;
+  c.max_pending_records = 64;
+  c.model = (PeakMpiCostConfig){1024, 4096, 1024, 128, 4, 64};
+  c.policy = (PeakMpiPolicyConfig){4, .1, 1, .5, 0, 0, 1};
+  PeakMpiCausalService *s = peak_mpi_causal_service_create(&c);
+  assert(s);
+  return s;
+}
+static void fault_seed(PeakMpiCausalService *s, int joined) {
+  assert(merge(s, 0, 1));
+  if (!joined)
+    assert(merge(s, 2, 3));
+  for (unsigned rank = 0; rank < s->config.world_size; rank += 2) {
+    PeakMpiPolicy *p = s->ranks[rank].policy;
+    PeakMpiPolicyCohortKey key = s->ranks[rank].key;
+    PeakMpiPolicySample samples[2];
+    stale_samples(samples, 1, .01, .01, 1);
+    for (unsigned j = 0; j < 2; j++) {
+      samples[j].member.process = rank + j;
+      assert(peak_mpi_policy_record_raw(p, key, &samples[j], 1) ==
+             PEAK_MPI_POLICY_OK);
+    }
+    PeakMpiPolicyCut c = stale_cut(samples, 1, 0);
+    c.cohort = key;
+    assert(peak_mpi_policy_submit_cut(p, &c, 1) == PEAK_MPI_POLICY_OK);
+  }
+  s->now = 1;
+}
+static void check_fault_cache(unsigned why, int partial) {
+  PeakMpiCausalService *s = partial ? fault_make_partial() : make();
+  fault_seed(s, !partial);
+  assert(prepare_feedback_cache(s, 100000) && !s->cache_dirty);
+  PeakMpiPolicyFeedback old = s->feedback_cache[0], next;
+  assert(old.mode == PEAK_MPI_POLICY_COMPLETE);
+  PeakMpiPolicyReceiver receiver;
+  assert(!peak_mpi_policy_receiver_init(&receiver, &stale_cfg, s->ranks[0].key,
+                                        stale_ids[0], 1));
+  assert(!peak_mpi_policy_receiver_rebind(&receiver, s->ranks[0].key, 2, 1, 1));
+  assert(!peak_mpi_policy_receiver_accept(&receiver, &old, 1));
+  if (partial) {
+    s->cache_dirty = 1;
+    size_t needed = peak_mpi_policy_feedback_batch_work(s->ranks[0].policy) + 4;
+    assert(prepare_feedback_cache(s, needed) > 0);
+    assert(s->cache_root == 1 && s->cache_dirty);
+  }
+  s->now = 1.1;
+  if (why == PEAK_MPI_POLICY_EVENT_LOSS) {
+    PeakMpiObserverRecord r = {0};
+    r.incarnation = 100;
+    r.thread_uid = r.thread_generation = 1;
+    r.sequence = 2;
+    assert(peak_mpi_causal_service_ingest_record(s, 0, &r));
+  } else
+    sink_fault(s, 0, (PeakMpiPolicyReason)why);
+  printf("why%u partial%d dirty%d cursor%u\n", why, partial, s->cache_dirty,
+         s->cache_root);
+  assert(s->cache_dirty);
+  assert(prepare_feedback_cache(s, 100000) > 0 && !s->cache_dirty);
+  assert(sink_feedback(s, 0, 1.1, &next));
+  printf("new mode%d reason%d g%g gen%llu old%llu\n", next.mode, next.reason,
+         next.g, (unsigned long long)next.generation,
+         (unsigned long long)old.generation);
+  assert(next.mode == PEAK_MPI_POLICY_COARSE && next.reason == why &&
+         next.g == 2 && next.generation > old.generation);
+  assert(peak_mpi_policy_receiver_accept(&receiver, &next, 1.1) ==
+         PEAK_MPI_POLICY_OK);
+  double received = receiver.received_at;
+  assert(peak_mpi_policy_receiver_accept(&receiver, &next, 1.2) ==
+             PEAK_MPI_POLICY_IGNORED &&
+         receiver.received_at == received);
+  assert(!prepare_feedback_cache(s, 100000) &&
+         s->feedback_cache[0].generation == next.generation);
+  coarse(s, 0, (PeakMpiPolicyReason)why, 0);
+  assert(!s->cache_dirty && !prepare_feedback_cache(s, 100000) &&
+         s->feedback_cache[0].generation == next.generation);
+  s->now = 1.3;
+  coarse(s, 0, (PeakMpiPolicyReason)why, 1);
+  assert(s->cache_dirty && prepare_feedback_cache(s, 100000));
+  PeakMpiPolicyFeedback lost;
+  sink_feedback(s, 0, 1.3, &lost);
+  assert(lost.generation > next.generation &&
+         lost.lost_events > next.lost_events);
+  assert(!peak_mpi_policy_receiver_accept(&receiver, &lost, 1.3));
+  if (partial)
+    assert(s->feedback_cache[2].mode == PEAK_MPI_POLICY_COMPLETE);
+  peak_mpi_causal_service_destroy(s);
+}
+static void test_cache_publish_cursor(void) {
+  PeakMpiCausalService *s = fault_make_partial();
+  fault_seed(s, 0);
+  assert(prepare_feedback_cache(s, 100000));
+  PeakMpiPolicyFeedback old = s->feedback_cache[0];
+  s->cache_dirty = 1;
+  size_t needed = peak_mpi_policy_feedback_batch_work(s->ranks[0].policy) + 4;
+  assert(prepare_feedback_cache(s, needed) > 0 && s->cache_root == 1);
+  PeakMpiPolicySample samples[2];
+  stale_samples(samples, 2, .02, .02, 1.1);
+  PeakMpiPolicy *p = s->ranks[0].policy;
+  for (unsigned j = 0; j < 2; j++)
+    assert(!peak_mpi_policy_record_raw(p, s->ranks[0].key, &samples[j], 1.1));
+  memcpy(s->samples, samples, sizeof samples);
+  s->now = s->pub_started = 1.1;
+  s->generation = 1;
+  s->pub_stage = 4;
+  s->pub_root = 0;
+  s->pub_count = 2;
+  s->pub_complete = 1;
+  s->pub_F = .02;
+  s->pub_age = s->pub_oldest = 0;
+  s->pub_epoch = s->epoch;
+  assert(!publish_work(s, 10) && s->pub_root == 1);
+  assert(prepare_feedback_cache(s, 100000) > 0);
+  PeakMpiPolicyFeedback next;
+  sink_feedback(s, 0, 1.1, &next);
+  printf("publish afterpartial gen%llu old%llu A%.17g\n",
+         (unsigned long long)next.generation,
+         (unsigned long long)old.generation, next.A_cut);
+  assert(next.generation > old.generation && next.A_cut == .02);
+  peak_mpi_causal_service_destroy(s);
+}
+static void test_cache_recovery_cursor(void) {
+  PeakMpiCausalService *s = fault_make_partial();
+  fault_seed(s, 0);
+  assert(prepare_feedback_cache(s, 100000));
+  s->cache_dirty = 1;
+  size_t need = peak_mpi_policy_feedback_batch_work(s->ranks[0].policy) + 4;
+  assert(prepare_feedback_cache(s, need) > 0 && s->cache_root == 1);
+  for (unsigned i = 0; i < s->config.world_size; i++) {
+    PeakMpiPolicy *p = s->ranks[i].policy;
+    peak_mpi_policy_recover_begin(p, 1.1, 1);
+    size_t used;
+    while (!peak_mpi_policy_recover_work(p, 100000, &used)) {
+    }
+  }
+  s->now = 1.1;
+  s->recovery_needed = 1;
+  s->recovery.state = PEAK_MPI_RECOVERY_QUERY;
+  s->recovery.epoch = 2;
+  s->recovery_reset = 7;
+  s->recovery_rank = s->config.world_size;
+  size_t used;
+  assert(!recovery_work(s, 1, &used));
+  assert(s->recovery.state == PEAK_MPI_RECOVERY_ACK);
+  assert(prepare_feedback_cache(s, 100000) > 0);
+  printf("recovery partialroot0 feedbackepoch%llu expected2\n",
+         (unsigned long long)s->ranks[0].feedback_epoch);
+  assert(s->ranks[0].feedback_epoch == 2);
+  PeakMpiPolicyFeedback f;
+  assert(sink_feedback(s, 0, 1.1, &f) &&
+         f.recovery.state == PEAK_MPI_RECOVERY_ACK);
+  peak_mpi_causal_service_destroy(s);
+}
+static void test_fault_cache(void) {
+  test_cache_publish_cursor();
+  test_cache_recovery_cursor();
+  check_fault_cache(PEAK_MPI_POLICY_EVENT_LOSS, 0);
+  check_fault_cache(PEAK_MPI_POLICY_EVENT_LOSS, 1);
+  for (unsigned reason = PEAK_MPI_POLICY_MISSING_CONTRACT;
+       reason <= PEAK_MPI_POLICY_BAD_CUT; reason++)
+    check_fault_cache(reason, 0);
+  puts("fault cache publication +partialcohort replay+receiverduplicate PASS");
+}
+
 int main(void) {
+  test_fault_cache();
   test_input_backpressure();
   test_compact_batches();
   test_compact_backend();
