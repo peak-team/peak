@@ -68,8 +68,10 @@ enum {
   PEAK_MPI_CAUSAL_LEGACY_INPUT = 1u << 22,
   /* Initialization proved SINGLE/FUNNELED callers, not progress or slack. */
   PEAK_MPI_CAUSAL_ORDERED_CALLER = 1u << 23,
+  PEAK_MPI_CAUSAL_COMPACT_GROUP = PEAK_MPI_OBSERVER_COMPACT_GROUP,
   PEAK_MPI_CAUSAL_APP_COST_KNOWN = PEAK_MPI_OBSERVER_APP_COST_KNOWN
 };
+#define PEAK_MPI_CAUSAL_EMIT_PRECHARGED UINT32_C(0x40000000)
 #define PEAK_MPI_CAUSAL_CUT_PRECAPTURED UINT32_C(0x80000000)
 #define PEAK_MPI_CAUSAL_ANY_SOURCE (-1)
 #define PEAK_MPI_CAUSAL_PROC_NULL (-2)
@@ -94,7 +96,14 @@ typedef struct {
   int32_t members[PEAK_MPI_CAUSAL_COMM_MEMBERS_PER_PART];
 } PeakMpiCausalCommPart;
 
-/* CALL_BEGIN/END share op_uid; batch_uid is a conservative concurrent group.
+/* COMPACT_GROUP is only emitted for proven SINGLE/FUNNELED callers. Its
+ * CALL_BEGIN/END carry omitted group L/P/A in the record's reserved aliases,
+ * previous-group identity in result_ref, group control generation in
+ * policy_generation, and group elapsed nanoseconds in partition (low32) /
+ * completion_index (high32). Those fields are otherwise unused on these CALL
+ * endpoints. Request subrecord progress/completion fields remain unchanged.
+ * The parser restores four logical boundaries without inventing sequences.
+ * CALL_BEGIN/END share op_uid; batch_uid is a conservative concurrent group.
  * input_ref at CALL_BEGIN is the previous completed call on THIS THREAD.
  * Group records use input_ref for the previous group. This group relationship
  * is cost ownership metadata, never a cross-thread MPI matching guarantee.

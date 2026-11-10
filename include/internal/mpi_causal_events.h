@@ -54,6 +54,9 @@ void peak_mpi_causal_runtime_observer_work(PeakMpiCausalWorkKind,
 /* Sample before an MPI call without publishing a semantic event. Required for
  * failed polling calls, which must add cost but no dependency. */
 void peak_mpi_causal_runtime_boundary(PeakMpiObserverRecord *);
+/* Compact END: charge its one physical emit and freeze its call cut before
+ * capturing the separate group cut; submit will not charge/freeze it twice. */
+void peak_mpi_causal_runtime_prepare_submit(PeakMpiObserverRecord *);
 void peak_mpi_causal_runtime_submit(PeakMpiObserverRecord *,
                                     int actual_interprocess);
 void peak_mpi_causal_runtime_define(const PeakMpiObserverObject *);

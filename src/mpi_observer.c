@@ -306,7 +306,8 @@ PeakMpiObserverStatus peak_mpi_observer_emit(PeakMpiObserver *o,
     copy.thread_uid = p->thread_uid;
     copy.thread_generation = p->generation;
     copy.sequence = seq;
-    memset(copy.reserved, 0, sizeof(copy.reserved));
+    if (!(copy.flags & PEAK_MPI_OBSERVER_COMPACT_GROUP))
+        copy.group_L_cut = copy.group_P_cut = copy.group_A_cut = 0;
     s->records[head % o->config.records_per_slot] = copy;
     atomic_store_explicit(&s->head, head + 1, memory_order_release);
     return PEAK_MPI_OBSERVER_OK;

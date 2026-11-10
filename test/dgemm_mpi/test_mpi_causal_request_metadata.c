@@ -40,6 +40,10 @@ void peak_mpi_causal_runtime_boundary(PeakMpiObserverRecord *r) {
   r->P_cut = r->A_cut = r->L_cut = cost;
   r->flags |= PEAK_MPI_CAUSAL_APP_COST_KNOWN;
 }
+void peak_mpi_causal_runtime_prepare_submit(PeakMpiObserverRecord *r) {
+  peak_mpi_causal_runtime_boundary(r);
+  r->flags |= PEAK_MPI_CAUSAL_CUT_PRECAPTURED | PEAK_MPI_CAUSAL_EMIT_PRECHARGED;
+}
 void peak_mpi_causal_runtime_submit(PeakMpiObserverRecord *r, int actual) {
   pthread_mutex_lock(&collected);
   if (require_buffer_activation &&
@@ -258,9 +262,10 @@ int main(int argc, char **argv) {
   assert(argc == 2);
   setenv("PEAK_MPI_COMPLETION_CAPACITY", "1024", 1);
   int provided;
-  assert(PMPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided) ==
+  int requested = (!strcmp(argv[1], "startup-compact") || !strcmp(argv[1], "compact-request")) ? MPI_THREAD_FUNNELED : MPI_THREAD_MULTIPLE;
+  assert(PMPI_Init_thread(&argc, &argv, requested, &provided) ==
              MPI_SUCCESS &&
-         provided == MPI_THREAD_MULTIPLE);
+         provided == requested);
   PeakMpiObserverConfig cfg = {1, 256, 4, 100};
   observer = peak_mpi_observer_create(&cfg);
   assert(observer);
@@ -274,7 +279,17 @@ int main(int argc, char **argv) {
       .observed_collective_completion = 1,
       .name = "unit",
       .reason = "unit"};
-  if (!strcmp(argv[1], "alias")) {
+  if (!strcmp(argv[1], "startup-compact")) {
+    for (int i = 0; i < 100; ++i) {
+      int value = world_rank == 0 ? i : -1;
+      assert(MPI_Bcast(&value, 1, MPI_INT, 0, MPI_COMM_WORLD) == MPI_SUCCESS && value == i);
+    }
+    PeakMpiObserverSlotState state;
+    assert(peak_mpi_observer_slot_state(observer, 0, &state));
+    fprintf(stderr, "startup rank=%d records=%llu lost=%llu failures=%u\n", world_rank,
+      (unsigned long long)state.published, (unsigned long long)state.lost, failures);
+    assert(state.published == 200 && !state.lost && !failures);
+  } else if (!strcmp(argv[1], "alias") || !strcmp(argv[1], "compact-request")) {
     MPI_Request r[2];
     MPI_Status statuses[2];
     int value = 1;
@@ -679,6 +694,11 @@ int main(int argc, char **argv) {
     assert(!failures && peak_mpi_observer_slot_state(observer, 0, &state) &&
            !state.lost && peak_mpi_observer_coarse_reason(observer) ==
                               PEAK_MPI_OBSERVER_REASON_NONE);
+  }
+  if (!strcmp(argv[1], "compact-request")) {
+    PeakMpiObserverSlotState state;
+    assert(peak_mpi_observer_slot_state(observer, 0, &state) &&
+           state.published == 8 && !state.lost);
   }
   no_reservations();
   assert(PMPI_Finalize() == MPI_SUCCESS);

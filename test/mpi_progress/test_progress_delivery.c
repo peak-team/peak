@@ -429,7 +429,296 @@ static void test_feedback_cache_guard(void) {
   puts("clean feedback cache retains tuple/raw fees; aged receiver blocks; "
        "dirty fresh cut recovers PASS");
 }
+static PeakMpiObserverRecord compact_rec(unsigned phase, unsigned seq,
+                                         unsigned uid, unsigned cost) {
+  PeakMpiObserverRecord r = {0};
+  r.incarnation = 1;
+  r.thread_uid = 1;
+  r.thread_generation = 1;
+  r.sequence = seq;
+  r.phase = phase;
+  r.op_uid = uid;
+  r.batch_uid = 100;
+  r.kind = PEAK_MPI_OBSERVER_EVENT_START;
+  r.flags = PEAK_MPI_CAUSAL_APP_COST_KNOWN | PEAK_MPI_CAUSAL_ORDERED_CALLER;
+  r.L_cut = r.A_cut = cost;
+  r.P_cut = cost / 2;
+  r.operation = PEAK_MPI_CAUSAL_BCAST;
+  return r;
+}
+static PeakMpiCausalBatchView compact_ready(PeakMpiCausalBatches *b) {
+  PeakMpiCausalBatchView v;
+  assert(peak_mpi_causal_batches_prepare_next(b, 100, &v) == 1);
+  return v;
+}
+static void test_compact_batches(void) {
+  PeakMpiObserverRecord full[4] = {
+      compact_rec(PEAK_MPI_CAUSAL_GROUP_BEGIN, 1, 100, 2),
+      compact_rec(PEAK_MPI_CAUSAL_CALL_BEGIN, 2, 10, 4),
+      compact_rec(PEAK_MPI_CAUSAL_CALL_END, 3, 10, 6),
+      compact_rec(PEAK_MPI_CAUSAL_GROUP_END, 4, 100, 8)};
+  full[0].progress_end = 1000000000;
+  full[3].progress_end = 2000000000;
+  full[0].operation = full[3].operation = 0;
+  full[3].completion_count = 1;
+  full[0].control_generation = 1;
+  full[1].control_generation = 2;
+  full[2].control_generation = 3;
+  full[3].control_generation = 4;
+  PeakMpiObserverRecord compact[2] = {full[1], full[2]};
+  for (unsigned i = 0; i < 2; i++) {
+    compact[i].flags |= PEAK_MPI_CAUSAL_COMPACT_GROUP;
+    compact[i].sequence = i + 1;
+    compact[i].group_L_cut = compact[i].group_A_cut = i ? 8 : 2;
+    compact[i].group_P_cut = i ? 4 : 1;
+    compact[i].policy_generation = i ? 4 : 1;
+    compact[i].partition = i ? 2000000000 : 1000000000;
+    compact[i].progress_end = 0;
+  }
+  PeakMpiCausalBatches *a = peak_mpi_causal_batches_create_with_slots(1, 2, 32),
+                       *b = peak_mpi_causal_batches_create_with_slots(1, 2, 32);
+  assert(a && b);
+  for (unsigned i = 0; i < 4; i++)
+    assert(peak_mpi_causal_batches_ingest(a, 0, &full[i]));
+  for (unsigned i = 0; i < 2; i++)
+    assert(peak_mpi_causal_batches_ingest(b, 0, &compact[i]));
+  PeakMpiCausalBatchView va = compact_ready(a), vb = compact_ready(b);
+  assert(va.record_count == 4 && vb.record_count == 4);
+  for (unsigned i = 0; i < 4; i++) {
+    const PeakMpiObserverRecord *x = peak_mpi_causal_batches_record_at(a, i),
+                                *y = peak_mpi_causal_batches_record_at(b, i);
+    assert(x->phase == y->phase && x->op_uid == y->op_uid &&
+           x->batch_uid == y->batch_uid && x->input_ref == y->input_ref &&
+           x->L_cut == y->L_cut && x->A_cut == y->A_cut &&
+           x->P_cut == y->P_cut &&
+           x->control_generation == y->control_generation);
+    if (i == 0 || i == 3)
+      assert(x->progress_end == y->progress_end);
+  }
+  assert(peak_mpi_causal_batches_pending(a) == 4 &&
+         peak_mpi_causal_batches_pending(b) == 2);
+  PeakMpiObserverRecord saved_begin = *vb.begin, saved_end = *vb.end;
+  PeakMpiObserverRecord later[2] = {compact[0], compact[1]};
+  for (unsigned i = 0; i < 2; i++) {
+    later[i].op_uid = 20;
+    later[i].batch_uid = 200;
+    later[i].result_ref = 100;
+    later[i].input_ref = 10;
+    later[i].sequence += 2;
+    later[i].L_cut += 10;
+    later[i].A_cut += 10;
+    later[i].P_cut += 5;
+    later[i].group_L_cut += 10;
+    later[i].group_A_cut += 10;
+    later[i].group_P_cut += 5;
+    assert(peak_mpi_causal_batches_ingest(b, 0, &later[i]));
+  }
+  PeakMpiCausalBatchView same;
+  assert(peak_mpi_causal_batches_prepare_next(b, 1, &same) == 1);
+  assert(vb.begin == same.begin && vb.end == same.end &&
+         !memcmp(vb.begin, &saved_begin, sizeof saved_begin) &&
+         !memcmp(vb.end, &saved_end, sizeof saved_end));
+
+  peak_mpi_causal_batches_commit(a);
+  peak_mpi_causal_batches_commit(b);
+  PeakMpiCausalBatchView v;
+  assert(!peak_mpi_causal_batches_prepare_next(a, 100, &v));
+  assert(peak_mpi_causal_batches_prepare_next(b, 100, &v) == 1 &&
+         v.group_uid == 200);
+  peak_mpi_causal_batches_commit(b);
+  assert(!peak_mpi_causal_batches_prepare_next(b, 100, &v));
+  assert(!peak_mpi_causal_batches_pending(a) &&
+         !peak_mpi_causal_batches_pending(b));
+  peak_mpi_causal_batches_destroy(a);
+  peak_mpi_causal_batches_destroy(b);
+  for (unsigned bad = 0; bad < 3; bad++) {
+    b = peak_mpi_causal_batches_create_with_slots(1, 2, 32);
+    PeakMpiObserverRecord x = compact[0], y = compact[1];
+    if (!bad)
+      x.flags &= ~PEAK_MPI_CAUSAL_ORDERED_CALLER;
+    else if (bad == 1)
+      y.thread_uid = 2;
+    else
+      y.op_uid++;
+    assert(peak_mpi_causal_batches_ingest(b, 0, &x));
+    assert(peak_mpi_causal_batches_ingest(b, 0, &y));
+    assert(peak_mpi_causal_batches_prepare_next(b, 100, &v) == -1);
+    peak_mpi_causal_batches_destroy(b);
+  }
+  b = peak_mpi_causal_batches_create_with_slots(1, 2, 32);
+  PeakMpiObserverRecord body[4] = {
+      compact[0], compact_rec(PEAK_MPI_CAUSAL_REQUEST_COMPLETE, 2, 30, 5),
+      compact_rec(PEAK_MPI_CAUSAL_REQUEST_COMPLETE, 3, 31, 5), compact[1]};
+  body[3].sequence = 4;
+  body[3].completion_count = 2;
+  for (unsigned i = 1; i <= 2; i++) {
+    body[i].flags |= PEAK_MPI_CAUSAL_COMPACT_GROUP;
+    body[i].batch_uid = 10;
+    body[i].progress_begin = 100 + i;
+    body[i].progress_end = 200 + i;
+  }
+  for (unsigned i = 0; i < 4; i++)
+    assert(peak_mpi_causal_batches_ingest(b, 0, &body[i]));
+  v = compact_ready(b);
+  assert(v.record_count == 6 && v.native_count == 1 &&
+         v.end->completion_count == 1 &&
+         peak_mpi_causal_batches_pending(b) == 4);
+  assert(peak_mpi_causal_batches_record_at(b, 2)->progress_begin == 101 &&
+         peak_mpi_causal_batches_record_at(b, 2)->progress_end == 201 &&
+         peak_mpi_causal_batches_record_at(b, 3)->progress_begin == 102 &&
+         peak_mpi_causal_batches_record_at(b, 3)->progress_end == 202);
+  assert(peak_mpi_causal_batches_record_at(b, 4)->phase ==
+             PEAK_MPI_CAUSAL_CALL_END &&
+         peak_mpi_causal_batches_record_at(b, 4)->completion_count == 2);
+  peak_mpi_causal_batches_commit(b);
+  assert(!peak_mpi_causal_batches_prepare_next(b, 100, &v) &&
+         !peak_mpi_causal_batches_pending(b));
+  peak_mpi_causal_batches_destroy(b);
+  puts("compact exact four cuts/control/identity; physical prefix and retire; "
+       "malformed PASS");
+}
+
+static PeakMpiCausalService *compact_shape(int compact, int serial) {
+  PeakMpiCausalService *s = make();
+  for (unsigned rank = 0; rank < 2; rank++) {
+    PeakMpiObserverRecord a[4] = {0};
+    unsigned phases[4] = {PEAK_MPI_CAUSAL_GROUP_BEGIN,
+                          PEAK_MPI_CAUSAL_CALL_BEGIN, PEAK_MPI_CAUSAL_CALL_END,
+                          PEAK_MPI_CAUSAL_GROUP_END};
+    for (unsigned i = 0; i < 4; i++) {
+      a[i].incarnation = 100 + rank;
+      a[i].thread_uid = 1;
+      a[i].thread_generation = 1;
+      a[i].sequence = i + 1;
+      a[i].phase = phases[i];
+      a[i].op_uid = (i == 0 || i == 3) ? 100 : 10;
+      a[i].batch_uid = 100;
+      a[i].kind = PEAK_MPI_OBSERVER_EVENT_START;
+      a[i].flags =
+          PEAK_MPI_CAUSAL_ORDERED_CALLER | PEAK_MPI_CAUSAL_APP_COST_KNOWN;
+      a[i].L_cut = a[i].A_cut = (2 + 2 * i + rank) * 1000000000ULL;
+      a[i].P_cut = a[i].A_cut / 2;
+      a[i].control_generation = i;
+      a[i].communicator_uid = 1;
+      a[i].capability_uid = PEAK_MPI_PROGRESS_INTEL_2021_11_ASYNC;
+      a[i].progress_scope = PEAK_MPI_OBSERVER_SCOPE_AUTONOMOUS;
+      a[i].operation =
+          (i == 0 || i == 3) ? 0
+          : serial ? (rank ? PEAK_MPI_CAUSAL_RECV : PEAK_MPI_CAUSAL_SEND)
+                   : PEAK_MPI_CAUSAL_ALLREDUCE;
+      a[i].peer = a[i].actual_source = 1 - rank;
+      a[i].tag = a[i].actual_tag = 7;
+      a[i].collective_ordinal = 1;
+    }
+    a[0].progress_end = 100000000000ULL + rank * 1000000000ULL;
+    a[3].progress_end = 200000000000ULL + rank * 1000000000ULL;
+    a[3].completion_count = 1;
+    a[2].flags |= PEAK_MPI_OBSERVER_PROGRESS_SEALED;
+    if (!serial) {
+      a[1].flags |= PEAK_MPI_CAUSAL_COLLECTIVE;
+      a[2].flags |= PEAK_MPI_CAUSAL_COLLECTIVE;
+    }
+    if (compact) {
+      for (unsigned i = 1; i <= 2; i++) {
+        a[i].flags |= PEAK_MPI_CAUSAL_COMPACT_GROUP;
+        a[i].sequence = i;
+        a[i].group_L_cut = a[i].group_A_cut = a[i == 1 ? 0 : 3].A_cut;
+        a[i].group_P_cut = a[i == 1 ? 0 : 3].P_cut;
+        a[i].policy_generation = i == 1 ? 0 : 3;
+        a[i].partition = (uint32_t)a[i == 1 ? 0 : 3].progress_end;
+        a[i].completion_index =
+            (uint32_t)(a[i == 1 ? 0 : 3].progress_end >> 32);
+        assert(peak_mpi_causal_batches_ingest(s->batches, rank, &a[i]));
+      }
+    } else
+      for (unsigned i = 0; i < 4; i++)
+        assert(peak_mpi_causal_batches_ingest(s->batches, rank, &a[i]));
+  }
+  for (unsigned rank = 0; rank < 2; rank++) {
+    unsigned char peers[2] = {1, 1};
+    PeakMpiCausalRaw raw = {0};
+    raw.generation = 1;
+    raw.incarnation = 100 + rank;
+    raw.control_generation = 3;
+    raw.L = raw.A = 8 + rank;
+    raw.P = raw.A / 2;
+    raw.app_cost_known = 1;
+    raw.cut = (PeakMpiCostCut){(uint64_t)(raw.P * 1e9), (uint64_t)(raw.A * 1e9),
+                               (uint64_t)(raw.L * 1e9)};
+    raw.elapsed = 200 + rank;
+    raw.active = 1;
+    raw.known_peers = peers;
+    raw.peer_count = 2;
+    assert(peak_mpi_causal_service_ingest_raw(s, rank, &raw, 1));
+  }
+  parse_batches(s, 10000);
+  run(s);
+  assert(publish_work(s, 100000));
+  return s;
+}
+static void test_compact_backend(void) {
+  for (int serial = 0; serial < 2; serial++) {
+    PeakMpiCausalService *a = compact_shape(0, serial),
+                         *b = compact_shape(1, serial);
+    for (unsigned rank = 0; rank < 2; rank++) {
+      Operation *x = find_op(a, rank, 10), *y = find_op(b, rank, 10);
+      assert(x && y);
+      double dx, dy;
+      PeakMpiCostStatus sx = peak_mpi_cost_model_delay(a->model, x->exit, &dx),
+                        sy = peak_mpi_cost_model_delay(b->model, y->exit, &dy);
+      assert(sx == PEAK_MPI_COST_OK && sx == sy && dx == dy);
+      assert(a->ranks[rank].last_A_cut == b->ranks[rank].last_A_cut &&
+             a->ranks[rank].last_P_cut == b->ranks[rank].last_P_cut &&
+             a->ranks[rank].last_raw_L_cut == b->ranks[rank].last_raw_L_cut);
+      assert(a->ranks[rank].covered.elapsed == b->ranks[rank].covered.elapsed &&
+             a->ranks[rank].covered.elapsed == 200 + rank);
+      PeakMpiPolicyFeedback fa, fb;
+      assert(peak_mpi_policy_feedback(a->ranks[root(a, rank)].policy,
+                                      (PeakMpiPolicyMemberId){rank, 99}, 1,
+                                      &fa) == PEAK_MPI_POLICY_OK);
+      assert(peak_mpi_policy_feedback(b->ranks[root(b, rank)].policy,
+                                      (PeakMpiPolicyMemberId){rank, 99}, 1,
+                                      &fb) == PEAK_MPI_POLICY_OK);
+      assert(fa.T_safe == fb.T_safe && fa.T_safe > 0 && fa.F == fb.F &&
+             fa.risk == fb.risk);
+      PeakMpiPolicyReceiver ra, rb;
+      PeakMpiPolicyDecision da, db;
+      assert(peak_mpi_policy_receiver_init(&ra, &a->config.policy, fa.cohort,
+                                           fa.member, 1) == PEAK_MPI_POLICY_OK);
+      assert(peak_mpi_policy_receiver_init(&rb, &b->config.policy, fb.cohort,
+                                           fb.member, 1) == PEAK_MPI_POLICY_OK);
+      assert(
+          peak_mpi_policy_receiver_accept(&ra, &fa, 1) == PEAK_MPI_POLICY_OK &&
+          peak_mpi_policy_receiver_accept(&rb, &fb, 1) == PEAK_MPI_POLICY_OK);
+      assert(peak_mpi_policy_receiver_snapshot_cut(
+                 &ra, 1, fa.local_elapsed_at_cut, fa.cut, 100, &da) ==
+             PEAK_MPI_POLICY_OK);
+      assert(peak_mpi_policy_receiver_snapshot_cut(
+                 &rb, 1, fb.local_elapsed_at_cut, fb.cut, 100, &db) ==
+             PEAK_MPI_POLICY_OK);
+      assert(da.global_available && db.global_available &&
+             da.feedback_age_seconds == db.feedback_age_seconds &&
+             da.available_headroom == db.available_headroom &&
+             da.q_eff == db.q_eff && da.detach_target == db.detach_target &&
+             da.candidate_stop_target == db.candidate_stop_target &&
+             da.cadence_target == db.cadence_target &&
+             da.reattach_future_rate_target == db.reattach_future_rate_target);
+      assert(peak_mpi_policy_receiver_snapshot_cut(&ra, 5, fa.local_elapsed_at_cut + 4, fa.cut, 100, &da) == PEAK_MPI_POLICY_OK);
+      assert(peak_mpi_policy_receiver_snapshot_cut(&rb, 5, fb.local_elapsed_at_cut + 4, fb.cut, 100, &db) == PEAK_MPI_POLICY_OK);
+      assert(da.mode == PEAK_MPI_POLICY_STALE && db.mode == PEAK_MPI_POLICY_STALE &&
+             da.feedback_age_seconds == db.feedback_age_seconds &&
+             !da.reattach_relaxation && !db.reattach_relaxation && da.q_eff == db.q_eff);
+      printf("backend serial=%d rank=%u D=%.17g "
+             "exactcosts/elapsed/headroom/targets PASS\n",
+             serial, rank, dx);
+    }
+    peak_mpi_causal_service_destroy(a);
+    peak_mpi_causal_service_destroy(b);
+  }
+}
 int main(void) {
+  test_compact_batches();
+  test_compact_backend();
   test_delayed_receiver_pressure();
   test_stale_feedback();
   test_feedback_cache_guard();

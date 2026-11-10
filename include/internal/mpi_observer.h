@@ -73,7 +73,8 @@ enum {
     PEAK_MPI_OBSERVER_SLACK_NO_OPEN_PROGRESS = 1u << 3,
     PEAK_MPI_OBSERVER_CANCELLED = 1u << 4,
     PEAK_MPI_OBSERVER_APP_COST_KNOWN = 1u << 24,
-    PEAK_MPI_OBSERVER_PROGRESS_ESTIMATED = 1u << 25
+    PEAK_MPI_OBSERVER_PROGRESS_ESTIMATED = 1u << 25,
+    PEAK_MPI_OBSERVER_COMPACT_GROUP = 1u << 26
 };
 
 typedef struct {
@@ -86,7 +87,11 @@ typedef struct {
     uint32_t kind, operation, phase, flags, progress_scope;
     uint32_t partition, completion_index, completion_count;
     uint64_t A_cut; /* Billable application cost; valid only with APP_COST_KNOWN. */
-    uint64_t reserved[3];
+    /* COMPACT_GROUP only: preserve the omitted group endpoint cost cut. */
+    union {
+        uint64_t reserved[3];
+        struct { uint64_t group_L_cut, group_P_cut, group_A_cut; };
+    };
 } PeakMpiObserverRecord;
 
 typedef struct {

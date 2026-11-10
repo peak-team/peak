@@ -25,7 +25,7 @@ typedef struct {
   size_t free_next, begin, end, successor, ready_next;
   size_t operation_head, operation_tail, begin_head, begin_tail;
   size_t operations, begins, ends, pairs, activations, subrecords;
-  int queued, exposed;
+  int queued, exposed, implicit;
 } BatchGroup;
 enum {
   IDLE,
@@ -53,6 +53,7 @@ struct PeakMpiCausalBatches {
   size_t ready_head, ready_tail, current, plan_count;
   size_t cursor, parent_cursor, retire, retire_operation, retire_epoch;
   int state, compact_plan;
+  PeakMpiObserverRecord implicit_begin, implicit_end;
   unsigned reset_stage;
   size_t reset_cursor;
   unsigned error_rank;
@@ -166,7 +167,7 @@ static void maybe_ready(PeakMpiCausalBatches *b, size_t index) {
   BatchGroup *g = &b->groups[index];
   if (b->state == ERROR || g->begin == NONE || g->end == NONE)
     return;
-  size_t expected = b->entries[g->end].r.completion_count;
+  size_t expected = g->implicit ? 1 : b->entries[g->end].r.completion_count;
   if (!expected || g->begins > expected || g->ends > expected ||
       g->operations > expected) {
     invalid(b, g->rank, g->uid);
@@ -304,6 +305,27 @@ int peak_mpi_causal_batches_ingest(PeakMpiCausalBatches *b, unsigned rank,
     invalid(b, rank, r->op_uid);
     return 1;
   }
+  int implicit = (r->flags & PEAK_MPI_CAUSAL_COMPACT_GROUP) != 0;
+  if (implicit && (!(r->flags & PEAK_MPI_CAUSAL_ORDERED_CALLER) || !r->batch_uid || !r->op_uid ||
+      r->phase == PEAK_MPI_CAUSAL_GROUP_BEGIN || r->phase == PEAK_MPI_CAUSAL_GROUP_END ||
+      r->group_P_cut > r->group_L_cut ||
+      ((r->flags & PEAK_MPI_CAUSAL_APP_COST_KNOWN) &&
+       (r->group_P_cut > r->group_A_cut || r->group_A_cut > r->group_L_cut)))) {
+    invalid(b, rank, r->op_uid);
+    return 1;
+  }
+  if (implicit &&
+      ((r->phase == PEAK_MPI_CAUSAL_CALL_BEGIN &&
+        (r->group_L_cut > r->L_cut || r->group_P_cut > r->P_cut ||
+         ((r->flags & PEAK_MPI_CAUSAL_APP_COST_KNOWN) && r->group_A_cut > r->A_cut) ||
+         r->policy_generation > r->control_generation)) ||
+       (r->phase == PEAK_MPI_CAUSAL_CALL_END &&
+        (r->group_L_cut < r->L_cut || r->group_P_cut < r->P_cut ||
+         ((r->flags & PEAK_MPI_CAUSAL_APP_COST_KNOWN) && r->group_A_cut < r->A_cut) ||
+         r->policy_generation < r->control_generation)))) {
+    invalid(b, rank, r->op_uid);
+    return 1;
+  }
   size_t group = NONE, op = NONE;
   if (r->phase == PEAK_MPI_CAUSAL_GROUP_BEGIN ||
       r->phase == PEAK_MPI_CAUSAL_GROUP_END)
@@ -336,10 +358,28 @@ int peak_mpi_causal_batches_ingest(PeakMpiCausalBatches *b, unsigned rank,
     invalid(b, rank, b->groups[group].uid);
     return 1;
   }
+  if (implicit && group == NONE) {
+    invalid(b, rank, r->op_uid);
+    return 1;
+  }
+  if (group != NONE && b->groups[group].implicit) {
+    BatchGroup *g = &b->groups[group];
+    const PeakMpiObserverRecord *first = &b->entries[g->begin].r;
+    if (!implicit || g->end != NONE || first->thread_uid != r->thread_uid ||
+        first->thread_generation != r->thread_generation ||
+        first->incarnation != r->incarnation || first->sequence >= r->sequence ||
+        ((r->phase == PEAK_MPI_CAUSAL_CALL_END || r->phase == PEAK_MPI_CAUSAL_CALL_BEGIN) &&
+         (first->op_uid != r->op_uid || first->result_ref != r->result_ref))) {
+      invalid(b, rank, g->uid);
+      return 1;
+    }
+  }
+  int implicit_begin = implicit && r->phase == PEAK_MPI_CAUSAL_CALL_BEGIN;
+  uint64_t previous = implicit_begin ? r->result_ref : r->input_ref;
   size_t predecessor = NONE;
-  if (r->phase == PEAK_MPI_CAUSAL_GROUP_BEGIN &&
-      r->input_ref != b->last[rank]) {
-    predecessor = group_find(b, rank, r->input_ref, 1);
+  if ((r->phase == PEAK_MPI_CAUSAL_GROUP_BEGIN || implicit_begin) &&
+      previous != b->last[rank]) {
+    predecessor = group_find(b, rank, previous, 1);
     if (predecessor == NONE)
       return 0;
   }
@@ -360,6 +400,33 @@ int peak_mpi_causal_batches_ingest(PeakMpiCausalBatches *b, unsigned rank,
     else
       b->entries[e->slot_previous].slot_next = record;
     b->slot_tail[at] = record;
+  }
+  if (implicit_begin) {
+    BatchGroup *g = &b->groups[group];
+    if (g->begin != NONE || g->end != NONE || g->operations || previous == g->uid) {
+      invalid(b, rank, g->uid);
+      return 1;
+    }
+    g->implicit = 1;
+    g->begin = record;
+    g->previous = previous;
+    if (previous == b->last[rank]) {
+      if (b->rank_next[rank] != NONE && b->rank_next[rank] != group)
+        invalid(b, rank, g->uid);
+      else b->rank_next[rank] = group;
+    } else {
+      if (b->groups[predecessor].successor != NONE &&
+          b->groups[predecessor].successor != group)
+        invalid(b, rank, g->uid);
+      else b->groups[predecessor].successor = group;
+    }
+  } else if (implicit && r->phase == PEAK_MPI_CAUSAL_CALL_END) {
+    BatchGroup *g = &b->groups[group];
+    if (!g->implicit || g->end != NONE) {
+      invalid(b, rank, g->uid);
+      return 1;
+    }
+    g->end = record;
   }
   if (r->phase == PEAK_MPI_CAUSAL_GROUP_BEGIN) {
     BatchGroup *g = &b->groups[group];
@@ -432,7 +499,7 @@ int peak_mpi_causal_batches_ingest(PeakMpiCausalBatches *b, unsigned rank,
     maybe_ready(b, group);
   return 1;
 }
-static void view(const PeakMpiCausalBatches *b, PeakMpiCausalBatchView *v) {
+static void view(PeakMpiCausalBatches *b, PeakMpiCausalBatchView *v) {
   if (!v)
     return;
   memset(v, 0, sizeof(*v));
@@ -449,6 +516,43 @@ static void view(const PeakMpiCausalBatches *b, PeakMpiCausalBatchView *v) {
   v->concurrent = g->begins > 1;
   v->begin = &b->entries[g->begin].r;
   v->end = &b->entries[g->end].r;
+  if (g->implicit) {
+    PeakMpiCausalBatches *mutable = b;
+    mutable->implicit_begin = *v->begin;
+    mutable->implicit_end = *v->end;
+    PeakMpiObserverRecord *begin = &mutable->implicit_begin, *end = &mutable->implicit_end;
+    begin->kind = PEAK_MPI_OBSERVER_EVENT_LOCAL_COST;
+    begin->phase = PEAK_MPI_CAUSAL_GROUP_BEGIN;
+    begin->operation = 0;
+    begin->op_uid = g->uid;
+    begin->input_ref = begin->result_ref;
+    begin->result_ref = 0;
+    begin->flags &= ~PEAK_MPI_CAUSAL_COMPACT_GROUP;
+    const PeakMpiObserverRecord *physical_end = v->end;
+    *end = (PeakMpiObserverRecord){
+      .incarnation = physical_end->incarnation,
+      .thread_uid = physical_end->thread_uid,
+      .thread_generation = physical_end->thread_generation,
+      .sequence = physical_end->sequence,
+      .kind = PEAK_MPI_OBSERVER_EVENT_BATCH_END,
+      .phase = PEAK_MPI_CAUSAL_GROUP_END,
+      .op_uid = g->uid, .batch_uid = g->uid, .completion_count = 1,
+      .flags = physical_end->flags & PEAK_MPI_CAUSAL_APP_COST_KNOWN,
+      .L_cut = physical_end->group_L_cut, .P_cut = physical_end->group_P_cut,
+      .A_cut = physical_end->group_A_cut,
+      .control_generation = physical_end->policy_generation,
+      .progress_end = (uint64_t)physical_end->partition |
+                      ((uint64_t)physical_end->completion_index << 32)
+    };
+    begin->L_cut = begin->group_L_cut; begin->P_cut = begin->group_P_cut; begin->A_cut = begin->group_A_cut;
+    begin->control_generation = begin->policy_generation;
+    begin->progress_end = (uint64_t)begin->partition |
+                          ((uint64_t)begin->completion_index << 32);
+    begin->partition = begin->completion_index = 0;
+    begin->group_L_cut = begin->group_P_cut = begin->group_A_cut = 0;
+    begin->policy_generation = 0;
+    v->begin = begin; v->end = end;
+  }
 }
 static void free_record(PeakMpiCausalBatches *b, size_t index) {
   BatchEntry *e = &b->entries[index];
@@ -573,8 +677,11 @@ int peak_mpi_causal_batches_prepare_next_work(PeakMpiCausalBatches *b,
     } else if (b->state == RETIRE_RECORDS) {
       if (b->retire == b->plan_count)
         b->state = RETIRE_OPERATIONS;
-      else
-        free_record(b, record_index_at(b, b->retire++));
+      else {
+        size_t index = b->retire++;
+        if (!b->groups[b->current].implicit || (index && index + 1 < b->plan_count))
+          free_record(b, record_index_at(b, index));
+      }
     } else if (b->state == RETIRE_OPERATIONS) {
       if (b->retire_operation == NONE)
         b->state = RETIRE_GROUP;
@@ -613,9 +720,12 @@ int peak_mpi_causal_batches_prepare_next(PeakMpiCausalBatches *b, size_t budget,
 }
 const PeakMpiObserverRecord *
 peak_mpi_causal_batches_record_at(const PeakMpiCausalBatches *b, size_t index) {
-  return b && b->state == READY && index < b->plan_count
-             ? &b->entries[record_index_at(b, index)].r
-             : NULL;
+  if (!b || b->state != READY || index >= b->plan_count) return NULL;
+  if (b->groups[b->current].implicit) {
+    if (!index) return &b->implicit_begin;
+    if (index + 1 == b->plan_count) return &b->implicit_end;
+  }
+  return &b->entries[record_index_at(b, index)].r;
 }
 const PeakMpiObserverRecord *
 peak_mpi_causal_batches_call_end(const PeakMpiCausalBatches *b, unsigned rank,

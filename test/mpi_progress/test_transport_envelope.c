@@ -48,7 +48,29 @@ static uint64_t random_word(void) {
   return v;
 }
 int main(void) {
+  _Static_assert(sizeof(PeakMpiObserverRecord) == 256, "fixed producer record");
   unsigned char b[4096], original[64];
+  PeakMpiObserverRecord r = {0}, decoded;
+  r.incarnation = 22; r.thread_uid = r.thread_generation = r.sequence = 1;
+  r.flags = PEAK_MPI_CAUSAL_COMPACT_GROUP | PEAK_MPI_CAUSAL_ORDERED_CALLER;
+  r.group_L_cut = UINT64_MAX; r.group_A_cut = UINT64_MAX - 1;
+  r.group_P_cut = UINT64_C(0x123456789abcdef0);
+  r.result_ref = UINT64_MAX; r.policy_generation = UINT64_MAX;
+  size_t rn = record_encode(b, &r);
+  assert(rn == 256);
+  record_decode(b, &decoded);
+  assert(!memcmp(&r, &decoded, sizeof r));
+  rn = packed_record(b, &r, 22);
+  assert(rn < 256 && unpack_record(b, rn, 22, &decoded));
+  assert(!memcmp(&r, &decoded, sizeof r));
+  PeakMpiCausalTransport old_receiver = {0};
+  old_receiver.cap = sizeof b;
+  FrameHeader old_header;
+  unsigned char *old = b;
+  p32(&old, UINT32_C(0x504d4336));
+  assert(frame_header(&old_receiver, b, 4, &old_header) == -1);
+  old = b; p32(&old, UINT32_C(0x504d4336) ^ UINT32_C(0x80000000));
+  assert(frame_header(&old_receiver, b, 4, &old_header) == -1);
   PeakMpiCausalTransport t = {0}, sender_header = {0};
   t.cap = sizeof b;
   FrameHeader h;
@@ -162,7 +184,7 @@ int main(void) {
         unsigned char wire[4096];
         PeakMpiObserverRecord r = {0};
         r.incarnation = 23;
-        assert(packed_record(wire + HDR, &r, 22) == 232);
+        assert(packed_record(wire + HDR, &r, 22) == 256);
         size_t n = record_encode(wire + HDR, &r);
         size_t size = frame(&sender, wire, RECORD, n, 1);
         assert(write(fd, wire, size) == (ssize_t)size);

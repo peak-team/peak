@@ -83,6 +83,18 @@ static void submit_event(PeakMpiObserverRecord *r, int actual) {
       (!current_call->capture_epoch ||
        current_call->capture_epoch != peak_mpi_causal_runtime_capture_epoch()))
     return;
+  if (current_call && (current_call->begin.flags & PEAK_MPI_CAUSAL_COMPACT_GROUP) &&
+      (r->phase == PEAK_MPI_CAUSAL_REQUEST_ACTIVATE ||
+       r->phase == PEAK_MPI_CAUSAL_REQUEST_COMPLETE ||
+       r->phase == PEAK_MPI_CAUSAL_REQUEST_RETIRED ||
+       r->phase == PEAK_MPI_CAUSAL_MESSAGE_BOUND)) {
+    r->flags |= PEAK_MPI_CAUSAL_COMPACT_GROUP | PEAK_MPI_CAUSAL_ORDERED_CALLER;
+    if (r->phase == PEAK_MPI_CAUSAL_REQUEST_ACTIVATE) {
+      r->result_ref = r->policy_generation = 0;
+      r->partition = r->completion_index = 0;
+      r->group_L_cut = r->group_P_cut = r->group_A_cut = 0;
+    }
+  }
   peak_mpi_causal_runtime_submit(r, actual);
 }
 static uint64_t group_capture_epoch = 1;
@@ -494,7 +506,19 @@ static void publish_begin(Context *c) {
     emit_group = 1;
   }
   pthread_mutex_unlock(&metadata);
-  if (emit_group)
+  if ((c->begin.flags & PEAK_MPI_CAUSAL_ORDERED_CALLER) &&
+      !c->begin.result_ref && !c->begin.policy_generation &&
+      !c->begin.partition && !c->begin.completion_index &&
+      !c->begin.group_L_cut && !c->begin.group_P_cut && !c->begin.group_A_cut) {
+    c->begin.flags |= PEAK_MPI_CAUSAL_COMPACT_GROUP;
+    c->begin.result_ref = group_begin.input_ref;
+    c->begin.group_L_cut = group_begin.L_cut;
+    c->begin.group_P_cut = group_begin.P_cut;
+    c->begin.group_A_cut = group_begin.A_cut;
+    c->begin.policy_generation = group_begin.control_generation;
+    c->begin.partition = (uint32_t)group_begin.progress_end;
+    c->begin.completion_index = (uint32_t)(group_begin.progress_end >> 32);
+  } else if (emit_group)
     submit_event(&group, 0);
   submit_event(&c->begin, 0);
   c->emitted = 1;
@@ -634,7 +658,11 @@ static void end_call(Context *c, int rc, PeakMpiObserverRecord *details,
         &contract, (PeakMpiCausalOperation)r.operation, r.flags, 0, &scope);
     r.progress_scope = scope;
   }
-  submit_event(&r, actual);
+  int compact = (r.flags & PEAK_MPI_CAUSAL_COMPACT_GROUP) != 0;
+  if (compact) {
+    peak_mpi_causal_runtime_prepare_submit(&r);
+  } else
+    submit_event(&r, actual);
   c->previous = r.op_uid;
   PeakMpiObserverRecord end;
   int emit_end = 0;
@@ -670,7 +698,15 @@ static void end_call(Context *c, int rc, PeakMpiObserverRecord *details,
   if (group_active)
     --group_active;
   pthread_mutex_unlock(&metadata);
-  if (emit_end)
+  if (compact && emit_end) {
+    r.group_L_cut = end.L_cut;
+    r.group_P_cut = end.P_cut;
+    r.group_A_cut = end.A_cut;
+    r.policy_generation = end.control_generation;
+    r.partition = (uint32_t)end.progress_end;
+    r.completion_index = (uint32_t)(end.progress_end >> 32);
+    submit_event(&r, actual);
+  } else if (emit_end)
     submit_event(&end, actual);
   c->observing = 0;
   if (current_call == c)

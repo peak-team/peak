@@ -388,6 +388,13 @@ void peak_mpi_causal_runtime_boundary(PeakMpiObserverRecord *r) {
       r->phase == PEAK_MPI_CAUSAL_GROUP_END)
     r->progress_end = ns(clock_seconds() - origin);
 }
+void peak_mpi_causal_runtime_prepare_submit(PeakMpiObserverRecord *r) {
+  if (!peak_mpi_causal_runtime_capture_enabled() || !get_producer())
+    return;
+  peak_mpi_causal_cost_observer_add(producer.slot, emit_price);
+  peak_mpi_causal_runtime_boundary(r);
+  r->flags |= PEAK_MPI_CAUSAL_CUT_PRECAPTURED | PEAK_MPI_CAUSAL_EMIT_PRECHARGED;
+}
 void peak_mpi_causal_runtime_submit(PeakMpiObserverRecord *r, int remote) {
   if (!peak_mpi_causal_runtime_enabled())
     return;
@@ -396,10 +403,11 @@ void peak_mpi_causal_runtime_submit(PeakMpiObserverRecord *r, int remote) {
   if (!peak_mpi_causal_runtime_capture_enabled() || !get_producer())
     return;
   peak_mpi_observer_activate(capture);
-  peak_mpi_causal_cost_observer_add(producer.slot, emit_price);
+  if (!(r->flags & PEAK_MPI_CAUSAL_EMIT_PRECHARGED))
+    peak_mpi_causal_cost_observer_add(producer.slot, emit_price);
   if (!(r->flags & PEAK_MPI_CAUSAL_CUT_PRECAPTURED))
     peak_mpi_causal_runtime_boundary(r);
-  r->flags &= ~PEAK_MPI_CAUSAL_CUT_PRECAPTURED;
+  r->flags &= ~(PEAK_MPI_CAUSAL_CUT_PRECAPTURED | PEAK_MPI_CAUSAL_EMIT_PRECHARGED);
   peak_mpi_observer_emit(capture, &producer, r);
 }
 void peak_mpi_causal_runtime_define(const PeakMpiObserverObject *o) {

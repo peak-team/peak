@@ -12,7 +12,7 @@
 
 #define HDR 40u /* Retained allocation/payload reservation, not wire length. */
 
-#define MAGIC UINT32_C(0x504d4336)
+#define MAGIC UINT32_C(0x504d4337)
 #define DENSE_MAGIC (MAGIC ^ UINT32_C(0x80000000))
 enum { SEND_BATCH_FRAMES = 16 };
 enum { HELLO = 1, RECORD, OBJECT, RAW, ACK, FEEDBACK, WMRQ, PACKED_RECORD, PACKED_RAW, PACKED_FEEDBACK };
@@ -98,7 +98,7 @@ static double gd(const unsigned char **p) {
   X(P_cut)                                                                     \
   X(control_generation) X(communicator_uid) X(request_uid)                     \
       X(request_generation) X(activation) X(collective_ordinal) X(batch_uid)   \
-          X(wait_ns) X(capability_uid) X(policy_generation)
+          X(wait_ns) X(capability_uid) X(policy_generation) X(group_L_cut) X(group_P_cut) X(group_A_cut)
 #define R32(X)                                                                 \
   X(peer)                                                                      \
   X(tag)                                                                       \
@@ -169,8 +169,8 @@ enum { RECORD_FIELDS = 0 R64(FIELD_COUNT) R32(FIELD_COUNT),
 #undef FIELD_COUNT
 _Static_assert(RECORD_FIELDS < 64, "record field-presence bitmap");
 static size_t packed_record(unsigned char *b, const PeakMpiObserverRecord *r, uint64_t incarnation) {
-  if (r->incarnation != incarnation) return 232;
-  PackedOut w = {b + RECORD_MASK_BYTES, b + 232, 1};
+  if (r->incarnation != incarnation) return 256;
+  PackedOut w = {b + RECORD_MASK_BYTES, b + 256, 1};
   uint64_t mask = 0; unsigned bit = 0;
 #define E64(f) if (offsetof(PeakMpiObserverRecord, f) != offsetof(PeakMpiObserverRecord, incarnation) && r->f) { mask |= UINT64_C(1) << bit; pack_uint(&w, r->f); } ++bit;
 #define E32(f) if ((uint32_t)r->f) { uint32_t v = (uint32_t)r->f; mask |= UINT64_C(1) << bit; pack_uint(&w, (v << 1) ^ (0u - (v >> 31))); } ++bit;
@@ -179,7 +179,7 @@ static size_t packed_record(unsigned char *b, const PeakMpiObserverRecord *r, ui
 #undef E32
   for (unsigned i = 0; i < RECORD_MASK_BYTES; ++i)
     b[i] = (unsigned char)(mask >> (8*i));
-  return w.ok ? (size_t)(w.p - b) : 232;
+  return w.ok ? (size_t)(w.p - b) : 256;
 }
 static int unpack_record(const unsigned char *b, size_t n, uint64_t incarnation,
                          PeakMpiObserverRecord *r) {
@@ -765,7 +765,7 @@ static int enqueue(PeakMpiCausalTransport *t, unsigned type, const void *v) {
     return 0;
   if (type == RECORD) {
     n = packed_record(b + HDR, v, t->c.incarnation);
-    if (n < 232) type = PACKED_RECORD;
+    if (n < 256) type = PACKED_RECORD;
     else n = record_encode(b + HDR, v);
   }
   else if (type == OBJECT)
@@ -781,7 +781,7 @@ static int enqueue(PeakMpiCausalTransport *t, unsigned type, const void *v) {
 static int deliver(PeakMpiCausalTransport *t, unsigned rank, uint64_t inc,
                    unsigned type, const unsigned char *b, size_t n,
                    double now) {
-  if ((type == RECORD && n == 232) || type == PACKED_RECORD) {
+  if ((type == RECORD && n == 256) || type == PACKED_RECORD) {
     PeakMpiObserverRecord r;
     if (type == PACKED_RECORD) {
       if (!unpack_record(b, n, inc, &r)) {

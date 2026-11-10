@@ -15,6 +15,9 @@ static double bits(uint64_t v) {
   return d;
 }
 int main(void) {
+  /* PMC7 carries the three previously reserved group-cut words. Exercise all
+   * 256 dense bytes and place the sentinel after that exact fixed bound. */
+  _Static_assert(sizeof(PeakMpiObserverRecord) == 256, "fixed producer record");
   unsigned char dense[2828], packed[2829], again[2828], peers[256],
       outpeers[256];
   uint64_t prefixes[288], outprefix[288];
@@ -22,7 +25,7 @@ int main(void) {
   PeakMpiObserverRecord e, f;
   unsigned dense_records = 0, dense_raws = 0;
   for (unsigned k = 0; k < 2048; k++) {
-    for (unsigned i = 0; i < 232; i++)
+    for (unsigned i = 0; i < 256; i++)
       dense[i] = (k % 2) ? (unsigned char)next() : 0;
     record_decode(dense, &e);
     if (k % 4 == 1) {
@@ -35,10 +38,10 @@ int main(void) {
 #undef S32
           record_encode(dense, &e);
     }
-    packed[232] = 0xab;
+    packed[256] = 0xab;
     size_t n = packed_record(packed, &e, e.incarnation);
-    assert(n <= 232);
-    if (n < 232) {
+    assert(n <= 256);
+    if (n < 256) {
       assert(unpack_record(packed, n, e.incarnation, &f));
       for (size_t cut = 0; cut < n; cut++)
         assert(!unpack_record(packed, cut, e.incarnation, &f));
@@ -49,8 +52,8 @@ int main(void) {
       record_decode(packed, &f);
     }
     record_encode(again, &f);
-    assert(!memcmp(dense, again, 232));
-    assert(packed[232] == 0xab);
+    assert(!memcmp(dense, again, 256));
+    assert(packed[256] == 0xab);
     memset(&a, 0, sizeof a);
     a.incarnation = next();
     a.generation = k + 1;
@@ -146,10 +149,10 @@ int main(void) {
     x.incarnation = 22;
     x.sequence = 1;
     size_t n = packed_record(packed, &x, 22);
-    assert(n < 232);
+    assert(n < 256);
     packed[0] |= 1;
     assert(!unpack_record(packed, n, 22, &y));
-    assert(packed_record(packed, &x, 23) == 232);
+    assert(packed_record(packed, &x, 23) == 256);
     a.incarnation = 22;
     assert(packed_raw(packed, &a, 23) == 2828);
   }
