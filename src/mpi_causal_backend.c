@@ -3567,14 +3567,16 @@ void peak_mpi_causal_service_destroy(PeakMpiCausalService *s) {
   free(s->peers);
   free(s);
 }
-void peak_mpi_causal_service_tick(PeakMpiCausalService *s,
+void peak_mpi_causal_service_tick_budget(PeakMpiCausalService *s,
                                   PeakMpiObserver *capture,
                                   const PeakMpiCausalRaw *raw, double now,
-                                  size_t bytes, size_t work) {
+                                  size_t *bytes_left, size_t *work_left) {
+  size_t bytes = *bytes_left, work = *work_left;
   if (!s || !raw)
     return;
   struct timespec begin, end;
   clock_gettime(CLOCK_THREAD_CPUTIME_ID, &begin);
+  s->last_tick_work = 0;
   s->now = now;
   PeakMpiCausalRaw local_raw = *raw;
   if (s->local_fault) {
@@ -3585,7 +3587,7 @@ void peak_mpi_causal_service_tick(PeakMpiCausalService *s,
   size_t pre_cache_work = 0;
   if (s->config.rank == s->config.owner_rank && s->cache_dirty)
     pre_cache_work = prepare_feedback_cache(s, work);
-  peak_mpi_causal_transport_tick(s->transport, capture, &local_raw, now, bytes);
+  *bytes_left = peak_mpi_causal_transport_tick(s->transport, capture, &local_raw, now, bytes);
   if (s->config.rank == s->config.owner_rank) {
     size_t recovery_used = 0;
     int recovering = recovery_work(s, work - pre_cache_work, &recovery_used);
@@ -3747,7 +3749,13 @@ accounting: {
   clock_gettime(CLOCK_THREAD_CPUTIME_ID, &end);
   s->stats.observer_cpu_seconds += (double)(end.tv_sec - begin.tv_sec) +
                                    (double)(end.tv_nsec - begin.tv_nsec) * 1e-9;
+  *work_left = work - s->last_tick_work;
 }
+void peak_mpi_causal_service_tick(PeakMpiCausalService *s, PeakMpiObserver *capture,
+    const PeakMpiCausalRaw *raw, double now, size_t bytes, size_t work) {
+  peak_mpi_causal_service_tick_budget(s, capture, raw, now, &bytes, &work);
+}
+
 int peak_mpi_causal_service_feedback(const PeakMpiCausalService *s,
                                      PeakMpiPolicyFeedback *f) {
   if (!s || !f)

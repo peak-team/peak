@@ -1359,6 +1359,21 @@ static void peak_general_listener_test_fast_pause(
 pthread_once_t pthread_pause_once_ctrl = PTHREAD_ONCE_INIT;
 pthread_mutex_t heartbeat_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t  heartbeat_cond  = PTHREAD_COND_INITIALIZER;
+#ifdef HAVE_MPI
+static int mpi_queue_pending;
+static void peak_mpi_causal_listener_notify_operation(int pending) {
+    pthread_mutex_lock(&heartbeat_mutex);
+    if (pending) mpi_queue_pending = 1;
+    pthread_cond_signal(&heartbeat_cond);
+    pthread_mutex_unlock(&heartbeat_mutex);
+}
+void peak_mpi_causal_listener_notify(void) {
+    peak_mpi_causal_listener_notify_operation(1);
+}
+void peak_mpi_causal_listener_calibrate_notify(void) {
+    peak_mpi_causal_listener_notify_operation(0);
+}
+#endif
 static __thread int last_cont_id = -1;
 static _Atomic int global_session_counter = 0;
 static int pthread_pause_ack_pipe[2] = { -1, -1 };
@@ -5342,29 +5357,49 @@ peak_heartbeat_wait_with_mpi_service(unsigned int sleep_us,
                                     unsigned int service_us)
 {
 #ifdef HAVE_MPI
-    if (peak_mpi_causal_runtime_requested() && service_us && sleep_us > service_us) {
+    if (peak_mpi_causal_runtime_requested() && service_us) {
         const double due = peak_second() + (double)sleep_us / 1e6;
+        double service_due = peak_second() + (double)service_us / 1e6;
+        int retry_queued = 1;
         for (;;) {
-            double remaining = due - peak_second();
-            if (remaining <= 0.0) return TRUE;
-            unsigned int wait_us = (unsigned int)MIN(
-                ceil(remaining * 1e6), (double)service_us);
-            if (!peak_heartbeat_wait_us(wait_us)) return FALSE;
             double now = peak_second();
             if (now >= due) return TRUE;
-            unsigned long long checkpoint = 0;
-            gboolean valid = peak_general_listener_thread_cpu_ns(&checkpoint);
-            if (!peak_mpi_causal_runtime_needs_service()) {
-                peak_general_listener_management_cpu_checkpoint(&checkpoint, &valid);
+            int available = peak_mpi_causal_runtime_service_available();
+            double next_due = available ? service_due : due;
+            pthread_mutex_lock(&heartbeat_mutex);
+            if (!atomic_load(&heartbeat_running)) {
+                pthread_mutex_unlock(&heartbeat_mutex);
+                return FALSE;
+            }
+            int queued = available && (mpi_queue_pending ||
+                (retry_queued && peak_mpi_causal_runtime_queue_pending()));
+            if (!queued && now < next_due) {
+                double wait = MIN(due, next_due) - now;
+                struct timespec ts;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                uint64_t ns = (uint64_t)ceil(wait * 1e9);
+                ts.tv_sec += ns / UINT64_C(1000000000);
+                ts.tv_nsec += ns % UINT64_C(1000000000);
+                if (ts.tv_nsec >= 1000000000L) { ++ts.tv_sec; ts.tv_nsec -= 1000000000L; }
+                pthread_cond_timedwait(&heartbeat_cond, &heartbeat_mutex, &ts);
+                pthread_mutex_unlock(&heartbeat_mutex);
                 continue;
             }
+            int scheduled = now >= service_due;
+            mpi_queue_pending = 0;
+            pthread_mutex_unlock(&heartbeat_mutex);
+            unsigned long long checkpoint = 0;
+            gboolean valid = peak_general_listener_thread_cpu_ns(&checkpoint);
             PeakDetachAccountingSnapshot accounting;
             peak_general_listener_runtime_accounting_snapshot(&accounting);
             double control = (double)
                 peak_general_listener_control_wall_ns_since_heartbeat(&accounting) / 1e9;
-            peak_mpi_causal_runtime_tick(now, MAX(now - peak_main_time, 1e-12),
+            retry_queued = peak_mpi_causal_runtime_tick(now, MAX(now - peak_main_time, 1e-12),
                 control, peak_general_listener_management_cpu_seconds(),
                 accounting.completed_stop_window_count + accounting.failed_stop_window_count);
+            if (scheduled) {
+                service_due = peak_second() + (double)service_us / 1e6;
+            }
             peak_general_listener_management_cpu_checkpoint(&checkpoint, &valid);
         }
     }
@@ -5431,7 +5466,7 @@ void* peak_heartbeat_monitor(void* arg) {
             (unsigned int)clipd((double)heartbeat_time,
                                 (double)hb_min_us,
                                 (double)hb_max_us);
-        if (!peak_heartbeat_wait_us(initial_sleep_us)) {
+        if (!peak_heartbeat_wait_with_mpi_service(initial_sleep_us, heartbeat_time ? heartbeat_time : hb_max_us)) {
             goto cleanup;
         }
     }
@@ -5451,7 +5486,7 @@ void* peak_heartbeat_monitor(void* arg) {
                 peak_general_listener_management_cpu_seconds(), 0);
             peak_general_listener_management_cpu_checkpoint(&management_cpu_checkpoint_ns,
                 &management_cpu_checkpoint_valid);
-            if (!peak_heartbeat_wait_us(heartbeat_time ? heartbeat_time : hb_max_us)) break;
+            if (!peak_heartbeat_wait_with_mpi_service(heartbeat_time ? heartbeat_time : hb_max_us, heartbeat_time ? heartbeat_time : hb_max_us)) break;
             continue;
         }
 #endif

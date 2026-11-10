@@ -40,6 +40,8 @@ static inline void peak_mpi_causal_profile_call(size_t slot) {
 
 int peak_mpi_causal_runtime_requested(void);
 int peak_mpi_causal_runtime_needs_service(void);
+int peak_mpi_causal_runtime_queue_pending(void);
+int peak_mpi_causal_runtime_service_available(void);
 int peak_mpi_causal_runtime_prepare(size_t slots, double q,
                                     double heartbeat_max_seconds,
                                     double ema_alpha);
@@ -55,7 +57,7 @@ void peak_mpi_causal_runtime_activation_begin(void);
 void peak_mpi_causal_runtime_activation_end(void);
 void peak_mpi_causal_runtime_mpi_initialized(void);
 void peak_mpi_causal_runtime_finalize(void);
-void peak_mpi_causal_runtime_tick(double now, double elapsed,
+int peak_mpi_causal_runtime_tick(double now, double elapsed,
                                   double control_seconds,
                                   double management_seconds,
                                   uint64_t control_generation);

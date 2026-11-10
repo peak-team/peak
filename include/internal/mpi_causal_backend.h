@@ -71,6 +71,8 @@ void peak_mpi_causal_service_tick(PeakMpiCausalService *service,
                                   PeakMpiObserver *capture,
                                   const PeakMpiCausalRaw *raw, double now,
                                   size_t byte_budget, size_t work_budget);
+void peak_mpi_causal_service_tick_budget(PeakMpiCausalService *, PeakMpiObserver *,
+    const PeakMpiCausalRaw *, double, size_t *bytes_left, size_t *work_left);
 int peak_mpi_causal_service_feedback(const PeakMpiCausalService *service,
                                      PeakMpiPolicyFeedback *feedback);
 uint64_t

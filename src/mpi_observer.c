@@ -30,6 +30,7 @@ _Static_assert(sizeof(PeakMpiObserverSlot) == 256,
                "review capture slot cache-line layout on this target");
 
 struct PeakMpiObserver {
+    void (*notify)(void);
     PeakMpiObserverConfig config;
     PeakMpiObserverSlot *slots;
     PeakMpiObserverRecord *records;
@@ -44,6 +45,20 @@ struct PeakMpiObserver {
     _Atomic unsigned fault_state; /* 0: none, 1: publishing, 2: immutable */
     PeakMpiObserverFault fault;
 };
+
+void peak_mpi_observer_set_notify(PeakMpiObserver *o, void (*notify)(void)) {
+    if (o) o->notify = notify;
+}
+
+int peak_mpi_observer_has_pending(const PeakMpiObserver *o) {
+    if (!o) return 0;
+    atomic_thread_fence(memory_order_seq_cst);
+    for (size_t i = 0; i < o->config.slots; ++i) {
+        uint64_t tail = atomic_load_explicit(&o->slots[i].tail, memory_order_acquire);
+        if (atomic_load_explicit(&o->slots[i].head, memory_order_acquire) != tail) return 1;
+    }
+    return 0;
+}
 
 static bool product_fits(size_t a, size_t b) {
     return b == 0 || a <= SIZE_MAX / b;
@@ -308,8 +323,16 @@ PeakMpiObserverStatus peak_mpi_observer_emit(PeakMpiObserver *o,
     copy.sequence = seq;
     if (!(copy.flags & PEAK_MPI_OBSERVER_COMPACT_GROUP))
         copy.group_L_cut = copy.group_P_cut = copy.group_A_cut = 0;
+#ifdef PEAK_MPI_OBSERVER_TEST_BEFORE_PUBLISH
+    peak_mpi_observer_test_before_publish(o);
+#endif
     s->records[head % o->config.records_per_slot] = copy;
     atomic_store_explicit(&s->head, head + 1, memory_order_release);
+    /* Paired with the final sleep-predicate fence: publication and drain
+     * cannot both miss each other on weakly ordered machines. */
+    atomic_thread_fence(memory_order_seq_cst);
+    uint64_t notified_tail = atomic_load_explicit(&s->tail, memory_order_acquire);
+    if (notified_tail == head && o->notify) o->notify();
     return PEAK_MPI_OBSERVER_OK;
 }
 

@@ -94,6 +94,13 @@ if(BUILD_TESTING)
             PASS_REGULAR_EXPRESSION "gum_mutation_allowlist_ok")
 
     if(PEAK_ENABLE_MPI AND UNIX)
+        add_executable(test_mpi_observer_notification mpi_progress/test_observer_notification.c)
+        target_include_directories(test_mpi_observer_notification PRIVATE ${PROJECT_SOURCE_DIR}/include)
+        target_compile_options(test_mpi_observer_notification PRIVATE -UNDEBUG)
+        target_link_libraries(test_mpi_observer_notification PRIVATE Threads::Threads)
+        add_test(NAME test_mpi_observer_notification COMMAND test_mpi_observer_notification)
+        set_tests_properties(test_mpi_observer_notification PROPERTIES TIMEOUT 20)
+
         add_executable(test_mpi_cost_model_dag mpi_progress/test_cost_model_dag.c)
         target_include_directories(test_mpi_cost_model_dag PRIVATE ${PROJECT_SOURCE_DIR}/include)
         target_compile_options(test_mpi_cost_model_dag PRIVATE -UNDEBUG)

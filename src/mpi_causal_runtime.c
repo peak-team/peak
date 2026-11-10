@@ -33,6 +33,8 @@ static size_t slots;
 static size_t observer_work_budget = 16384;
 static size_t configured_owner_byte_budget = 65536;
 static size_t effective_byte_budget = 65536;
+extern void peak_mpi_causal_listener_notify(void) __attribute__((weak));
+extern void peak_mpi_causal_listener_calibrate_notify(void) __attribute__((weak));
 static int rank_id, world_size;
 static int owner_rank, observer_cpu_requested = -1;
 static _Atomic int observer_cpu_effective = -1;
@@ -43,7 +45,7 @@ static uint64_t incarnation, raw_generation;
 static double origin, startup, activation_start;
 static _Atomic double control_cost, management_cost;
 static _Atomic uint64_t control_generation;
-static double boundary_price, boundary_slot_price, emit_price;
+static double boundary_price, boundary_slot_price, emit_price, notify_price;
 static double mode_seconds[5], previous_tick, exceeded_seconds,
     maximum_feedback_age;
 static uint64_t age_histogram[64], age_samples;
@@ -118,6 +120,18 @@ static size_t owner_byte_budget_from_environment(void) {
     return (size_t)parsed;
   fprintf(stderr, "[peak mpi causal] invalid PEAK_MPI_OBSERVER_OWNER_BYTE_BUDGET; using 65536 (valid range 1..16777216)\n");
   return 65536;
+}
+static void notify_queue_ready(void) {
+  if (atomic_load_explicit(&active, memory_order_relaxed) && peak_mpi_causal_listener_notify) {
+    if (producer_valid) peak_mpi_causal_cost_observer_add(producer.slot, notify_price);
+    peak_mpi_causal_listener_notify();
+  }
+}
+int peak_mpi_causal_runtime_service_available(void) {
+  return atomic_load_explicit(&backend_ready, memory_order_acquire) && service && heartbeat_enabled && atomic_load_explicit(&active, memory_order_relaxed);
+}
+int peak_mpi_causal_runtime_queue_pending(void) {
+  return atomic_load_explicit(&active, memory_order_relaxed) && peak_mpi_observer_has_pending(capture);
 }
 int peak_mpi_causal_runtime_requested(void) {
   const char *v = getenv("PEAK_MPI_CAUSAL_FEEDBACK");
@@ -255,6 +269,11 @@ int peak_mpi_causal_runtime_prepare(size_t n, double q, double hb, double ema) {
       peak_mpi_observer_release(calibration, &writer);
     }
     peak_mpi_observer_destroy(calibration);
+  }
+  if (peak_mpi_causal_listener_calibrate_notify) {
+    start = clock_seconds();
+    for (unsigned i = 0; i < 1024; ++i) peak_mpi_causal_listener_calibrate_notify();
+    notify_price = (clock_seconds() - start) / 1024;
   }
   startup = clock_seconds() - begin;
   return 1;
@@ -495,6 +514,7 @@ void peak_mpi_causal_runtime_mpi_initialized(void) {
   PeakMpiPolicyMemberId member = {(uint64_t)rank_id, context};
   peak_mpi_policy_receiver_init(&receiver, &policy, key, member,
                                 clock_seconds());
+  peak_mpi_observer_set_notify(capture, notify_queue_ready);
   atomic_store_explicit(&ready, 1, memory_order_release);
   peak_mpi_causal_events_init();
   PeakMpiCausalWorkPrices measured;
@@ -563,13 +583,13 @@ static int freeze_idle_raw(uint64_t previous_closed_group, void *data) {
   raw->idle_group_uid = previous_closed_group;
   return 1;
 }
-void peak_mpi_causal_runtime_tick(double now, double elapsed, double C,
+int peak_mpi_causal_runtime_tick(double now, double elapsed, double C,
                                   double M, uint64_t generation) {
   atomic_store_explicit(&control_cost, C, memory_order_relaxed);
   atomic_store_explicit(&management_cost, M, memory_order_relaxed);
   atomic_store_explicit(&control_generation, generation, memory_order_relaxed);
   if (!atomic_load_explicit(&backend_ready, memory_order_acquire))
-    return;
+    return 0;
   bind_observer_worker();
   uint64_t notified = peak_mpi_observer_loss_generation(capture);
   if (notified != handled_loss) {
@@ -609,7 +629,7 @@ void peak_mpi_causal_runtime_tick(double now, double elapsed, double C,
           now);
     }
     latch_capture_coarse();
-    return;
+    return 0;
   }
   for (int i = 0; i < world_size; i++)
     peer_snapshot[i] = atomic_load_explicit(&peers[i], memory_order_relaxed);
@@ -649,7 +669,9 @@ void peak_mpi_causal_runtime_tick(double now, double elapsed, double C,
   }
   double A = raw.A;
 
-  peak_mpi_causal_service_tick(service, capture, &raw, now, effective_byte_budget, observer_work_budget);
+  size_t bytes_left = effective_byte_budget, work_left = observer_work_budget;
+  peak_mpi_causal_service_tick_budget(service, capture, &raw, now, &bytes_left, &work_left);
+  int progressed = bytes_left < effective_byte_budget || work_left < observer_work_budget;
   PeakMpiPolicyReason service_fault =
       peak_mpi_causal_service_fault_reason(service);
   if (service_fault != PEAK_MPI_POLICY_NO_REASON)
@@ -744,6 +766,7 @@ void peak_mpi_causal_runtime_tick(double now, double elapsed, double C,
     }
   }
   previous_tick = now;
+  return progressed;
 }
 int peak_mpi_causal_runtime_decision(double now, double elapsed,
                                      double headroom,

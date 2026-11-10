@@ -1370,20 +1370,20 @@ static void transport_io(PeakMpiCausalTransport *t,
     }
   }
 }
-void peak_mpi_causal_transport_tick(PeakMpiCausalTransport *t,
+size_t peak_mpi_causal_transport_tick(PeakMpiCausalTransport *t,
                                     PeakMpiObserver *o,
                                     const PeakMpiCausalRaw *raw, double now,
                                     size_t budget) {
   int owner;
   if (!t || !raw)
-    return;
+    return budget;
   owner = t->c.rank == t->c.owner_rank;
   if (raw->active) {
     if (raw->peer_count != t->c.world_size || !raw->known_peers ||
         (raw->slot_count &&
          (raw->slot_count != t->c.slots || !raw->slot_prefixes))) {
       fault(t, t->c.rank, PEAK_MPI_POLICY_BAD_IDENTITY);
-      return;
+      return budget;
     }
     if (!t->raw_seen || raw->generation != t->raw.generation ||
         memcmp(&raw->recovery, &t->raw.recovery, sizeof raw->recovery) != 0 ||
@@ -1441,6 +1441,7 @@ void peak_mpi_causal_transport_tick(PeakMpiCausalTransport *t,
   t->stats.pending_records = t->count + (size_t)t->held;
   t->stats.listening = t->listener >= 0;
   t->stats.connected = owner ? t->stats.listening : t->peers[0].ready;
+  return local_budget;
 }
 int peak_mpi_causal_transport_feedback(const PeakMpiCausalTransport *t,
                                        PeakMpiPolicyFeedback *f) {

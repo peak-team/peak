@@ -19,7 +19,7 @@ PeakMpiCausalTransport *
 peak_mpi_causal_transport_create(const PeakMpiCausalServiceConfig *,
                                  const PeakMpiCausalTransportSink *);
 void peak_mpi_causal_transport_destroy(PeakMpiCausalTransport *);
-void peak_mpi_causal_transport_tick(PeakMpiCausalTransport *, PeakMpiObserver *,
+size_t peak_mpi_causal_transport_tick(PeakMpiCausalTransport *, PeakMpiObserver *,
                                     const PeakMpiCausalRaw *, double now,
                                     size_t byte_budget);
 int peak_mpi_causal_transport_feedback(const PeakMpiCausalTransport *,
