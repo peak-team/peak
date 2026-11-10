@@ -295,6 +295,12 @@ void peak_mpi_causal_batches_destroy(PeakMpiCausalBatches *b) {
   free(b->slot_tail);
   free(b);
 }
+int peak_mpi_causal_batches_runnable(const PeakMpiCausalBatches *b) {
+  return b && b->state != ERROR && (b->state != IDLE || b->ready_head != NONE);
+}
+int peak_mpi_causal_batches_backpressured(const PeakMpiCausalBatches *b) {
+  return b && b->free_entry == NONE && peak_mpi_causal_batches_runnable(b);
+}
 int peak_mpi_causal_batches_ingest(PeakMpiCausalBatches *b, unsigned rank,
                                    const PeakMpiObserverRecord *r) {
   if (!b || !r || rank >= b->world || b->free_entry == NONE)

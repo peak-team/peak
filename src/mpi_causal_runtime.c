@@ -131,7 +131,9 @@ int peak_mpi_causal_runtime_service_available(void) {
   return atomic_load_explicit(&backend_ready, memory_order_acquire) && service && heartbeat_enabled && atomic_load_explicit(&active, memory_order_relaxed);
 }
 int peak_mpi_causal_runtime_queue_pending(void) {
-  return atomic_load_explicit(&active, memory_order_relaxed) && peak_mpi_observer_has_pending(capture);
+  return atomic_load_explicit(&active, memory_order_relaxed) &&
+         (peak_mpi_observer_has_pending(capture) ||
+          peak_mpi_causal_service_runnable(service));
 }
 int peak_mpi_causal_runtime_requested(void) {
   const char *v = getenv("PEAK_MPI_CAUSAL_FEEDBACK");

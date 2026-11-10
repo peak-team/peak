@@ -716,7 +716,120 @@ static void test_compact_backend(void) {
     peak_mpi_causal_service_destroy(b);
   }
 }
+static PeakMpiObserverRecord queue_test_record(uint64_t seq, uint64_t group,
+                                               uint64_t previous, int end) {
+  PeakMpiObserverRecord r = {0};
+  r.incarnation = 100;
+  r.thread_uid = r.thread_generation = 1;
+  r.sequence = seq;
+  r.op_uid = group + 1000;
+  r.batch_uid = group;
+  r.result_ref = previous;
+  r.kind =
+      end ? PEAK_MPI_OBSERVER_EVENT_COMPLETE : PEAK_MPI_OBSERVER_EVENT_START;
+  r.phase = end ? PEAK_MPI_CAUSAL_CALL_END : PEAK_MPI_CAUSAL_CALL_BEGIN;
+  r.operation = PEAK_MPI_CAUSAL_BSEND;
+  r.flags = PEAK_MPI_CAUSAL_ORDERED_CALLER | PEAK_MPI_CAUSAL_COMPACT_GROUP |
+            PEAK_MPI_CAUSAL_APP_COST_KNOWN |
+            PEAK_MPI_OBSERVER_PROGRESS_ESTIMATED |
+            (end ? PEAK_MPI_CAUSAL_SUCCESS : 0);
+  r.communicator_uid = 1;
+  r.peer = 1;
+  r.tag = 7;
+  r.capability_uid = PEAK_MPI_PROGRESS_INTEL_2021_11_OPX_ASYNC0_APPROX;
+  r.progress_scope = PEAK_MPI_OBSERVER_SCOPE_INTERVAL;
+  return r;
+}
+static void test_unclosed_input_capacity(void) {
+  PeakMpiCausalService *s = make();
+  peak_mpi_causal_batches_destroy(s->batches);
+  s->config.max_pending_records = 2;
+  s->batches = peak_mpi_causal_batches_create_with_slots(2, 2, 2);
+  PeakMpiObserverRecord r = queue_test_record(1, 20, 0, 0);
+  r.flags = 0;
+  r.kind = PEAK_MPI_OBSERVER_EVENT_LOCAL_COST;
+  r.phase = PEAK_MPI_CAUSAL_GROUP_BEGIN;
+  r.op_uid = 20;
+  r.result_ref = 0;
+  assert(peak_mpi_causal_service_ingest_record(s, 0, &r));
+  r = queue_test_record(2, 20, 0, 0);
+  r.flags &= ~PEAK_MPI_CAUSAL_COMPACT_GROUP;
+  r.result_ref = 0;
+  assert(peak_mpi_causal_service_ingest_record(s, 0, &r));
+  assert(peak_mpi_causal_batches_pending(s->batches) == 2);
+  assert(!peak_mpi_causal_service_runnable(s));
+  r = queue_test_record(3, 20, 0, 1);
+  r.flags &= ~PEAK_MPI_CAUSAL_COMPACT_GROUP;
+  assert(peak_mpi_causal_service_ingest_record(s, 0, &r));
+  assert(s->ranks[0].coarse && s->ranks[0].lost == 1);
+  peak_mpi_causal_service_destroy(s);
+  puts("all-unclosed statefull retains hard resource failure rather than "
+       "deadlocking behind missingEND PASS");
+}
+static void test_recovery_input_capacity(void) {
+  PeakMpiCausalService *s = make();
+  peak_mpi_causal_batches_destroy(s->batches);
+  s->config.max_pending_records = 4;
+  s->batches = peak_mpi_causal_batches_create_with_slots(2, 2, 4);
+  assert(s->batches);
+  for (unsigned i = 0; i < 4; ++i) {
+    PeakMpiObserverRecord r = queue_test_record(i + 1, 10 + i / 2, i / 2 ? 10 : 0, i % 2);
+    assert(peak_mpi_causal_service_ingest_record(s, 0, &r));
+  }
+  s->recovery_needed = 1;
+  s->recovery.state = PEAK_MPI_RECOVERY_QUERY;
+  assert(!s->ranks[0].coarse && !peak_mpi_causal_service_runnable(s));
+  PeakMpiObserverRecord r = queue_test_record(5, 12, 11, 0);
+  assert(peak_mpi_causal_service_ingest_record(s, 0, &r));
+  assert(s->ranks[0].coarse && s->ranks[0].reason == PEAK_MPI_POLICY_RESOURCE_LIMIT);
+  assert(s->ranks[0].lost == 1 && s->ranks[0].sequence[0] == 5);
+  peak_mpi_causal_service_destroy(s);
+}
+static void test_input_backpressure(void) {
+  test_recovery_input_capacity();
+  test_unclosed_input_capacity();
+  PeakMpiCausalService *s = make();
+  peak_mpi_causal_batches_destroy(s->batches);
+  s->config.max_pending_records = 4;
+  s->batches = peak_mpi_causal_batches_create_with_slots(2, 2, 4);
+  assert(s->batches);
+  for (unsigned i = 0; i < 4; i++) {
+    PeakMpiObserverRecord r =
+        queue_test_record(i + 1, 10 + i / 2, i / 2 ? 10 : 0, i % 2);
+    assert(peak_mpi_causal_service_ingest_record(s, 0, &r));
+  }
+  assert(peak_mpi_causal_batches_pending(s->batches) == 4);
+  assert(peak_mpi_causal_service_runnable(s));
+  s->hard_fault = 1;
+  assert(!peak_mpi_causal_service_runnable(s));
+  s->hard_fault = 0;
+  s->recovery_needed = 1;
+  s->recovery.state = PEAK_MPI_RECOVERY_QUERY;
+  assert(!peak_mpi_causal_service_runnable(s));
+  s->recovery_needed = 0;
+  s->recovery.state = PEAK_MPI_RECOVERY_NONE;
+  assert(peak_mpi_causal_service_runnable(s));
+  PeakMpiObserverRecord blocked = queue_test_record(5, 12, 11, 0);
+  assert(!peak_mpi_causal_service_ingest_record(s, 0, &blocked));
+  assert(!s->ranks[0].coarse && !s->stats.lost_events &&
+         s->ranks[0].sequence[0] == 4 && s->stats.records == 4);
+  size_t tries = 0;
+  while (peak_mpi_causal_batches_pending(s->batches) == 4) {
+    parse_batches(s, 1);
+    assert(++tries < 100);
+  }
+  assert(peak_mpi_causal_service_ingest_record(s, 0, &blocked));
+  assert(s->ranks[0].sequence[0] == 5 && s->stats.records == 5 &&
+         !s->ranks[0].coarse);
+  assert(peak_mpi_causal_service_ingest_record(s, 0, &blocked));
+  assert(s->stats.records == 5 && s->stats.duplicates == 1);
+  peak_mpi_causal_service_destroy(s);
+  puts("full closed pendingqueue backpressures beforeseq/counters; "
+       "boundedparse+exactretry+duplicate PASS");
+}
+
 int main(void) {
+  test_input_backpressure();
   test_compact_batches();
   test_compact_backend();
   test_delayed_receiver_pressure();

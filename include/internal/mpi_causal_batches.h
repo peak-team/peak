@@ -47,6 +47,11 @@ peak_mpi_causal_batches_call_end(const PeakMpiCausalBatches *, unsigned rank,
 /* O(1): starts group-owned retirement; the next prepare call pays its work. */
 void peak_mpi_causal_batches_commit(PeakMpiCausalBatches *);
 size_t peak_mpi_causal_batches_pending(const PeakMpiCausalBatches *);
+/* Full record storage with a closed plan that the parser can retire without
+ * accepting another event. Purely unclosed-state exhaustion is not transient. */
+int peak_mpi_causal_batches_backpressured(const PeakMpiCausalBatches *);
+/* Closed input that can build/retire without another remote event. */
+int peak_mpi_causal_batches_runnable(const PeakMpiCausalBatches *);
 uint64_t peak_mpi_causal_batches_last_group(const PeakMpiCausalBatches *,
                                             unsigned rank);
 /* Caller carries an opaque cursor across quota-limited scans of an unchanged
