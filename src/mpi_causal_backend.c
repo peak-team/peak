@@ -3576,22 +3576,24 @@ void peak_mpi_causal_service_tick_budget(PeakMpiCausalService *s,
                                   const PeakMpiCausalRaw *raw, double now,
                                   size_t *bytes_left, size_t *work_left) {
   size_t bytes = *bytes_left, work = *work_left;
-  if (!s || !raw)
+  if (!s)
     return;
   struct timespec begin, end;
   clock_gettime(CLOCK_THREAD_CPUTIME_ID, &begin);
   s->last_tick_work = 0;
   s->now = now;
-  PeakMpiCausalRaw local_raw = *raw;
-  if (s->local_fault) {
-    local_raw.coarse_reason = PEAK_MPI_OBSERVER_REASON_METADATA;
+  PeakMpiCausalRaw local_raw;
+  if (raw) {
+    local_raw = *raw;
+    if (s->local_fault)
+      local_raw.coarse_reason = PEAK_MPI_OBSERVER_REASON_METADATA;
   }
   /* A cut committed on the previous heartbeat must be visible to this
    * transport turn. Charge its atomic cache preparation to the same budget. */
   size_t pre_cache_work = 0;
   if (s->config.rank == s->config.owner_rank && s->cache_dirty)
     pre_cache_work = prepare_feedback_cache(s, work);
-  *bytes_left = peak_mpi_causal_transport_tick(s->transport, capture, &local_raw, now, bytes);
+  *bytes_left = peak_mpi_causal_transport_tick(s->transport, capture, raw ? &local_raw : NULL, now, bytes);
   if (s->config.rank == s->config.owner_rank) {
     size_t recovery_used = 0;
     int recovering = recovery_work(s, work - pre_cache_work, &recovery_used);
@@ -3760,6 +3762,9 @@ void peak_mpi_causal_service_tick(PeakMpiCausalService *s, PeakMpiObserver *capt
   peak_mpi_causal_service_tick_budget(s, capture, raw, now, &bytes, &work);
 }
 
+const PeakMpiCausalRaw *peak_mpi_causal_service_observation(const PeakMpiCausalService *s) {
+  return s ? peak_mpi_causal_transport_observation(s->transport) : NULL;
+}
 int peak_mpi_causal_service_runnable(const PeakMpiCausalService *s) {
   /* Old closed history is not runnable while recovery waits for remote
    * witnesses or replaces the normal parser's state. */

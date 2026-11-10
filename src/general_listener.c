@@ -5394,9 +5394,14 @@ peak_heartbeat_wait_with_mpi_service(unsigned int sleep_us,
             peak_general_listener_runtime_accounting_snapshot(&accounting);
             double control = (double)
                 peak_general_listener_control_wall_ns_since_heartbeat(&accounting) / 1e9;
-            retry_queued = peak_mpi_causal_runtime_tick(now, MAX(now - peak_main_time, 1e-12),
-                control, peak_general_listener_management_cpu_seconds(),
-                accounting.completed_stop_window_count + accounting.failed_stop_window_count);
+            if (scheduled)
+                retry_queued = peak_mpi_causal_runtime_tick(now, MAX(now - peak_main_time, 1e-12),
+                    control, peak_general_listener_management_cpu_seconds(),
+                    accounting.completed_stop_window_count + accounting.failed_stop_window_count);
+            else
+                retry_queued = peak_mpi_causal_runtime_drain(now, MAX(now - peak_main_time, 1e-12),
+                    control, peak_general_listener_management_cpu_seconds(),
+                    accounting.completed_stop_window_count + accounting.failed_stop_window_count);
             if (scheduled) {
                 service_due = peak_second() + (double)service_us / 1e6;
             }

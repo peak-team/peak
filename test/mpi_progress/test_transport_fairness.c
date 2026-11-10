@@ -134,6 +134,56 @@ static void sink_fault(void *ctx, unsigned rank, PeakMpiPolicyReason reason) {
   (void)reason;
   faults++;
 }
+static unsigned attempts, accepted;
+static double received;
+static int drain_raw_sink(void *v, unsigned rank, const PeakMpiCausalRaw *r,
+                    double now) {
+  (void)v;
+  (void)rank;
+  assert(r->generation == 7);
+  attempts++;
+  if (attempts == 1)
+    return 0;
+  accepted++;
+  received = now;
+  return 1;
+}
+static void test_drain_raw(void) {
+  PeakMpiCausalServiceConfig c = {0};
+  c.world_size = 1;
+  c.slots = 1;
+  c.rank = c.owner_rank = 0;
+  c.job_context = 11;
+  c.incarnation = 22;
+  c.address = "127.0.0.1";
+  c.port = 23653;
+  c.queue_frames = 8;
+  PeakMpiCausalTransportSink sink = {.raw = drain_raw_sink};
+  PeakMpiCausalTransport *t = peak_mpi_causal_transport_create(&c, &sink);
+  assert(t);
+  unsigned char peer = 0;
+  uint64_t prefix = 0;
+  PeakMpiCausalRaw raw = {0};
+  raw.active = 1;
+  raw.generation = 7;
+  raw.incarnation = 22;
+  raw.peer_count = raw.slot_count = 1;
+  raw.known_peers = &peer;
+  raw.slot_prefixes = &prefix;
+  raw.elapsed = 1;
+  peak_mpi_causal_transport_tick(t, NULL, &raw, 1, 65536);
+  assert(attempts == 1 && !accepted && t->raw_pending);
+  peak_mpi_causal_transport_tick(t, NULL, NULL, 2, 65536);
+  assert(attempts == 2 && accepted == 1 && !t->raw_pending && received == 2);
+  for (unsigned i = 0; i < 1000; i++)
+    peak_mpi_causal_transport_tick(t, NULL, NULL, 3 + i, 65536);
+  assert(attempts == 2 && accepted == 1 && received == 2 &&
+         t->raw.generation == 7 && t->raw.elapsed == 1);
+  peak_mpi_causal_transport_destroy(t);
+  puts("NULL drain retries rejected RAW exactly once; 1000 drains never replay "
+       "accepted RAW or refresh received_at");
+}
+
 int main(int argc, char **argv) {
   size_t budget = argc > 1 ? (size_t)strtoul(argv[1], NULL, 10) : 256;
   PeakMpiCausalServiceConfig c = {0};
@@ -237,4 +287,5 @@ int main(int argc, char **argv) {
   peak_mpi_causal_transport_destroy(o);
   peak_mpi_observer_destroy(local_capture);
   test_many_peer_fairness();
+  test_drain_raw();
 }

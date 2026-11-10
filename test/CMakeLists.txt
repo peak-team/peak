@@ -166,6 +166,23 @@ if(BUILD_TESTING)
         endforeach()
 
         if(MPI_C_FOUND)
+            add_executable(test_mpi_runtime_generation
+                mpi_progress/test_runtime_generation.c
+                ${PROJECT_SOURCE_DIR}/src/mpi_policy_adapter.c
+                ${PROJECT_SOURCE_DIR}/src/mpi_cost_model.c
+                ${PROJECT_SOURCE_DIR}/src/mpi_causal_backend.c
+                ${PROJECT_SOURCE_DIR}/src/mpi_causal_batches.c
+                ${PROJECT_SOURCE_DIR}/src/mpi_causal_match_index.c
+                ${PROJECT_SOURCE_DIR}/src/mpi_causal_transport.c
+                ${PROJECT_SOURCE_DIR}/src/mpi_observer.c
+                ${PROJECT_SOURCE_DIR}/src/mpi_progress_contract.c)
+            target_include_directories(test_mpi_runtime_generation PRIVATE ${PROJECT_SOURCE_DIR}/include)
+            target_compile_definitions(test_mpi_runtime_generation PRIVATE HAVE_MPI)
+            target_compile_options(test_mpi_runtime_generation PRIVATE -UNDEBUG -ffunction-sections -fdata-sections)
+            target_link_options(test_mpi_runtime_generation PRIVATE -Wl,--gc-sections)
+            target_link_libraries(test_mpi_runtime_generation PRIVATE MPI::MPI_C Threads::Threads m)
+            add_test(NAME test_mpi_runtime_generation COMMAND test_mpi_runtime_generation)
+            set_tests_properties(test_mpi_runtime_generation PROPERTIES TIMEOUT 20)
             add_executable(test_mpi_causal_request_metadata
                 dgemm_mpi/test_mpi_causal_request_metadata.c
                 ${PROJECT_SOURCE_DIR}/src/mpi_progress_contract.c

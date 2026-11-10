@@ -73,6 +73,7 @@ void peak_mpi_causal_service_tick(PeakMpiCausalService *service,
                                   size_t byte_budget, size_t work_budget);
 void peak_mpi_causal_service_tick_budget(PeakMpiCausalService *, PeakMpiObserver *,
     const PeakMpiCausalRaw *, double, size_t *bytes_left, size_t *work_left);
+const PeakMpiCausalRaw *peak_mpi_causal_service_observation(const PeakMpiCausalService *);
 int peak_mpi_causal_service_runnable(const PeakMpiCausalService *);
 int peak_mpi_causal_service_feedback(const PeakMpiCausalService *service,
                                      PeakMpiPolicyFeedback *feedback);

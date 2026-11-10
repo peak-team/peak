@@ -1375,10 +1375,12 @@ size_t peak_mpi_causal_transport_tick(PeakMpiCausalTransport *t,
                                     const PeakMpiCausalRaw *raw, double now,
                                     size_t budget) {
   int owner;
-  if (!t || !raw)
+  if (!t || (!raw && !t->raw_seen))
     return budget;
+  int observe = raw != NULL;
+  if (!raw) raw = &t->raw;
   owner = t->c.rank == t->c.owner_rank;
-  if (raw->active) {
+  if (observe && raw->active) {
     if (raw->peer_count != t->c.world_size || !raw->known_peers ||
         (raw->slot_count &&
          (raw->slot_count != t->c.slots || !raw->slot_prefixes))) {
@@ -1404,12 +1406,12 @@ size_t peak_mpi_causal_transport_tick(PeakMpiCausalTransport *t,
       t->raw_pending = 1;
       t->raw_seen = 1;
     }
-    if (owner) {
+  }
+  if (raw->active && owner) {
       if (t->raw_pending &&
           (!t->sink.raw ||
            t->sink.raw(t->sink.context, t->c.rank, &t->raw, now)))
         t->raw_pending = 0;
-    }
   }
   /* Keep a local-record quantum available without starving readable peers or
    * control. Unused IO allowance is lent to the single frozen capture, then
@@ -1442,6 +1444,9 @@ size_t peak_mpi_causal_transport_tick(PeakMpiCausalTransport *t,
   t->stats.listening = t->listener >= 0;
   t->stats.connected = owner ? t->stats.listening : t->peers[0].ready;
   return local_budget;
+}
+const PeakMpiCausalRaw *peak_mpi_causal_transport_observation(const PeakMpiCausalTransport *t) {
+  return t && t->raw_seen ? &t->raw : NULL;
 }
 int peak_mpi_causal_transport_feedback(const PeakMpiCausalTransport *t,
                                        PeakMpiPolicyFeedback *f) {

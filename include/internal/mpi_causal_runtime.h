@@ -57,6 +57,8 @@ void peak_mpi_causal_runtime_activation_begin(void);
 void peak_mpi_causal_runtime_activation_end(void);
 void peak_mpi_causal_runtime_mpi_initialized(void);
 void peak_mpi_causal_runtime_finalize(void);
+int peak_mpi_causal_runtime_drain(double now, double elapsed, double control,
+                                  double management, uint64_t generation);
 int peak_mpi_causal_runtime_tick(double now, double elapsed,
                                   double control_seconds,
                                   double management_seconds,
