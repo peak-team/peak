@@ -50,6 +50,11 @@ static _Atomic unsigned int peak_finalize_test_original_calls;
 #endif
 
 static int (*original_pmpi_finalize)(void);
+static int (*real_mpi_finalize)(void);
+static int (*real_pmpi_finalize)(void);
+static pthread_once_t real_mpi_finalize_once = PTHREAD_ONCE_INIT;
+static pthread_once_t real_pmpi_finalize_once = PTHREAD_ONCE_INIT;
+static _Atomic int service_only_finalize;
 extern void peak_fini(void);
 
 typedef int (*PeakMpiInitFunction)(int*, char***);
@@ -597,6 +602,53 @@ peak_pmpi_finalize(void)
     return mpi_interceptor_call_original_finalize_once();
 }
 
+static void
+mpi_interceptor_resolve_mpi_finalize_once(void)
+{
+    real_mpi_finalize = (int (*)(void))dlsym(RTLD_NEXT, "MPI_Finalize");
+}
+
+static void
+mpi_interceptor_resolve_pmpi_finalize_once(void)
+{
+    real_pmpi_finalize = (int (*)(void))dlsym(RTLD_NEXT, "PMPI_Finalize");
+}
+
+void
+mpi_interceptor_prepare_service_only_finalize(void)
+{
+    pthread_once(&real_pmpi_finalize_once,
+                 mpi_interceptor_resolve_pmpi_finalize_once);
+    if (real_pmpi_finalize == NULL) {
+        peak_log_warn("[peak] unable to resolve next PMPI_Finalize for MPI observer shutdown\n");
+        return;
+    }
+    original_pmpi_finalize = real_pmpi_finalize;
+    atomic_store_explicit(&service_only_finalize, 1, memory_order_release);
+}
+
+/* The observer-only activation does not install Gum. It still ends observation
+ * at the same application finalization boundary as the profiled MPI path. */
+PEAK_API int
+MPI_Finalize(void)
+{
+    if (atomic_load_explicit(&service_only_finalize, memory_order_acquire))
+        return peak_pmpi_finalize();
+    pthread_once(&real_mpi_finalize_once,
+                 mpi_interceptor_resolve_mpi_finalize_once);
+    return real_mpi_finalize ? real_mpi_finalize() : MPI_ERR_OTHER;
+}
+
+PEAK_API int
+PMPI_Finalize(void)
+{
+    if (atomic_load_explicit(&service_only_finalize, memory_order_acquire))
+        return peak_pmpi_finalize();
+    pthread_once(&real_pmpi_finalize_once,
+                 mpi_interceptor_resolve_pmpi_finalize_once);
+    return real_pmpi_finalize ? real_pmpi_finalize() : MPI_ERR_OTHER;
+}
+
 int mpi_interceptor_finalize_was_requested()
 {
     return __atomic_load_n(&peak_finalize_state, __ATOMIC_ACQUIRE) !=
@@ -624,7 +676,9 @@ int mpi_interceptor_attach()
     mpi_interceptor = gum_interceptor_obtain();
 
     gum_interceptor_begin_transaction(mpi_interceptor);
-    hook_address = peak_general_listener_find_function("PMPI_Finalize");
+    pthread_once(&real_pmpi_finalize_once,
+                 mpi_interceptor_resolve_pmpi_finalize_once);
+    hook_address = (gpointer)real_pmpi_finalize;
     if (hook_address) {
         replace_check = gum_interceptor_replace_fast(mpi_interceptor,
                                                      hook_address, &peak_pmpi_finalize,
@@ -721,3 +775,41 @@ void mpi_interceptor_dettach(int allow_delayed_finalize)
     }
     hook_address = NULL;
 }
+
+/* Public legacy Fortran bindings may initialize without entering the C symbol.
+ * Forward their native ABI unchanged; depth also deduplicates implementations
+ * that in turn call MPI_Init/PMPI_Init. No Fortran handle conversion occurs. */
+#define PEAK_FORTRAN_INIT(name) \
+PEAK_API void name(MPI_Fint *ierr) { \
+    typedef void (*Function)(MPI_Fint *); \
+    static Function function; \
+    if (!function) function=(Function)dlsym(RTLD_NEXT,#name); \
+    peak_mpi_init_wrapper_depth++; \
+    if(function) function(ierr); else if(ierr) *ierr=(MPI_Fint)MPI_ERR_OTHER; \
+    peak_mpi_init_wrapper_depth--; \
+    if(!peak_mpi_init_wrapper_depth) peak_mpi_init_completed(ierr?(int)*ierr:MPI_ERR_OTHER); \
+}
+#define PEAK_FORTRAN_INIT_THREAD(name) \
+PEAK_API void name(MPI_Fint *required,MPI_Fint *provided,MPI_Fint *ierr) { \
+    typedef void (*Function)(MPI_Fint *,MPI_Fint *,MPI_Fint *); \
+    static Function function; \
+    if(!function) function=(Function)dlsym(RTLD_NEXT,#name); \
+    peak_mpi_init_wrapper_depth++; \
+    if(function) function(required,provided,ierr); else if(ierr) *ierr=(MPI_Fint)MPI_ERR_OTHER; \
+    peak_mpi_init_wrapper_depth--; \
+    if(!peak_mpi_init_wrapper_depth) peak_mpi_init_completed(ierr?(int)*ierr:MPI_ERR_OTHER); \
+}
+PEAK_FORTRAN_INIT(mpi_init_)
+PEAK_FORTRAN_INIT(mpi_init__)
+PEAK_FORTRAN_INIT(MPI_INIT)
+PEAK_FORTRAN_INIT(pmpi_init_)
+PEAK_FORTRAN_INIT(pmpi_init__)
+PEAK_FORTRAN_INIT(PMPI_INIT)
+PEAK_FORTRAN_INIT_THREAD(mpi_init_thread_)
+PEAK_FORTRAN_INIT_THREAD(mpi_init_thread__)
+PEAK_FORTRAN_INIT_THREAD(MPI_INIT_THREAD)
+PEAK_FORTRAN_INIT_THREAD(pmpi_init_thread_)
+PEAK_FORTRAN_INIT_THREAD(pmpi_init_thread__)
+PEAK_FORTRAN_INIT_THREAD(PMPI_INIT_THREAD)
+#undef PEAK_FORTRAN_INIT
+#undef PEAK_FORTRAN_INIT_THREAD

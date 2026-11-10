@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include "internal/mpi_causal_runtime.h"
 #include <errno.h>
 #include <dlfcn.h>
 #include <limits.h>
@@ -1016,7 +1017,11 @@ peak_has_requested_work(void)
     return peak_requested_work.cpu ||
            peak_requested_work.gpu ||
            peak_requested_work.memory ||
-           peak_requested_work.jit;
+           peak_requested_work.jit
+#ifdef HAVE_MPI
+           || peak_mpi_causal_runtime_requested()
+#endif
+           ;
 }
 
 static void
@@ -1256,6 +1261,79 @@ peak_mpi_activation_policy_post_init(void)
 }
 #endif
 
+#ifdef HAVE_MPI
+static void
+peak_initialize_mpi_causal_runtime_if_ready(void)
+{
+    if (peak_mpi_causal_runtime_requested()) {
+        int initialized = 0, finalized = 0;
+        if (PMPI_Initialized(&initialized) == MPI_SUCCESS && initialized &&
+            PMPI_Finalized(&finalized) == MPI_SUCCESS && !finalized)
+            peak_mpi_causal_runtime_mpi_initialized();
+    }
+}
+
+static void
+peak_activate_mpi_service_only_runtime(void)
+{
+    mpi_interceptor_prepare_service_only_finalize();
+    atomic_store_explicit(&peak_runtime_owner_pid, getpid(), memory_order_release);
+    peak_mpi_causal_runtime_configure_control(heartbeat_time != 0, FALSE);
+    peak_initialize_mpi_causal_runtime_if_ready();
+    peak_main_time = peak_second();
+    peak_general_listener_note_runtime_start(peak_main_time);
+    peak_mpi_causal_runtime_activation_end();
+    args = NULL;
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    gboolean fail_heartbeat_setup =
+        getenv("PEAK_TEST_FAIL_HEARTBEAT_SETUP_ALLOCATION") != NULL;
+#else
+    gboolean fail_heartbeat_setup = FALSE;
+#endif
+    if (heartbeat_time && !fail_heartbeat_setup)
+        args = g_try_new0(PeakHeartbeatArgs, 1);
+    if (args) {
+        args->heartbeat_time = heartbeat_time;
+        args->mpi_service_only = TRUE;
+        args->check_interval = check_interval;
+        args->hb_min_us = hb_min_us;
+        args->hb_max_us = hb_max_us;
+        args->hb_k_err = hb_k_err;
+        args->hb_k_rate = hb_k_rate;
+        args->hb_ema_a = hb_ema_a;
+        atomic_store(&heartbeat_running, true);
+        int heartbeat_create_result;
+#ifdef PEAK_ENABLE_TEST_HOOKS
+        if (atomic_exchange_explicit(&peak_test_fail_heartbeat_create, 0,
+                                     memory_order_acq_rel) != 0 ||
+            (getenv("PEAK_TEST_FAIL_HEARTBEAT_CREATE") != NULL &&
+             getenv("PEAK_TEST_FAIL_HEARTBEAT_CREATE")[0] != '\0')) {
+            heartbeat_create_result = EAGAIN;
+        } else
+#endif
+        {
+            heartbeat_create_result = pthread_create(&heartbeat_thread,
+                NULL, peak_heartbeat_monitor, args);
+        }
+        if (heartbeat_create_result == 0) {
+            atomic_store_explicit(&peak_heartbeat_started, 1,
+                                  memory_order_release);
+        } else {
+            atomic_store(&heartbeat_running, false);
+            g_free(args);
+            args = NULL;
+        }
+    }
+    if (!args && heartbeat_time) {
+        peak_report_snapshot_note_degraded(PEAK_PROFILER_DEGRADED_HEARTBEAT,
+            "heartbeat setup or thread creation failed");
+        peak_mpi_causal_runtime_configure_control(FALSE, FALSE);
+    }
+    atomic_store_explicit(&peak_runtime_active, 1, memory_order_release);
+    peak_runtime_activation_publish(PEAK_RUNTIME_ACTIVATION_ACTIVE);
+}
+#endif
+
 static void
 peak_activate_runtime(void)
 {
@@ -1277,6 +1355,9 @@ peak_activate_runtime(void)
         }
         return;
     }
+#ifdef HAVE_MPI
+    peak_mpi_causal_runtime_activation_begin();
+#endif
     peak_runtime_activation_owner = pthread_self();
     atomic_store_explicit(&peak_runtime_activation_owner_known,
                           1,
@@ -1285,6 +1366,14 @@ peak_activate_runtime(void)
     peak_test_activation_pause_after_claim();
 #endif
 
+#ifdef HAVE_MPI
+    if (peak_mpi_causal_runtime_requested() && !peak_requested_work.cpu &&
+        !peak_requested_work.gpu && !peak_requested_work.memory &&
+        !peak_requested_work.jit) {
+        peak_activate_mpi_service_only_runtime();
+        return;
+    }
+#endif
 #if defined(__APPLE__)
     /*
      * Darwin v1 has no strict protocol for installing Gum hooks after peer
@@ -1427,10 +1516,24 @@ peak_activate_runtime(void)
         }
     }
 #endif
+    gboolean heartbeat_controls_hooks = peak_requested_work.cpu &&
+        strict_mutation_active && heartbeat_time != 0;
+#ifdef HAVE_MPI
+    peak_mpi_causal_runtime_configure_control(heartbeat_time != 0,
+                                              heartbeat_controls_hooks);
+    peak_initialize_mpi_causal_runtime_if_ready();
+#endif
     peak_main_time = peak_second();
     peak_general_listener_note_runtime_start(peak_main_time);
-    if (peak_requested_work.cpu && strict_mutation_active &&
-        heartbeat_time != 0) {
+#ifdef HAVE_MPI
+    peak_mpi_causal_runtime_activation_end();
+#endif
+    gboolean start_heartbeat = heartbeat_controls_hooks;
+#ifdef HAVE_MPI
+    start_heartbeat = start_heartbeat ||
+        (heartbeat_time != 0 && peak_mpi_causal_runtime_requested());
+#endif
+    if (start_heartbeat) {
 #ifdef PEAK_ENABLE_TEST_HOOKS
         if (getenv("PEAK_TEST_FAIL_HEARTBEAT_SETUP_ALLOCATION") != NULL) {
             heartbeat_overhead = NULL;
@@ -1451,11 +1554,15 @@ peak_activate_runtime(void)
             g_free(heartbeat_overhead);
             heartbeat_overhead = NULL;
             heartbeat_time = 0;
+            start_heartbeat = FALSE;
+#ifdef HAVE_MPI
+            peak_mpi_causal_runtime_configure_control(FALSE, FALSE);
+#endif
         }
     }
-    if (peak_requested_work.cpu && strict_mutation_active &&
-        heartbeat_time != 0) {
+    if (start_heartbeat) {
         args->heartbeat_time = heartbeat_time;
+        args->mpi_service_only = !heartbeat_controls_hooks;
         args->check_interval = check_interval;
         args->hb_min_us = hb_min_us;
         args->hb_max_us = hb_max_us;
@@ -1487,8 +1594,7 @@ peak_activate_runtime(void)
         peak_report_capability_note_active(PEAK_CAPABILITY_DYNAMIC_DSO);
     }
 #endif
-    if (peak_requested_work.cpu && strict_mutation_active &&
-        heartbeat_time != 0) {
+    if (start_heartbeat) {
         pthread_mutex_lock(&heartbeat_mutex);
         atomic_store(&heartbeat_running, true);
         pthread_mutex_unlock(&heartbeat_mutex);
@@ -1518,6 +1624,9 @@ peak_activate_runtime(void)
             g_free(heartbeat_overhead);
             heartbeat_overhead = NULL;
             heartbeat_time = 0;
+#ifdef HAVE_MPI
+            peak_mpi_causal_runtime_configure_control(FALSE, FALSE);
+#endif
             pthread_mutex_lock(&heartbeat_mutex);
             atomic_store(&heartbeat_running, false);
             pthread_mutex_unlock(&heartbeat_mutex);
@@ -1538,6 +1647,7 @@ peak_mpi_init_completed(int result)
 {
     if (result == MPI_SUCCESS) {
         peak_activate_runtime();
+        peak_mpi_causal_runtime_mpi_initialized();
     } else if (atomic_load_explicit(&peak_runtime_activation_state,
                                     memory_order_acquire) ==
                PEAK_RUNTIME_ACTIVATION_READY) {
@@ -1685,6 +1795,10 @@ void peak_init()
     hb_k_err = numeric_config.heartbeat_error_gain;
     hb_k_rate = numeric_config.heartbeat_rate_gain;
     hb_ema_a = numeric_config.heartbeat_ema_alpha;
+#ifdef HAVE_MPI
+    peak_mpi_causal_runtime_prepare(peak_max_num_threads, global_target_ratio,
+        (double)hb_max_us / 1e6, hb_ema_a);
+#endif
     peak_memory_profile = parse_env_to_bool(PEAK_MEMORY_PROFILE);
     peak_memory_track_all = parse_env_to_bool(PEAK_MEMORY_TRACK_ALL);
     peak_requested_work.cpu = peak_hook_address_count > 0;
@@ -1771,6 +1885,14 @@ void peak_init()
     }
 #endif
     peak_activate_runtime();
+#ifdef HAVE_MPI
+    if (peak_mpi_causal_runtime_requested()) {
+        int initialized=0, finalized=0;
+        if (PMPI_Initialized(&initialized)==MPI_SUCCESS && initialized &&
+            PMPI_Finalized(&finalized)==MPI_SUCCESS && !finalized)
+            peak_mpi_causal_runtime_mpi_initialized();
+    }
+#endif
 }
 
 #ifdef HAVE_MPI
@@ -1824,6 +1946,10 @@ peak_fini_impl(void)
 #endif
 
     peak_general_listener_controller_stop();
+    peak_general_listener_print_hook_coverage();
+#ifdef HAVE_MPI
+    peak_mpi_causal_runtime_finalize();
+#endif
     if (peak_runtime_start_time > 0.0) {
         peak_main_time = peak_second() - peak_runtime_start_time;
     }
@@ -1880,6 +2006,13 @@ peak_fini_impl(void)
     PeakOutputAggregationMode aggregation_mode =
         found_MPI ? peak_requested_output_aggregation
                   : PEAK_OUTPUT_AGGREGATION_LOCAL;
+    /* The observer already reported; retain failed profiling requests and
+     * collective participation, but omit empty rank-local profiling CSVs. */
+    gboolean profile_report_requested =
+        aggregation_mode != PEAK_OUTPUT_AGGREGATION_LOCAL ||
+        (peak_report_capability_manifest().requested &
+         (PEAK_CAPABILITY_CPU_TARGET | PEAK_CAPABILITY_CUDA |
+          PEAK_CAPABILITY_MEMORY | PEAK_CAPABILITY_JIT)) != 0;
     int local_requested_mpi_finalize =
         mpi_interceptor_finalize_was_requested();
     int mpi_collectives_failed_closed =
@@ -1932,11 +2065,15 @@ peak_fini_impl(void)
         } else if (found_MPI && mpi_collectives_failed_closed && mpi_log_rank) {
             g_printerr("[peak] PEAK MPI collective path was already failed closed; writing rank-local output without touching MPI again\n");
         }
-        used_mpi_aggregation =
-            peak_general_listener_print_with_mpi_job_policy(
-                output_mode,
-                TRUE,
-                &report_write_succeeded);
+        if (profile_report_requested) {
+            used_mpi_aggregation =
+                peak_general_listener_print_with_mpi_job_policy(
+                    output_mode,
+                    TRUE,
+                    &report_write_succeeded);
+        } else {
+            report_write_succeeded = TRUE;
+        }
         report_published = 1;
     }
 
@@ -2031,11 +2168,15 @@ peak_fini_impl(void)
                    mpi_log_rank) {
             g_printerr("[peak] Aggregate output was not proven safe; writing rank-local output before process exit\n");
         }
-        used_mpi_aggregation =
-            peak_general_listener_print_with_mpi_job_policy(
-                output_mode,
-                found_MPI ? TRUE : FALSE,
-                &report_write_succeeded);
+        if (profile_report_requested) {
+            used_mpi_aggregation =
+                peak_general_listener_print_with_mpi_job_policy(
+                    output_mode,
+                    found_MPI ? TRUE : FALSE,
+                    &report_write_succeeded);
+        } else {
+            report_write_succeeded = TRUE;
+        }
         report_published = 1;
     }
     /*

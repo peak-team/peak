@@ -93,6 +93,141 @@ if(BUILD_TESTING)
         PROPERTIES
             PASS_REGULAR_EXPRESSION "gum_mutation_allowlist_ok")
 
+    if(PEAK_ENABLE_MPI AND UNIX)
+        add_executable(test_mpi_observer_notification mpi_progress/test_observer_notification.c)
+        target_include_directories(test_mpi_observer_notification PRIVATE ${PROJECT_SOURCE_DIR}/include)
+        target_compile_options(test_mpi_observer_notification PRIVATE -UNDEBUG)
+        target_link_libraries(test_mpi_observer_notification PRIVATE Threads::Threads)
+        add_test(NAME test_mpi_observer_notification COMMAND test_mpi_observer_notification)
+        set_tests_properties(test_mpi_observer_notification PROPERTIES TIMEOUT 20)
+
+        add_executable(test_mpi_cost_model_dag mpi_progress/test_cost_model_dag.c)
+        target_include_directories(test_mpi_cost_model_dag PRIVATE ${PROJECT_SOURCE_DIR}/include)
+        target_compile_options(test_mpi_cost_model_dag PRIVATE -UNDEBUG)
+        target_link_libraries(test_mpi_cost_model_dag PRIVATE m)
+        add_test(NAME test_mpi_cost_model_dag COMMAND test_mpi_cost_model_dag)
+        set_tests_properties(test_mpi_cost_model_dag PROPERTIES TIMEOUT 20)
+
+        add_executable(test_mpi_progress_delivery
+            mpi_progress/test_progress_delivery.c
+            ${PROJECT_SOURCE_DIR}/src/mpi_cost_model.c
+            ${PROJECT_SOURCE_DIR}/src/mpi_policy_adapter.c
+            ${PROJECT_SOURCE_DIR}/src/mpi_causal_batches.c
+            ${PROJECT_SOURCE_DIR}/src/mpi_causal_match_index.c
+            ${PROJECT_SOURCE_DIR}/src/mpi_causal_transport.c
+            ${PROJECT_SOURCE_DIR}/src/mpi_observer.c
+            ${PROJECT_SOURCE_DIR}/src/mpi_progress_contract.c)
+        target_include_directories(test_mpi_progress_delivery PRIVATE
+            ${PROJECT_SOURCE_DIR}/include)
+        target_compile_options(test_mpi_progress_delivery PRIVATE -UNDEBUG)
+        target_link_libraries(test_mpi_progress_delivery PRIVATE Threads::Threads m)
+        add_test(NAME test_mpi_progress_delivery COMMAND test_mpi_progress_delivery)
+        set_tests_properties(test_mpi_progress_delivery PROPERTIES TIMEOUT 20)
+
+        add_executable(test_mpi_comm_membership
+            mpi_progress/test_comm_membership.c
+            ${PROJECT_SOURCE_DIR}/src/mpi_cost_model.c
+            ${PROJECT_SOURCE_DIR}/src/mpi_policy_adapter.c
+            ${PROJECT_SOURCE_DIR}/src/mpi_causal_batches.c
+            ${PROJECT_SOURCE_DIR}/src/mpi_causal_match_index.c
+            ${PROJECT_SOURCE_DIR}/src/mpi_causal_transport.c
+            ${PROJECT_SOURCE_DIR}/src/mpi_observer.c
+            ${PROJECT_SOURCE_DIR}/src/mpi_progress_contract.c)
+        target_include_directories(test_mpi_comm_membership PRIVATE
+            ${PROJECT_SOURCE_DIR}/include)
+        target_compile_options(test_mpi_comm_membership PRIVATE -UNDEBUG)
+        target_link_libraries(test_mpi_comm_membership PRIVATE Threads::Threads m)
+        add_test(NAME test_mpi_comm_membership COMMAND test_mpi_comm_membership)
+        set_tests_properties(test_mpi_comm_membership PROPERTIES TIMEOUT 20)
+
+        add_executable(test_mpi_transport_fairness
+            mpi_progress/test_transport_fairness.c
+            ${PROJECT_SOURCE_DIR}/src/mpi_observer.c)
+        target_include_directories(test_mpi_transport_fairness PRIVATE
+            ${PROJECT_SOURCE_DIR}/include)
+        target_compile_options(test_mpi_transport_fairness PRIVATE -UNDEBUG)
+        target_link_libraries(test_mpi_transport_fairness PRIVATE Threads::Threads m)
+        add_test(NAME test_mpi_transport_fairness COMMAND test_mpi_transport_fairness)
+        set_tests_properties(test_mpi_transport_fairness PROPERTIES TIMEOUT 20)
+
+        foreach(_peak_transport_case codec envelope)
+            add_executable(test_mpi_transport_${_peak_transport_case}
+                mpi_progress/test_transport_${_peak_transport_case}.c
+                ${PROJECT_SOURCE_DIR}/src/mpi_observer.c)
+            target_include_directories(test_mpi_transport_${_peak_transport_case} PRIVATE
+                ${PROJECT_SOURCE_DIR}/include)
+            target_compile_options(test_mpi_transport_${_peak_transport_case} PRIVATE -UNDEBUG)
+            target_link_libraries(test_mpi_transport_${_peak_transport_case} PRIVATE
+                Threads::Threads m)
+            add_test(NAME test_mpi_transport_${_peak_transport_case}
+                COMMAND test_mpi_transport_${_peak_transport_case})
+            set_tests_properties(test_mpi_transport_${_peak_transport_case}
+                PROPERTIES TIMEOUT 30)
+        endforeach()
+
+        if(MPI_C_FOUND)
+            add_executable(test_mpi_runtime_generation
+                mpi_progress/test_runtime_generation.c
+                ${PROJECT_SOURCE_DIR}/src/mpi_policy_adapter.c
+                ${PROJECT_SOURCE_DIR}/src/mpi_cost_model.c
+                ${PROJECT_SOURCE_DIR}/src/mpi_causal_backend.c
+                ${PROJECT_SOURCE_DIR}/src/mpi_causal_batches.c
+                ${PROJECT_SOURCE_DIR}/src/mpi_causal_match_index.c
+                ${PROJECT_SOURCE_DIR}/src/mpi_causal_transport.c
+                ${PROJECT_SOURCE_DIR}/src/mpi_observer.c
+                ${PROJECT_SOURCE_DIR}/src/mpi_progress_contract.c)
+            target_include_directories(test_mpi_runtime_generation PRIVATE ${PROJECT_SOURCE_DIR}/include)
+            target_compile_definitions(test_mpi_runtime_generation PRIVATE HAVE_MPI)
+            target_compile_options(test_mpi_runtime_generation PRIVATE -UNDEBUG -ffunction-sections -fdata-sections)
+            target_link_options(test_mpi_runtime_generation PRIVATE -Wl,--gc-sections)
+            target_link_libraries(test_mpi_runtime_generation PRIVATE MPI::MPI_C Threads::Threads m)
+            add_test(NAME test_mpi_runtime_generation COMMAND test_mpi_runtime_generation)
+            set_tests_properties(test_mpi_runtime_generation PROPERTIES TIMEOUT 20)
+            add_executable(test_mpi_causal_request_metadata
+                dgemm_mpi/test_mpi_causal_request_metadata.c
+                ${PROJECT_SOURCE_DIR}/src/mpi_progress_contract.c
+                ${PROJECT_SOURCE_DIR}/src/mpi_observer.c)
+            target_include_directories(test_mpi_causal_request_metadata PRIVATE
+                ${PROJECT_SOURCE_DIR}/include)
+            target_compile_definitions(test_mpi_causal_request_metadata PRIVATE HAVE_MPI)
+            target_compile_options(test_mpi_causal_request_metadata PRIVATE -UNDEBUG)
+            target_link_libraries(test_mpi_causal_request_metadata PRIVATE
+                MPI::MPI_C Threads::Threads ${CMAKE_DL_LIBS} m)
+            add_executable(test_mpi_causal_eager_native
+                dgemm_mpi/test_mpi_causal_eager_native.c)
+            target_compile_options(test_mpi_causal_eager_native PRIVATE -UNDEBUG)
+            target_link_libraries(test_mpi_causal_eager_native PRIVATE MPI::MPI_C)
+            add_test(NAME test_mpi_causal_eager_native
+                COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2
+                    ${MPIEXEC_PREFLAGS}
+                    $<TARGET_FILE:test_mpi_causal_eager_native> ${MPIEXEC_POSTFLAGS})
+            set_tests_properties(test_mpi_causal_eager_native PROPERTIES TIMEOUT 20
+                FAIL_REGULAR_EXPRESSION "bad=[1-9]")
+
+            foreach(_peak_request_case alias copy overwrite any some reuse
+                    persistent null self singleton concurrent false status partial
+                    free-wait batch128 batch256 native reserved-lookup persistent-buffer
+                    native-buffer native-latewait startup-compact compact-request)
+                add_test(NAME test_mpi_request_metadata_${_peak_request_case}
+                    COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2
+                        ${MPIEXEC_PREFLAGS}
+                        $<TARGET_FILE:test_mpi_causal_request_metadata>
+                        ${_peak_request_case} ${MPIEXEC_POSTFLAGS})
+                set_tests_properties(test_mpi_request_metadata_${_peak_request_case}
+                    PROPERTIES TIMEOUT 15)
+            endforeach()
+        endif()
+
+        add_executable(test_mpi_delivery_contract
+            mpi_progress/test_delivery_contract.c
+            ${PROJECT_SOURCE_DIR}/src/mpi_progress_contract.c)
+        target_include_directories(test_mpi_delivery_contract PRIVATE
+            ${PROJECT_SOURCE_DIR}/include)
+        target_compile_options(test_mpi_delivery_contract PRIVATE -UNDEBUG)
+        add_test(NAME test_mpi_delivery_contract COMMAND test_mpi_delivery_contract)
+        set_tests_properties(test_mpi_delivery_contract PROPERTIES TIMEOUT 20)
+    endif()
+
     add_test(NAME test_mpi_report_transport_nonblocking
         COMMAND ${Python3_EXECUTABLE}
                 ${PROJECT_SOURCE_DIR}/test/static_checks/check_mpi_report_transport_nonblocking.py

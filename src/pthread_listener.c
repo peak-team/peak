@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include "internal/mpi_causal_runtime.h"
 #include "pthread_listener.h"
 #include "general_listener.h"
 #include "detach_controller.h"
@@ -119,6 +120,7 @@ pthread_listener_publish_current_slot(size_t slot, uint64_t generation)
         pthread_slot_identity.valid = FALSE;
         return FALSE;
     }
+    peak_mpi_causal_runtime_note_slot(slot);
     return TRUE;
 }
 
@@ -572,6 +574,7 @@ peak_pthread_join(pthread_t thread, void **retval)
                                                     token)) {
             gboolean reusable =
                 peak_general_listener_retire_current_thread_slot(slot);
+            peak_mpi_causal_runtime_retire_slot(slot, token.generation);
             (void)peak_pthread_slot_registry_complete_retire(
                 &pthread_slot_registry, token, reusable);
         }
@@ -690,6 +693,7 @@ pthread_listener_reclaim_detached_slots(void)
                 &pthread_slot_registry, candidates[index].token);
             continue;
         }
+        peak_mpi_causal_runtime_retire_slot(candidates[index].token.slot, candidates[index].token.generation);
         if (peak_pthread_slot_registry_complete_retire(
                 &pthread_slot_registry, candidates[index].token, true)) {
             pthread_reclaim_diagnostics.reclaimed++;
@@ -1112,3 +1116,7 @@ size_t pthread_listener_snapshot_threads(pthread_t* tids,
     }
     return count;
 }
+
+#ifdef HAVE_MPI
+int peak_mpi_causal_registry_active(void) { return tid_mapping_initialized; }
+#endif

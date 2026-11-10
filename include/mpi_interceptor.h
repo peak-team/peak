@@ -48,6 +48,9 @@ PEAK_MPI_INTERCEPTOR_API void peak_mpi_init_completed(int result);
  */
 int mpi_interceptor_attach();
 
+/* Register the existing finalize boundary without initializing Gum or hooks. */
+void mpi_interceptor_prepare_service_only_finalize(void);
+
 /**
  * @brief Returns non-zero after the application has attempted PMPI_Finalize.
  */

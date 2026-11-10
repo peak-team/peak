@@ -27,6 +27,7 @@ set(sources_peak
     general_listener/report_formatter.c
     general_listener/report_maxima.c
     general_listener/report_model.c
+    general_listener/hook_coverage.c
     general_listener/report_snapshot.c
     general_listener/runtime_config.c
     general_listener/socket_report_transport.c
@@ -73,7 +74,18 @@ if(MPI_FOUND)
     list(APPEND sources_peak
         general_listener/mpi_report_transport.c
         mpi_teardown_guard.c
-        mpi_interceptor.c)
+        mpi_interceptor.c
+        mpi_cost_model.c
+        mpi_causal_cost.c
+        mpi_causal_runtime.c
+        mpi_causal_events.c
+        mpi_progress_contract.c
+        mpi_causal_batches.c
+        mpi_causal_match_index.c
+        mpi_causal_backend.c
+        mpi_causal_transport.c
+        mpi_observer.c
+        mpi_policy_adapter.c)
 endif()
 if(PEAK_CUDA_ENABLED)
     list(APPEND sources_peak $<TARGET_OBJECTS:cuda_interceptor_obj>)
