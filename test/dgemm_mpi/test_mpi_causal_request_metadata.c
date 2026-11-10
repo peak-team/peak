@@ -689,6 +689,11 @@ int main(int argc, char **argv) {
     int probe_sent = 73, probe_received = -1;
     MPI_Request probe_request;
     assert(MPI_Isend(&probe_sent, 1, MPI_INT, 0, 72, local, &probe_request) == MPI_SUCCESS);
+    int visible = 0;
+    do {
+      assert(MPI_Iprobe(MPI_ANY_SOURCE, 72, local, &visible,
+                        MPI_STATUS_IGNORE) == MPI_SUCCESS);
+    } while (!visible);
     for (int i = 0; i < 600; ++i) {
       int flag = 0;
       assert(MPI_Iprobe(MPI_ANY_SOURCE, 72, local, &flag, MPI_STATUS_IGNORE) == MPI_SUCCESS && flag);
