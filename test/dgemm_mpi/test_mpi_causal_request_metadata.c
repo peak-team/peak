@@ -16,12 +16,15 @@ static pthread_mutex_t collected = PTHREAD_MUTEX_INITIALIZER;
 static pthread_barrier_t in_flight;
 static int concurrent_test, concurrent_free_test, require_buffer_activation;
 static uint64_t snapshot_ids[2][2];
-static unsigned remote_active, failures, completed;
+static _Atomic unsigned remote_active;
+static unsigned failures, completed;
+static int self_loop, require_mixed_start;
 static uint64_t completed_uid[8], completed_start[8];
 static unsigned native_buffer_results;
 static uint64_t native_buffer_ids[16];
 static int check_native_buffer;
 int peak_mpi_causal_runtime_enabled(void) { return 1; }
+int peak_mpi_causal_runtime_needs_service(void) { return remote_active != 0; }
 int peak_mpi_causal_runtime_capture_enabled(void) {
   return peak_mpi_observer_coarse_reason(observer) ==
          PEAK_MPI_OBSERVER_REASON_NONE;
@@ -64,12 +67,16 @@ void peak_mpi_causal_runtime_submit(PeakMpiObserverRecord *r, int actual) {
       native_buffer_ids[native_buffer_results++] = r->op_uid;
     }
   }
+  if (require_mixed_start &&
+      ((r->operation == PEAK_MPI_CAUSAL_START && r->phase == PEAK_MPI_CAUSAL_CALL_BEGIN) ||
+       r->phase == PEAK_MPI_CAUSAL_REQUEST_ACTIVATE))
+    assert(remote_active && r->op_uid && r->batch_uid);
   if (actual)
     remote_active = 1;
   peak_mpi_causal_runtime_boundary(r);
   peak_mpi_observer_activate(observer);
   (void)peak_mpi_observer_emit(observer, &writer, r);
-  if (r->phase == PEAK_MPI_CAUSAL_REQUEST_COMPLETE) {
+  if (r->phase == PEAK_MPI_CAUSAL_REQUEST_COMPLETE && !self_loop) {
     assert(completed < 8);
     completed_uid[completed] = r->request_uid;
     completed_start[completed++] = r->op_uid;
@@ -662,6 +669,67 @@ int main(int argc, char **argv) {
       cost++;
       assert(MPI_Barrier(local) == MPI_SUCCESS);
     }
+    self_loop = 1;
+    for (int i = 0; i < 600; ++i) {
+      int sent = i + world_rank, received = -1;
+      MPI_Request request;
+      assert(MPI_Isend(&sent, 1, MPI_INT, 0, 71, local, &request) == MPI_SUCCESS);
+      assert(MPI_Recv(&received, 1, MPI_INT, MPI_ANY_SOURCE, 71, local,
+                      MPI_STATUS_IGNORE) == MPI_SUCCESS && received == sent);
+      assert(MPI_Wait(&request, MPI_STATUS_IGNORE) == MPI_SUCCESS);
+      int reduced = -1;
+      assert(MPI_Iallreduce(&sent, &reduced, 1, MPI_INT, MPI_SUM, local,
+                            &request) == MPI_SUCCESS);
+      assert(MPI_Wait(&request, MPI_STATUS_IGNORE) == MPI_SUCCESS && reduced == sent);
+      assert(!observed_open_requests && !request_used && !remote_active);
+      PeakMpiObserverSlotState local_state;
+      assert(peak_mpi_observer_slot_state(observer, 0, &local_state) &&
+             !local_state.published && !local_state.lost);
+    }
+    int probe_sent = 73, probe_received = -1;
+    MPI_Request probe_request;
+    assert(MPI_Isend(&probe_sent, 1, MPI_INT, 0, 72, local, &probe_request) == MPI_SUCCESS);
+    for (int i = 0; i < 600; ++i) {
+      int flag = 0;
+      assert(MPI_Iprobe(MPI_ANY_SOURCE, 72, local, &flag, MPI_STATUS_IGNORE) == MPI_SUCCESS && flag);
+    }
+    assert(MPI_Recv(&probe_received, 1, MPI_INT, 0, 72, local,
+                    MPI_STATUS_IGNORE) == MPI_SUCCESS && probe_received == probe_sent);
+    assert(MPI_Wait(&probe_request, MPI_STATUS_IGNORE) == MPI_SUCCESS);
+    for (int variant = 0; variant < 2; ++variant) {
+      MPI_Message message;
+      MPI_Request sender, receiver;
+      int sent = 75 + variant, received = -1;
+      assert(MPI_Isend(&sent, 1, MPI_INT, 0, 73 + variant, local, &sender) == MPI_SUCCESS);
+      assert(MPI_Mprobe(0, 73 + variant, local, &message, MPI_STATUS_IGNORE) == MPI_SUCCESS);
+      assert(observed_open_requests == 2);
+      if (!variant)
+        assert(MPI_Mrecv(&received, 1, MPI_INT, &message, MPI_STATUS_IGNORE) == MPI_SUCCESS);
+      else {
+        assert(MPI_Imrecv(&received, 1, MPI_INT, &message, &receiver) == MPI_SUCCESS);
+        assert(MPI_Wait(&receiver, MPI_STATUS_IGNORE) == MPI_SUCCESS);
+      }
+      assert(MPI_Wait(&sender, MPI_STATUS_IGNORE) == MPI_SUCCESS && received == sent);
+      assert(!observed_open_requests && !request_used);
+    }
+    self_loop = 0;
+    /* Keep unrecorded SELF branches alive across the first remote join. */
+    contract = (PeakMpiProgressContract){.profile=PEAK_MPI_PROGRESS_INTEL_2021_11_ASYNC,
+      .autonomous_p2p=1,.autonomous_blocking_collective=1,.autonomous_selected_nbc=1,
+      .name="unit",.reason="unit"};
+    single_flow = 1;
+    int late_value = 81, late_received = -1, late_reduced = -1, late_message_value = 83;
+    MPI_Request late[3];
+    MPI_Message late_message;
+    assert(MPI_Isend(&late_value, 1, MPI_INT, 0, 81, local, &late[0]) == MPI_SUCCESS);
+    assert(MPI_Recv(&late_received, 1, MPI_INT, 0, 81, local, MPI_STATUS_IGNORE) == MPI_SUCCESS);
+    assert(MPI_Iallreduce(&late_value, &late_reduced, 1, MPI_INT, MPI_SUM, local, &late[1]) == MPI_SUCCESS);
+    assert(MPI_Isend(&late_message_value, 1, MPI_INT, 0, 83, local, &late[2]) == MPI_SUCCESS);
+    assert(MPI_Mprobe(0, 83, local, &late_message, MPI_STATUS_IGNORE) == MPI_SUCCESS);
+    MPI_Comm late_comm;
+    MPI_Request late_idup;
+    assert(MPI_Comm_idup(local, &late_comm, &late_idup) == MPI_SUCCESS);
+    assert(observed_open_requests == 4 + (late_idup != MPI_REQUEST_NULL) && !remote_active);
     PeakMpiObserverSlotState state;
     assert(peak_mpi_observer_slot_state(observer, 0, &state));
     fprintf(stderr,
@@ -673,21 +741,67 @@ int main(int argc, char **argv) {
            peak_mpi_observer_coarse_reason(observer) ==
                PEAK_MPI_OBSERVER_REASON_NONE &&
            !remote_active && !failures);
+    if (!strcmp(argv[1], "singleton")) {
+      MPI_Request persistent[4];
+      int send = world_rank + 91, self_received = -1, remote_received = -1;
+      assert(MPI_Send_init(&send,1,MPI_INT,0,91,local,&persistent[0])==MPI_SUCCESS);
+      assert(MPI_Recv_init(&self_received,1,MPI_INT,0,91,local,&persistent[1])==MPI_SUCCESS);
+      assert(MPI_Send_init(&send,1,MPI_INT,1-world_rank,92,MPI_COMM_WORLD,&persistent[2])==MPI_SUCCESS);
+      assert(MPI_Recv_init(&remote_received,1,MPI_INT,1-world_rank,92,MPI_COMM_WORLD,&persistent[3])==MPI_SUCCESS);
+      require_mixed_start = 1;
+      assert(MPI_Startall(4,persistent)==MPI_SUCCESS);
+      require_mixed_start = 0;
+      assert(MPI_Waitall(4,persistent,MPI_STATUSES_IGNORE)==MPI_SUCCESS);
+      assert(self_received==send&&remote_received==1-world_rank+91&&completed==4);
+      for(unsigned i=0;i<4;i++) assert(MPI_Request_free(&persistent[i])==MPI_SUCCESS);
+      expected_previous=contexts[0].previous;
+    }
     int value = world_rank + 1, got = 0;
     assert(MPI_Sendrecv(&value, 1, MPI_INT, 1 - world_rank, 8, &got, 1, MPI_INT,
                         1 - world_rank, 8, MPI_COMM_WORLD,
                         MPI_STATUS_IGNORE) == MPI_SUCCESS &&
            got == 2 - world_rank);
+    unsigned before_local_completion = completed;
+    assert(MPI_Barrier(MPI_COMM_WORLD)==MPI_SUCCESS);
+    assert(MPI_Wait(&late[0],MPI_STATUS_IGNORE)==MPI_SUCCESS);
+    assert(MPI_Wait(&late[1],MPI_STATUS_IGNORE)==MPI_SUCCESS&&late_reduced==late_value);
+    int late_message_received=-1;
+    MPI_Request late_receiver;
+    assert(MPI_Imrecv(&late_message_received,1,MPI_INT,&late_message,&late_receiver)==MPI_SUCCESS);
+    assert(MPI_Wait(&late_receiver,MPI_STATUS_IGNORE)==MPI_SUCCESS);
+    assert(MPI_Wait(&late[2],MPI_STATUS_IGNORE)==MPI_SUCCESS&&late_message_received==late_message_value);
+    assert(MPI_Wait(&late_idup,MPI_STATUS_IGNORE)==MPI_SUCCESS);
+    Comm late_context; unsigned late_slot;
+    assert(get_comm(late_comm,&late_context,&late_slot,0) && local_comm(&late_context));
+    put_comm(late_slot);
+    assert(MPI_Comm_free(&late_comm)==MPI_SUCCESS);
+    assert(completed==before_local_completion&&!observed_open_requests);
+    assert(MPI_Barrier(MPI_COMM_WORLD)==MPI_SUCCESS);
+    MPI_Request recorded;
+    int recorded_reduced = -1;
+    assert(MPI_Iallreduce(&late_value,&recorded_reduced,1,MPI_INT,MPI_SUM,local,&recorded)==MPI_SUCCESS);
+    Request recorded_identity;
+    assert(snapshot_request_at(recorded,&recorded,&recorded_identity) &&
+           recorded_identity.start_uid && recorded_identity.graph_epoch);
+    assert(MPI_Wait(&recorded,MPI_STATUS_IGNORE)==MPI_SUCCESS && recorded_reduced==late_value &&
+           completed==before_local_completion+1 &&
+           completed_start[before_local_completion]==recorded_identity.start_uid);
     PeakMpiObserverRecord rec;
-    int found = 0;
+    int found = 0, barrier_count=0;
     while (peak_mpi_observer_consume(observer, 0, &rec)) {
+      if (rec.operation==PEAK_MPI_CAUSAL_BARRIER&&rec.phase==PEAK_MPI_CAUSAL_CALL_BEGIN) {
+        assert(((rec.flags&PEAK_MPI_OBSERVER_SLACK_NO_OPEN_PROGRESS)!=0)==(barrier_count!=0));
+        barrier_count++;
+      }
+      assert(rec.phase!=PEAK_MPI_CAUSAL_REQUEST_COMPLETE||rec.op_uid);
       if (rec.operation == PEAK_MPI_CAUSAL_SENDRECV &&
           rec.phase == PEAK_MPI_CAUSAL_CALL_BEGIN) {
         assert(rec.L_cut == 600 && rec.input_ref == expected_previous);
         found = 1;
       }
     }
-    assert(found && remote_active);
+    assert(found && remote_active && barrier_count==2 && !failures);
+    no_live_requests();
   }
   if (!strcmp(argv[1], "native-buffer") || !strcmp(argv[1], "native-latewait")) {
     PeakMpiObserverSlotState state;

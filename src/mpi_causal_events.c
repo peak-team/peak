@@ -523,6 +523,40 @@ static void publish_begin(Context *c) {
   submit_event(&c->begin, 0);
   c->emitted = 1;
 }
+static int local_comm(const Comm *comm) {
+  return comm && !comm->inter && comm->size == 1 && comm->members &&
+         comm->members[0] == world_rank;
+}
+static int unrecorded_local_message(const Message *msg, const Comm *comm) {
+  return msg->uid && !msg->probe_uid && local_comm(comm);
+}
+static void finish_local_message(const Message *msg, const Comm *comm, int rc) {
+  if (!unrecorded_local_message(msg, comm)) return;
+  if (rc != MPI_SUCCESS) {
+    fail(PEAK_MPI_OBSERVER_REASON_CAPABILITY);
+    return;
+  }
+  pthread_mutex_lock(&metadata);
+  if (observed_open_requests) --observed_open_requests;
+  pthread_mutex_unlock(&metadata);
+}
+static int unrecorded_local_request(const Request *r) {
+  return r->occupied && !r->start_uid && !r->graph_epoch &&
+         r->comm_slot < COMM_CAP && comms[r->comm_slot].uid &&
+         local_comm(&comms[r->comm_slot]);
+}
+static int local_call(PeakMpiCausalOperation op, const Comm *comm,
+                       const Context *c) {
+  if (local_comm(comm))
+    return 1;
+  if (op != PEAK_MPI_CAUSAL_WAIT && op != PEAK_MPI_CAUSAL_TEST &&
+      op != PEAK_MPI_CAUSAL_START && op != PEAK_MPI_CAUSAL_REQUEST_FREE)
+    return 0;
+  for (unsigned i = 0; i < c->count; ++i)
+    if (c->requests[i].occupied && !unrecorded_local_request(&c->requests[i]))
+      return 0;
+  return 1;
+}
 static Context *begin_call(PeakMpiCausalOperation op, const Comm *comm,
                            unsigned flags, int peer, int tag, int root,
                            int deferred) {
@@ -531,9 +565,11 @@ static Context *begin_call(PeakMpiCausalOperation op, const Comm *comm,
   Context *c = context();
   if (!c)
     return NULL;
-  uint64_t epoch = peak_mpi_causal_runtime_capture_enabled()
-                       ? peak_mpi_causal_runtime_capture_epoch()
-                       : 0;
+  int local = !peak_mpi_causal_runtime_needs_service() &&
+              local_call(op, comm, c);
+  uint64_t epoch = peak_mpi_causal_runtime_capture_enabled() &&
+                           (!local || peak_mpi_causal_runtime_needs_service())
+                       ? peak_mpi_causal_runtime_capture_epoch() : 0;
   if (c->capture_epoch != epoch)
     c->previous = 0;
   c->capture_epoch = epoch;
@@ -561,15 +597,15 @@ static Context *begin_call(PeakMpiCausalOperation op, const Comm *comm,
   if (op == PEAK_MPI_CAUSAL_BSEND)
     r->flags |= PEAK_MPI_CAUSAL_BUFFERED;
   pthread_mutex_lock(&metadata);
-  uint64_t locked_epoch = peak_mpi_causal_runtime_capture_enabled()
-                              ? peak_mpi_causal_runtime_capture_epoch()
-                              : 0;
+  uint64_t locked_epoch = peak_mpi_causal_runtime_capture_enabled() &&
+                                  (!local || peak_mpi_causal_runtime_needs_service())
+                              ? peak_mpi_causal_runtime_capture_epoch() : 0;
   if (c->capture_epoch != locked_epoch) {
     c->previous = 0;
     r->input_ref = 0;
   }
   c->capture_epoch = locked_epoch;
-  r->op_uid = peak_mpi_causal_runtime_operation_id();
+  r->op_uid = c->capture_epoch ? peak_mpi_causal_runtime_operation_id() : 0;
   if (op == PEAK_MPI_CAUSAL_BSEND || op == PEAK_MPI_CAUSAL_BUFFER_DETACH)
     r->progress_begin = buffer_generation;
   if (contract.observed_buffer_detach && op == PEAK_MPI_CAUSAL_BSEND)
@@ -609,6 +645,14 @@ static Context *begin_call(PeakMpiCausalOperation op, const Comm *comm,
     publish_begin(c);
   }
   return c;
+}
+static Context *begin_request_call(PeakMpiCausalOperation op, int deferred,
+                                    const Request *old) {
+  Context *c = context();
+  if (!c) return NULL;
+  c->requests[0] = *old;
+  c->count = 1;
+  return begin_call(op, NULL, 0, -1, -1, -1, deferred);
 }
 static void end_call(Context *c, int rc, PeakMpiObserverRecord *details,
                      int actual, unsigned completed) {
@@ -1342,8 +1386,9 @@ static int install_request(MPI_Request *storage, const Comm *comm,
   r->persistent = persistent;
   r->active = !persistent;
   r->occupied = 1;
-  if (contract.observed_p2p_completion && !persistent &&
-      !(r->flags & PEAK_MPI_CAUSAL_BUFFERED))
+  if (!persistent &&
+      ((contract.observed_p2p_completion && !(r->flags & PEAK_MPI_CAUSAL_BUFFERED)) ||
+       unrecorded_local_request(r)))
     ++observed_open_requests;
   ++comms[comm_slot].references;
   details->request_uid = r->uid;
@@ -1374,6 +1419,7 @@ static unsigned complete_request(Context *c, const Request *old,
     return 0;
   peak_mpi_causal_runtime_observer_work(PEAK_MPI_CAUSAL_WORK_COMPLETION, 1);
   int observed = old->observed;
+  int local = unrecorded_local_request(old);
   pthread_mutex_lock(&metadata);
   int claim = request_exact_index(old);
   if (claim < 0) {
@@ -1384,8 +1430,8 @@ static unsigned complete_request(Context *c, const Request *old,
     observed = requests[claim].observed;
     if (old->active && !observed) {
       requests[claim].observed = 1;
-      if (error == MPI_SUCCESS && contract.observed_p2p_completion &&
-          !(old->flags & PEAK_MPI_CAUSAL_BUFFERED) && observed_open_requests)
+      if (error == MPI_SUCCESS && observed_open_requests &&
+          ((contract.observed_p2p_completion && !(old->flags & PEAK_MPI_CAUSAL_BUFFERED)) || local))
         --observed_open_requests;
     }
   }
@@ -1394,7 +1440,7 @@ static unsigned complete_request(Context *c, const Request *old,
   int cancelled = 0;
   if (old->cancelled && status && error == MPI_SUCCESS)
     (void)PMPI_Test_cancelled(status, &cancelled);
-  if (old->active && !observed) {
+  if (old->active && !observed && !local) {
     PeakMpiObserverRecord r;
     memset(&r, 0, sizeof(r));
     r.kind = PEAK_MPI_OBSERVER_EVENT_COMPLETE;
@@ -1441,10 +1487,6 @@ static unsigned complete_request(Context *c, const Request *old,
       submit_event(&r, actual);
     if (error != MPI_SUCCESS)
       fail(PEAK_MPI_OBSERVER_REASON_CAPABILITY);
-    if (old->operation == PEAK_MPI_CAUSAL_COMM_IDUP &&
-        old->idup_comm != MPI_COMM_NULL && error == MPI_SUCCESS)
-      define_comm(old->idup_comm, old->comm_uid, old->lineage_ordinal,
-                  PEAK_MPI_CAUSAL_COMM_IDUP_CREATED, 0);
   } else if (c && old->observed && reclaim && old->start_uid &&
              old->graph_epoch == c->capture_epoch) {
     PeakMpiObserverRecord r = {0};
@@ -1460,6 +1502,12 @@ static unsigned complete_request(Context *c, const Request *old,
       r.flags |= PEAK_MPI_CAUSAL_INACTIVE_REQUEST;
     submit_event(&r, 0);
   }
+  if (old->active && !observed && old->operation == PEAK_MPI_CAUSAL_COMM_IDUP &&
+      old->idup_comm != MPI_COMM_NULL && error == MPI_SUCCESS)
+    define_comm(old->idup_comm, old->comm_uid, old->lineage_ordinal,
+                PEAK_MPI_CAUSAL_COMM_IDUP_CREATED, 0);
+  if (local && error != MPI_SUCCESS)
+    fail(PEAK_MPI_OBSERVER_REASON_CAPABILITY);
   pthread_mutex_lock(&metadata);
   int i = request_exact_index(old);
   if (i >= 0 && requests[i].generation == old->generation) {
@@ -1471,7 +1519,7 @@ static unsigned complete_request(Context *c, const Request *old,
   pthread_mutex_unlock(&metadata);
   if (reclaim && !old->persistent)
     forget_request(old);
-  return old->active && !observed ? 1u : 0u;
+  return old->active && !observed && !local ? 1u : 0u;
 }
 
 #define BLOCK_SEND_TYPED(name, operation, count_type)                          \
@@ -1710,7 +1758,7 @@ static int wrap_Wait(Fn_Wait real, MPI_Request *request, MPI_Status *status) {
   MPI_Status *native = status;
   if (observe && request) {
     snapshot_request_claimed(*request, request, &old);
-    c = begin_call(PEAK_MPI_CAUSAL_WAIT, NULL, 0, -1, -1, -1, 0);
+    c = begin_request_call(PEAK_MPI_CAUSAL_WAIT, 0, &old);
     remember_request(c, &old);
     if (status == MPI_STATUS_IGNORE)
       native = &scratch;
@@ -1737,7 +1785,7 @@ static int wrap_Test(Fn_Test real, MPI_Request *request, int *flag,
   MPI_Status *native = status;
   if (observe && request) {
     snapshot_request_claimed(*request, request, &old);
-    c = begin_call(PEAK_MPI_CAUSAL_TEST, NULL, 0, -1, -1, -1, 1);
+    c = begin_request_call(PEAK_MPI_CAUSAL_TEST, 1, &old);
     remember_request(c, &old);
     if (status == MPI_STATUS_IGNORE)
       native = &scratch;
@@ -1779,6 +1827,11 @@ static Context *prepare_many(int count, MPI_Request array[],
   if (missing)
     fail(PEAK_MPI_OBSERVER_REASON_IDENTITY);
   Context *snapshots = c;
+  c->count = (unsigned)count;
+  if (op == PEAK_MPI_CAUSAL_START)
+    for (int i = 0; i < count; ++i)
+      if (c->requests[i].occupied)
+        note_peer(c->requests[i].peer);
   c = begin_call(op, NULL, 0, -1, -1, -1, deferred);
   if (c) {
     c->count = (unsigned)count;
@@ -1965,7 +2018,7 @@ static int wrap_Request_get_status(Fn_Request_get_status real,
   MPI_Status *native = status;
   if (observe) {
     snapshot_request_claimed(request, NULL, &old);
-    c = begin_call(PEAK_MPI_CAUSAL_TEST, NULL, 0, -1, -1, -1, 1);
+    c = begin_request_call(PEAK_MPI_CAUSAL_TEST, 1, &old);
     remember_request(c, &old);
     if (status == MPI_STATUS_IGNORE)
       native = &scratch;
@@ -2017,7 +2070,7 @@ static int wrap_Request_free(Fn_Request_free real, MPI_Request *request) {
   Context *c = NULL;
   if (observe && request) {
     snapshot_request_claimed(*request, request, &old);
-    c = begin_call(PEAK_MPI_CAUSAL_REQUEST_FREE, NULL, 0, -1, -1, -1, 0);
+    c = begin_request_call(PEAK_MPI_CAUSAL_REQUEST_FREE, 0, &old);
     remember_request(c, &old);
     if (old.active && !old.observed)
       fail(PEAK_MPI_OBSERVER_REASON_CAPABILITY);
@@ -2122,7 +2175,7 @@ static unsigned activate_requests(Context *c, unsigned count) {
       fail(PEAK_MPI_OBSERVER_REASON_IDENTITY);
       continue;
     }
-    uint64_t start = peak_mpi_causal_runtime_operation_id();
+    uint64_t start = c->capture_epoch ? peak_mpi_causal_runtime_operation_id() : 0;
     pthread_mutex_lock(&metadata);
     int i = request_exact_index(old);
     if (i >= 0 && requests[i].generation == old->generation) {
@@ -2132,12 +2185,13 @@ static unsigned activate_requests(Context *c, unsigned count) {
       requests[i].start_uid = start;
       requests[i].graph_epoch = c->capture_epoch;
       ++requests[i].activation;
-      if (contract.observed_p2p_completion) {
-        if (requests[i].flags & PEAK_MPI_CAUSAL_BUFFERED)
-          ++observed_open_buffered;
-        else
-          ++observed_open_requests;
-      }
+      if (contract.observed_p2p_completion &&
+          (requests[i].flags & PEAK_MPI_CAUSAL_BUFFERED))
+        ++observed_open_buffered;
+      if ((contract.observed_p2p_completion &&
+           !(requests[i].flags & PEAK_MPI_CAUSAL_BUFFERED)) ||
+          unrecorded_local_request(&requests[i]))
+        ++observed_open_requests;
       *old = requests[i];
     }
     pthread_mutex_unlock(&metadata);
@@ -2294,6 +2348,8 @@ static uint64_t bind_message(MPI_Message handle, const Comm *comm,
                               normalized_tag(status->MPI_TAG),
                               1};
       ++comms[slot].references;
+      if (unrecorded_local_message(&messages[i], comm))
+        ++observed_open_requests;
       break;
     }
   pthread_mutex_unlock(&metadata);
@@ -2415,8 +2471,9 @@ static int wrap_Mrecv(Fn_Mrecv real, void *buf, int count, MPI_Datatype type,
   MPI_Status scratch;
   MPI_Status *native = status;
   if (observe && message && take_message(*message, &msg, &m, &slot)) {
-    c = begin_call(PEAK_MPI_CAUSAL_MRECV, &m, PEAK_MPI_CAUSAL_RECEIVE, msg.peer,
-                   msg.tag, -1, 1);
+    if (!unrecorded_local_message(&msg, &m))
+      c = begin_call(PEAK_MPI_CAUSAL_MRECV, &m, PEAK_MPI_CAUSAL_RECEIVE, msg.peer,
+                     msg.tag, -1, 1);
     if (c) {
       c->begin.request_uid = msg.uid;
       c->begin.progress_begin = msg.probe_uid;
@@ -2432,6 +2489,7 @@ static int wrap_Mrecv(Fn_Mrecv real, void *buf, int count, MPI_Datatype type,
   if (observe && m.uid && rc == MPI_SUCCESS)
     actual = receive_status(&m, native, &d);
   d.request_uid = msg.uid;
+  finish_local_message(&msg, &m, rc);
   if (c)
     end_call(c, rc, &d, actual, 0);
   if (m.uid)
@@ -2456,9 +2514,10 @@ static int wrap_Imrecv(Fn_Imrecv real, void *buf, int count, MPI_Datatype type,
   unsigned slot = 0;
   Context *c = NULL;
   if (observe && message && take_message(*message, &msg, &m, &slot)) {
-    c = begin_call(PEAK_MPI_CAUSAL_MRECV, &m,
-                   PEAK_MPI_CAUSAL_RECEIVE | PEAK_MPI_CAUSAL_NONBLOCKING,
-                   msg.peer, msg.tag, -1, 1);
+    if (!unrecorded_local_message(&msg, &m))
+      c = begin_call(PEAK_MPI_CAUSAL_MRECV, &m,
+                     PEAK_MPI_CAUSAL_RECEIVE | PEAK_MPI_CAUSAL_NONBLOCKING,
+                     msg.peer, msg.tag, -1, 1);
     if (c) {
       c->begin.request_uid = msg.uid;
       c->begin.progress_begin = msg.probe_uid;
@@ -2468,10 +2527,11 @@ static int wrap_Imrecv(Fn_Imrecv real, void *buf, int count, MPI_Datatype type,
   int rc;
   NATIVE(rc, real(buf, count, type, message, request));
   PeakMpiObserverRecord d = {0};
-  if (c && rc == MPI_SUCCESS && request)
+  if (m.uid && rc == MPI_SUCCESS && request)
     install_request(request, &m, slot, PEAK_MPI_CAUSAL_MRECV,
                     PEAK_MPI_CAUSAL_RECEIVE | PEAK_MPI_CAUSAL_NONBLOCKING,
-                    msg.peer, msg.tag, -1, 0, c->begin.op_uid, 0, &d);
+                    msg.peer, msg.tag, -1, 0, c ? c->begin.op_uid : 0, 0, &d);
+  finish_local_message(&msg, &m, rc);
   if (c)
     end_call(c, rc, &d, actual_peer(msg.peer), 0);
   if (m.uid)
@@ -2556,9 +2616,9 @@ static Context *collective_begin(PeakMpiCausalOperation op, MPI_Comm handle,
     flags |= PEAK_MPI_OBSERVER_SLACK_S1;
   if (single_flow)
     flags |= PEAK_MPI_OBSERVER_SLACK_SINGLE_FLOW;
-  if (contract.profile == PEAK_MPI_PROGRESS_INTEL_2021_11_ASYNC ||
-      (contract.observed_collective_completion && !contract.progress_estimate &&
-       no_open))
+  if (no_open &&
+      (contract.profile == PEAK_MPI_PROGRESS_INTEL_2021_11_ASYNC ||
+       (contract.observed_collective_completion && !contract.progress_estimate)))
     flags |= PEAK_MPI_OBSERVER_SLACK_NO_OPEN_PROGRESS;
   Context *c = begin_call(op, comm, flags, -1, -1, world_peer(comm, root), 1);
   if (c) {

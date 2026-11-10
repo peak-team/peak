@@ -25,6 +25,7 @@ const PeakMpiProgressContract *peak_mpi_causal_events_contract(void);
  * Object definitions contain a frontend-local UID in CommPart.local_uid;
  * observer slab UIDs are separate immutable transport definition identities. */
 int peak_mpi_causal_runtime_enabled(void);
+int peak_mpi_causal_runtime_needs_service(void);
 /* Sticky-coarse retains cached communicator/actual peer discovery only. New
  * wildcard requests or untracked activations mark membership unknown. */
 int peak_mpi_causal_runtime_capture_enabled(void);
