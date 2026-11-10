@@ -804,7 +804,13 @@ static PeakMpiPolicyResult receiver_snapshot(PeakMpiPolicyReceiver *r,
         d->g = r->have_feedback ? f->g : r->conservative_g;
         /* A membership bound is not a pressure observation. Unknown members
          * still forbid global headroom, without tightening local control. */
-        if (d->mode == PEAK_MPI_POLICY_STALE || d->mode == PEAK_MPI_POLICY_COARSE) {
+        if (d->mode == PEAK_MPI_POLICY_STALE && !r->feedback_invalid &&
+            !r->permanent_coarse && (!r->have_feedback ||
+                (elapsed >= f->local_elapsed_at_cut && cut_ordered))) {
+            /* Delayed observation is not evidence of amplified pressure. Keep
+             * learned pressure while global risk and reattach remain unknown. */
+            d->g = r->conservative_g;
+        } else if (d->mode == PEAK_MPI_POLICY_STALE || d->mode == PEAK_MPI_POLICY_COARSE) {
             d->g = r->membership_complete ? (double)(r->known_member_count ? r->known_member_count : 1) :
                 maximum(r->conservative_g, (double)(r->known_member_count ? r->known_member_count : 1));
         }

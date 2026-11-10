@@ -221,6 +221,57 @@ static PeakMpiPolicyCut stale_cut(PeakMpiPolicySample *s, unsigned gen,
                             .01,       age, 0,   PEAK_MPI_POLICY_COMPLETE_CUT,
                             1,         s,   2};
 }
+static void test_delayed_receiver_pressure(void) {
+  PeakMpiPolicyReceiver r;
+  PeakMpiPolicyDecision d;
+  assert(peak_mpi_policy_receiver_init(&r, &stale_cfg, stale_key, stale_ids[0], 0) == PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_receiver_rebind(&r, stale_key, 2, 1, 0) == PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_receiver_snapshot(&r, 1, 1, 0, 1, &d) == PEAK_MPI_POLICY_OK);
+  assert(d.mode == PEAK_MPI_POLICY_STALE && d.g == 1 &&
+         !d.global_available && !d.headroom_known && !d.reattach_relaxation);
+  PeakMpiPolicySample s[2];
+  stale_samples(s, 1, .01, .01, 1);
+  PeakMpiPolicy *p = peak_mpi_policy_create(&stale_cfg, stale_key, stale_ids, 2, 1, 1, 0);
+  assert(p);
+  PeakMpiPolicyCut c = stale_cut(s, 1, 0);
+  assert(peak_mpi_policy_submit_cut(p, &c, 1) == PEAK_MPI_POLICY_OK);
+  PeakMpiPolicyFeedback f;
+  assert(peak_mpi_policy_feedback(p, stale_ids[0], 1, &f) == PEAK_MPI_POLICY_OK);
+  f.g = 1.5;
+  assert(peak_mpi_policy_receiver_accept(&r, &f, 1) == PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_receiver_snapshot_cut(&r, 2, 2, s[0].cut, 1, &d) == PEAK_MPI_POLICY_OK);
+  assert(d.mode == PEAK_MPI_POLICY_STALE && d.g == 1.5 &&
+         !d.global_available && !d.headroom_known && !d.reattach_relaxation);
+  assert(d.q_eff == stale_cfg.q / 1.5 && d.detach_target == d.q_eff &&
+         d.candidate_stop_target == d.q_eff && d.cadence_target == d.q_eff &&
+         d.reattach_future_rate_target == d.q_eff);
+  PeakMpiPolicyFeedback delayed = f;
+  delayed.generation++;
+  delayed.mode = PEAK_MPI_POLICY_STALE;
+  delayed.reason = PEAK_MPI_POLICY_FEEDBACK_OLD;
+  delayed.g = 2;
+  assert(peak_mpi_policy_receiver_accept(&r, &delayed, 2) == PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_receiver_snapshot_cut(&r, 2, 2, s[0].cut, 1, &d) == PEAK_MPI_POLICY_OK && d.g == 1.5 && !d.reattach_relaxation);
+  /* Backward elapsed and local cost are invalid, rather than harmless age. */
+  assert(peak_mpi_policy_receiver_snapshot_cut(&r, 2, .5, s[0].cut, 1, &d) == PEAK_MPI_POLICY_OK && d.g == 2);
+  PeakMpiCostCut backward = {0};
+  assert(peak_mpi_policy_receiver_snapshot_cut(&r, 2, 2, backward, 1, &d) == PEAK_MPI_POLICY_OK && d.g == 2);
+  f.generation += 2;
+  f.age_seconds = 0;
+  f.local_elapsed_at_cut = 2;
+  f.T_safe = 2;
+  assert(peak_mpi_policy_receiver_accept(&r, &f, 2) == PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_receiver_snapshot_cut(&r, 2, 2, s[0].cut, 1, &d) == PEAK_MPI_POLICY_OK && d.mode == PEAK_MPI_POLICY_COMPLETE && d.g == 1.5 && d.global_available);
+  PeakMpiPolicyFeedback invalid = f;
+  invalid.generation++;
+  invalid.g = NAN;
+  assert(peak_mpi_policy_receiver_accept(&r, &invalid, 2) == PEAK_MPI_POLICY_INVALID);
+  assert(peak_mpi_policy_receiver_snapshot_cut(&r, 2, 2, s[0].cut, 1, &d) == PEAK_MPI_POLICY_OK && d.mode == PEAK_MPI_POLICY_STALE && d.g == 2 && !d.reattach_relaxation);
+  assert(peak_mpi_policy_receiver_mark_coarse(&r, PEAK_MPI_POLICY_EVENT_LOSS, 2) == PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_receiver_snapshot_cut(&r, 2, 2, s[0].cut, 1, &d) == PEAK_MPI_POLICY_OK && d.mode == PEAK_MPI_POLICY_COARSE && d.g == 2 && !d.reattach_relaxation);
+  peak_mpi_policy_free(p);
+}
+
 static void test_stale_feedback(void) {
   PeakMpiPolicySample s[2], raw[2];
   stale_samples(s, 1, .01, .01, 1);
@@ -379,6 +430,7 @@ static void test_feedback_cache_guard(void) {
        "dirty fresh cut recovers PASS");
 }
 int main(void) {
+  test_delayed_receiver_pressure();
   test_stale_feedback();
   test_feedback_cache_guard();
   test_profile = PEAK_MPI_PROGRESS_INTEL_2021_11_ASYNC;
