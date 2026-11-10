@@ -136,6 +136,21 @@ if(BUILD_TESTING)
         add_test(NAME test_mpi_transport_fairness COMMAND test_mpi_transport_fairness)
         set_tests_properties(test_mpi_transport_fairness PROPERTIES TIMEOUT 20)
 
+        foreach(_peak_transport_case codec envelope)
+            add_executable(test_mpi_transport_${_peak_transport_case}
+                mpi_progress/test_transport_${_peak_transport_case}.c
+                ${PROJECT_SOURCE_DIR}/src/mpi_observer.c)
+            target_include_directories(test_mpi_transport_${_peak_transport_case} PRIVATE
+                ${PROJECT_SOURCE_DIR}/include)
+            target_compile_options(test_mpi_transport_${_peak_transport_case} PRIVATE -UNDEBUG)
+            target_link_libraries(test_mpi_transport_${_peak_transport_case} PRIVATE
+                Threads::Threads m)
+            add_test(NAME test_mpi_transport_${_peak_transport_case}
+                COMMAND test_mpi_transport_${_peak_transport_case})
+            set_tests_properties(test_mpi_transport_${_peak_transport_case}
+                PROPERTIES TIMEOUT 30)
+        endforeach()
+
         if(MPI_C_FOUND)
             add_executable(test_mpi_causal_request_metadata
                 dgemm_mpi/test_mpi_causal_request_metadata.c

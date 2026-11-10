@@ -10,10 +10,12 @@
 #include <sys/uio.h>
 #include <unistd.h>
 
-#define HDR 40u
-#define MAGIC UINT32_C(0x504d4335)
+#define HDR 40u /* Retained allocation/payload reservation, not wire length. */
+
+#define MAGIC UINT32_C(0x504d4336)
+#define DENSE_MAGIC (MAGIC ^ UINT32_C(0x80000000))
 enum { SEND_BATCH_FRAMES = 16 };
-enum { HELLO = 1, RECORD, OBJECT, RAW, ACK, FEEDBACK, WMRQ };
+enum { HELLO = 1, RECORD, OBJECT, RAW, ACK, FEEDBACK, WMRQ, PACKED_RECORD, PACKED_RAW, PACKED_FEEDBACK };
 typedef struct {
   int fd, ready, feedback_sent;
   uint64_t feedback_generation, nonce_sent, pending_ack;
@@ -127,6 +129,75 @@ static void record_decode(const unsigned char *p, PeakMpiObserverRecord *r) {
 #undef D64
 #undef D32
 }
+/* Bounded exact integer encoding; floating values retain their original bits. */
+typedef struct { unsigned char *p, *end; int ok; } PackedOut;
+typedef struct { const unsigned char *p, *end; int ok; } PackedIn;
+static void pack_uint(PackedOut *w, uint64_t v) {
+  do {
+    if (!w->ok || w->p == w->end) { w->ok = 0; return; }
+    unsigned char b = (unsigned char)(v & 127); v >>= 7;
+    *w->p++ = b | (v ? 128 : 0);
+  } while (v);
+}
+static uint64_t unpack_uint(PackedIn *r) {
+  uint64_t v = 0;
+  for (unsigned i = 0; i < 10; ++i) {
+    if (!r->ok || r->p == r->end) { r->ok = 0; return 0; }
+    unsigned char b = *r->p++;
+    if (i == 9 && b > 1) { r->ok = 0; return 0; }
+    v |= (uint64_t)(b & 127) << (7 * i);
+    if (!(b & 128)) return v;
+  }
+  r->ok = 0; return 0;
+}
+static uint32_t unpack32(PackedIn *r) {
+  uint64_t v = unpack_uint(r);
+  if (v > UINT32_MAX) r->ok = 0;
+  return (uint32_t)v;
+}
+static void pack_double(PackedOut *w, double d) {
+  if (!w->ok || (size_t)(w->end - w->p) < 8) { w->ok = 0; return; }
+  pd(&w->p, d);
+}
+static double unpack_double(PackedIn *r) {
+  if (!r->ok || (size_t)(r->end - r->p) < 8) { r->ok = 0; return 0; }
+  return gd(&r->p);
+}
+#define FIELD_COUNT(f) +1
+enum { RECORD_FIELDS = 0 R64(FIELD_COUNT) R32(FIELD_COUNT),
+       RECORD_MASK_BYTES = (RECORD_FIELDS + 7) / 8 };
+#undef FIELD_COUNT
+_Static_assert(RECORD_FIELDS < 64, "record field-presence bitmap");
+static size_t packed_record(unsigned char *b, const PeakMpiObserverRecord *r, uint64_t incarnation) {
+  if (r->incarnation != incarnation) return 232;
+  PackedOut w = {b + RECORD_MASK_BYTES, b + 232, 1};
+  uint64_t mask = 0; unsigned bit = 0;
+#define E64(f) if (offsetof(PeakMpiObserverRecord, f) != offsetof(PeakMpiObserverRecord, incarnation) && r->f) { mask |= UINT64_C(1) << bit; pack_uint(&w, r->f); } ++bit;
+#define E32(f) if ((uint32_t)r->f) { uint32_t v = (uint32_t)r->f; mask |= UINT64_C(1) << bit; pack_uint(&w, (v << 1) ^ (0u - (v >> 31))); } ++bit;
+  R64(E64) R32(E32)
+#undef E64
+#undef E32
+  for (unsigned i = 0; i < RECORD_MASK_BYTES; ++i)
+    b[i] = (unsigned char)(mask >> (8*i));
+  return w.ok ? (size_t)(w.p - b) : 232;
+}
+static int unpack_record(const unsigned char *b, size_t n, uint64_t incarnation,
+                         PeakMpiObserverRecord *r) {
+  if (n < RECORD_MASK_BYTES) return 0;
+  PackedIn v = {b + RECORD_MASK_BYTES, b + n, 1};
+  uint64_t mask = 0; unsigned bit = 0;
+  for (unsigned i = 0; i < RECORD_MASK_BYTES; ++i)
+    mask |= (uint64_t)b[i] << (8*i);
+  if (mask & 1) return 0; /* Incarnation is explicit in this same frame header. */
+  memset(r, 0, sizeof *r);
+  r->incarnation = incarnation;
+#define D64(f) if (mask & (UINT64_C(1) << bit)) r->f = unpack_uint(&v); ++bit;
+#define D32(f) if (mask & (UINT64_C(1) << bit)) { uint32_t u = unpack32(&v); r->f = (u >> 1) ^ (0u - (u & 1)); } ++bit;
+  R64(D64) R32(D32)
+#undef D64
+#undef D32
+  return v.ok && v.p == v.end && !(mask >> bit);
+}
 #define REC64(X)                                                               \
   X(epoch)                                                                     \
   X(state) X(comm) X(ordinal) X(operation) X(uid_floor) X(loss) X(fault_mask)
@@ -153,6 +224,29 @@ static void recovery_decode(const unsigned char **p, PeakMpiCausalRecovery *r) {
   r->cut.P_ns = g64(p); r->cut.A_ns = g64(p); r->cut.L_ns = g64(p);
 }
 #define RECOVERY_BYTES 128u
+static void pack_recovery(PackedOut *w, const PeakMpiCausalRecovery *r) {
+  unsigned char bytes[RECOVERY_BYTES], *end = bytes;
+  recovery_encode(&end, r);
+  unsigned nonzero = 0;
+  for (size_t i = 0; i < sizeof bytes; ++i) nonzero |= bytes[i];
+  pack_uint(w, nonzero != 0);
+  if (nonzero) {
+    const unsigned char *words = bytes;
+    for (size_t i = 0; i < RECOVERY_BYTES / 8; ++i) pack_uint(w, g64(&words));
+  }
+}
+static int unpack_recovery(PackedIn *v, PeakMpiCausalRecovery *r) {
+  uint64_t present = unpack_uint(v);
+  if (!v->ok || present > 1) return 0;
+  memset(r, 0, sizeof *r);
+  if (present) {
+    unsigned char bytes[RECOVERY_BYTES], *words = bytes;
+    for (size_t i = 0; i < RECOVERY_BYTES / 8; ++i) p64(&words, unpack_uint(v));
+    if (!v->ok) return 0;
+    const unsigned char *start = bytes; recovery_decode(&start, r);
+  }
+  return v->ok;
+}
 #define F64(X)                                                                 \
   X(cohort.job_incarnation)                                                    \
   X(cohort.cohort_id)                                                          \
@@ -214,6 +308,43 @@ static void feedback_decode(const unsigned char *p, PeakMpiPolicyFeedback *r) {
 #undef D
   recovery_decode(&p, &r->recovery);
   r->approximate = (int)g32(&p);
+}
+#define FIELD_COUNT(f) +1
+enum { FEEDBACK_FIELDS = 2 F64(FIELD_COUNT) FD(FIELD_COUNT) FI(FIELD_COUNT),
+       FEEDBACK_MASK_BYTES = (FEEDBACK_FIELDS + 7) / 8 };
+#undef FIELD_COUNT
+_Static_assert(FEEDBACK_FIELDS < 64, "feedback field-presence bitmap");
+static size_t packed_feedback(unsigned char *b, const PeakMpiPolicyFeedback *r) {
+  PackedOut w = {b + FEEDBACK_MASK_BYTES, b + 300 + RECOVERY_BYTES + 4, 1};
+  uint64_t mask = 0; unsigned bit = 0;
+#define U(f) if (r->f) { mask |= UINT64_C(1) << bit; pack_uint(&w, r->f); } ++bit;
+#define I(f) if ((uint32_t)r->f) { mask |= UINT64_C(1) << bit; pack_uint(&w, (uint32_t)r->f); } ++bit;
+#define D(f) { uint64_t u; memcpy(&u, &r->f, 8); if (u) { mask |= UINT64_C(1) << bit; pack_double(&w, r->f); } ++bit; }
+  F64(U) U(member_count) FD(D) FI(I) I(approximate)
+#undef U
+#undef I
+#undef D
+  pack_recovery(&w, &r->recovery);
+  for (unsigned i = 0; i < FEEDBACK_MASK_BYTES; ++i)
+    b[i] = (unsigned char)(mask >> (8*i));
+  return w.ok ? (size_t)(w.p - b) : 300 + RECOVERY_BYTES + 4;
+}
+static int unpack_feedback(const unsigned char *b, size_t n,
+                            PeakMpiPolicyFeedback *r) {
+  if (n < FEEDBACK_MASK_BYTES) return 0;
+  PackedIn v = {b + FEEDBACK_MASK_BYTES, b + n, 1};
+  uint64_t mask = 0; unsigned bit = 0;
+  for (unsigned i = 0; i < FEEDBACK_MASK_BYTES; ++i)
+    mask |= (uint64_t)b[i] << (8*i);
+  memset(r, 0, sizeof *r);
+#define U(f) if (mask & (UINT64_C(1) << bit)) r->f = unpack_uint(&v); ++bit;
+#define I(f) if (mask & (UINT64_C(1) << bit)) r->f = unpack32(&v); ++bit;
+#define D(f) if (mask & (UINT64_C(1) << bit)) r->f = unpack_double(&v); ++bit;
+  F64(U) U(member_count) FD(D) FI(I) I(approximate)
+#undef U
+#undef I
+#undef D
+  return !(mask >> bit) && unpack_recovery(&v, &r->recovery) && v.p == v.end;
 }
 static size_t object_encode(unsigned char *b, const PeakMpiObserverObject *o) {
   unsigned char *p = b;
@@ -338,18 +469,173 @@ static int raw_decode(const unsigned char *p, size_t n, PeakMpiCausalRaw *r,
   recovery_decode(&p, &r->recovery);
   return 1;
 }
+static size_t packed_raw(unsigned char *b, const PeakMpiCausalRaw *r, uint64_t incarnation) {
+  size_t dense = 140 + RECOVERY_BYTES + r->peer_count + 8 * r->slot_count;
+  if (r->incarnation != incarnation) return dense;
+  PackedOut w = {b, b + dense, 1};
+#define U(f) pack_uint(&w, r->f)
+#define I(f) pack_uint(&w, (uint32_t)r->f)
+#define D(f) pack_double(&w, r->f)
+  U(generation); U(watermark_nonce); U(idle_group_uid); I(idle_cut);
+  U(control_generation); D(L); D(A); I(app_cost_known);
+  U(cut.P_ns); U(cut.A_ns); U(cut.L_ns); D(P); D(elapsed);
+  I(contract_profile); I(active); I(unknown_members); I(finalized);
+  I(coarse_reason); U(lost_events); U(peer_count);
+  size_t ones = 0;
+  for (size_t i = 0; i < r->peer_count; ++i) {
+    if (r->known_peers[i] > 1) return dense;
+    ones += r->known_peers[i];
+  }
+  unsigned def = ones > r->peer_count / 2;
+  size_t minority = def ? r->peer_count - ones : ones;
+  size_t sparse_bytes = 1;
+  for (size_t v = minority; v >= 128; v >>= 7) ++sparse_bytes;
+  for (size_t i = 0; i < r->peer_count; ++i)
+    if (r->known_peers[i] != def) {
+      ++sparse_bytes;
+      for (size_t v = i; v >= 128; v >>= 7) ++sparse_bytes;
+    }
+  int sparse = sparse_bytes < r->peer_count / 8 + (r->peer_count % 8 != 0);
+  pack_uint(&w, sparse ? def + 1 : 0);
+  if (sparse) {
+    pack_uint(&w, minority);
+    for (size_t i = 0; i < r->peer_count; ++i)
+      if (r->known_peers[i] != def) pack_uint(&w, i);
+  } else for (size_t i = 0; i < r->peer_count; i += 8) {
+    unsigned char bits = 0;
+    for (size_t j = 0; j < 8 && i + j < r->peer_count; ++j)
+      bits |= r->known_peers[i + j] << j;
+    if (!w.ok || w.p == w.end) return dense;
+    *w.p++ = bits;
+  }
+  U(slot_count);
+  size_t used = r->slot_count;
+  while (used && !r->slot_prefixes[used - 1]) --used;
+  pack_uint(&w, used);
+  for (size_t i = 0; i < used; ++i) pack_uint(&w, r->slot_prefixes[i]);
+  pack_recovery(&w, &r->recovery);
+#undef U
+#undef I
+#undef D
+  return w.ok ? (size_t)(w.p - b) : dense;
+}
+static int unpack_raw(const unsigned char *b, size_t n, uint64_t incarnation, PeakMpiCausalRaw *r,
+                       unsigned char *peers, unsigned world,
+                       uint64_t *prefixes, size_t slots) {
+  PackedIn v = {b, b + n, 1};
+  memset(r, 0, sizeof *r);
+  r->incarnation = incarnation;
+#define U(f) r->f = unpack_uint(&v)
+#define I(f) r->f = unpack32(&v)
+#define D(f) r->f = unpack_double(&v)
+  U(generation); U(watermark_nonce); U(idle_group_uid); I(idle_cut);
+  U(control_generation); D(L); D(A); I(app_cost_known);
+  U(cut.P_ns); U(cut.A_ns); U(cut.L_ns); D(P); D(elapsed);
+  I(contract_profile); I(active); I(unknown_members); I(finalized);
+  I(coarse_reason); U(lost_events); U(peer_count);
+  unsigned mode = unpack32(&v);
+  if (!v.ok || r->peer_count != world || mode > 2) return 0;
+  if (mode) {
+    unsigned def = mode - 1;
+    memset(peers, def, world);
+    uint64_t count = unpack_uint(&v), previous = 0;
+    if (count > world) return 0;
+    for (size_t i = 0; i < count; ++i) {
+      uint64_t index = unpack_uint(&v);
+      if (!v.ok || index >= world || (i && index <= previous)) return 0;
+      peers[index] = (unsigned char)!def; previous = index;
+    }
+  } else {
+    size_t peer_bytes = (size_t)world / 8 + (world % 8 != 0);
+    if ((size_t)(v.end-v.p) < peer_bytes) return 0;
+    for (size_t i = 0; i < world; ++i) peers[i] = (v.p[i/8] >> (i%8)) & 1;
+    if (world % 8 && (v.p[peer_bytes-1] >> (world % 8))) return 0;
+    v.p += peer_bytes;
+  }
+  r->known_peers = peers;
+  U(slot_count);
+  uint64_t used = unpack_uint(&v);
+  if (!v.ok || (r->slot_count && r->slot_count != slots) || used > r->slot_count)
+    return 0;
+  memset(prefixes, 0, slots * sizeof *prefixes);
+  for (size_t i = 0; i < used; ++i) prefixes[i] = unpack_uint(&v);
+  r->slot_prefixes = prefixes;
+  if (!unpack_recovery(&v, &r->recovery)) return 0;
+#undef U
+#undef I
+#undef D
+  return v.ok && v.p == v.end;
+}
+
+typedef struct {
+  unsigned type, rank;
+  size_t length, bytes;
+  uint64_t job, incarnation, sequence;
+} FrameHeader;
+/* 0 means a partial header; -1 means an invalid bounded integer. */
+static int header_uint(const unsigned char **p, const unsigned char *end,
+                        unsigned limit, uint64_t *value) {
+  *value = 0;
+  for (unsigned i = 0; i < limit; ++i) {
+    if (*p == end) return 0;
+    unsigned char b = *(*p)++;
+    if (i + 1 == limit && b > (limit == 5 ? 15 : 1)) return -1;
+    *value |= (uint64_t)(b & 127) << (7*i);
+    if (!(b & 128)) return 1;
+  }
+  return -1;
+}
+static int frame_header(PeakMpiCausalTransport *t, const unsigned char *b,
+                         size_t have, FrameHeader *h) {
+  const unsigned char *p = b, *end = b + have;
+  uint64_t n, rank;
+  if (have < 4) return 0;
+  uint32_t magic = g32(&p);
+  if (magic == DENSE_MAGIC) {
+    if (have < HDR) return 0;
+    h->type = g32(&p); h->length = g32(&p); h->rank = g32(&p);
+    h->job = g64(&p); h->incarnation = g64(&p); h->sequence = g64(&p);
+  } else {
+    if (magic != MAGIC) return -1;
+    if (p == end) return 0;
+    h->type = *p++;
+    int rc = header_uint(&p, end, 5, &n);
+    if (rc != 1) return rc;
+    h->length = (size_t)n;
+    rc = header_uint(&p, end, 5, &rank);
+    if (rc != 1) return rc;
+    h->rank = (unsigned)rank;
+    rc = header_uint(&p, end, 10, &h->job);
+    if (rc != 1) return rc;
+    rc = header_uint(&p, end, 10, &h->incarnation);
+    if (rc != 1) return rc;
+    rc = header_uint(&p, end, 10, &h->sequence);
+    if (rc != 1) return rc;
+    if ((size_t)(p-b) >= HDR) return -1;
+  }
+  if (h->type < HELLO || h->type > PACKED_FEEDBACK || h->length > t->cap - HDR)
+    return -1;
+  h->bytes = (size_t)(p-b);
+  return 1;
+}
 static size_t frame(PeakMpiCausalTransport *t, unsigned char *b, unsigned type,
                     size_t n, uint64_t seq) {
   unsigned char *p = b;
-  p32(&p, MAGIC);
-  p32(&p, type);
-  p32(&p, (uint32_t)n);
-  p32(&p, t->c.rank);
-  p64(&p, t->c.job_context);
-  p64(&p, t->c.incarnation);
-  p64(&p, seq);
-  return HDR + n;
+  p32(&p, MAGIC); *p++ = (unsigned char)type;
+  PackedOut w = {p, b + HDR, 1};
+  pack_uint(&w, n); pack_uint(&w, t->c.rank);
+  pack_uint(&w, t->c.job_context); pack_uint(&w, t->c.incarnation);
+  pack_uint(&w, seq);
+  size_t header = (size_t)(w.p-b);
+  if (!w.ok || header >= HDR) {
+    p = b; p32(&p, DENSE_MAGIC); p32(&p, type); p32(&p, (uint32_t)n);
+    p32(&p, t->c.rank); p64(&p, t->c.job_context);
+    p64(&p, t->c.incarnation); p64(&p, seq); header = HDR;
+  }
+  memmove(b + header, b + HDR, n);
+  return header + n;
 }
+
 static void fault(PeakMpiCausalTransport *t, unsigned rank,
                   PeakMpiPolicyReason why) {
   t->stats.unavailable = 1;
@@ -446,42 +732,21 @@ static int write_queued(PeakMpiCausalTransport *t, int fd, size_t *budget) {
   return -1;
 }
 static int read_frame(PeakMpiCausalTransport *t, Peer *p, size_t *budget) {
-  ssize_t z;
-  size_t k;
-  const unsigned char *q;
-  if (p->have >= HDR && p->need == HDR) {
-    q = p->in;
-    if (g32(&q) != MAGIC)
-      return -1;
-    (void)g32(&q);
-    k = g32(&q);
-    if (k > t->cap - HDR)
-      return -1;
-    p->need = HDR + k;
-  }
-  if (p->have >= p->need)
-    return 1;
-  if (!*budget)
-    return 0;
-  k = t->cap - p->have;
-  if (k > *budget)
-    k = *budget;
-  z = recv(p->fd, p->in + p->have, k, 0);
+  FrameHeader h;
+  int rc = frame_header(t, p->in, p->have, &h);
+  if (rc < 0) return -1;
+  if (rc) { p->need = h.bytes + h.length; if (p->have >= p->need) return 1; }
+  if (!*budget) return 0;
+  size_t k = t->cap - p->have;
+  if (k > *budget) k = *budget;
+  ssize_t z = recv(p->fd, p->in + p->have, k, 0);
   if (z > 0) {
-    p->have += (size_t)z;
-    *budget -= (size_t)z;
+    p->have += (size_t)z; *budget -= (size_t)z;
     t->stats.received_bytes += (uint64_t)z;
-    if (p->have >= HDR && p->need == HDR) {
-      q = p->in;
-      if (g32(&q) != MAGIC)
-        return -1;
-      (void)g32(&q);
-      k = g32(&q);
-      if (k > t->cap - HDR)
-        return -1;
-      p->need = HDR + k;
-    }
-    return p->have >= p->need;
+    rc = frame_header(t, p->in, p->have, &h);
+    if (rc < 0) return -1;
+    if (rc) { p->need = h.bytes + h.length; return p->have >= p->need; }
+    return 0;
   }
   if (z < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
     return 0;
@@ -498,8 +763,11 @@ static int enqueue(PeakMpiCausalTransport *t, unsigned type, const void *v) {
   unsigned char *b = t->queue + i * t->cap;
   if (t->count == t->c.queue_frames)
     return 0;
-  if (type == RECORD)
-    n = record_encode(b + HDR, v);
+  if (type == RECORD) {
+    n = packed_record(b + HDR, v, t->c.incarnation);
+    if (n < 232) type = PACKED_RECORD;
+    else n = record_encode(b + HDR, v);
+  }
   else if (type == OBJECT)
     n = object_encode(b + HDR, v);
   else
@@ -513,9 +781,13 @@ static int enqueue(PeakMpiCausalTransport *t, unsigned type, const void *v) {
 static int deliver(PeakMpiCausalTransport *t, unsigned rank, uint64_t inc,
                    unsigned type, const unsigned char *b, size_t n,
                    double now) {
-  if (type == RECORD && n == 232) {
+  if ((type == RECORD && n == 232) || type == PACKED_RECORD) {
     PeakMpiObserverRecord r;
-    record_decode(b, &r);
+    if (type == PACKED_RECORD) {
+      if (!unpack_record(b, n, inc, &r)) {
+        fault(t, rank, PEAK_MPI_POLICY_BAD_IDENTITY); return -1;
+      }
+    } else record_decode(b, &r);
     if (r.incarnation != inc) {
       fault(t, rank, PEAK_MPI_POLICY_BAD_IDENTITY);
       return -1;
@@ -527,10 +799,11 @@ static int deliver(PeakMpiCausalTransport *t, unsigned rank, uint64_t inc,
     object_decode(b, &o);
     return !t->sink.object || t->sink.object(t->sink.context, rank, inc, &o);
   }
-  if (type == RAW) {
+  if (type == RAW || type == PACKED_RAW) {
     PeakMpiCausalRaw r;
-    if (raw_decode(b, n, &r, t->decode_peers, t->c.world_size,
-                   t->decode_prefixes, t->c.slots) &&
+    if ((type == PACKED_RAW ?
+         unpack_raw(b, n, inc, &r, t->decode_peers, t->c.world_size, t->decode_prefixes, t->c.slots) :
+         raw_decode(b, n, &r, t->decode_peers, t->c.world_size, t->decode_prefixes, t->c.slots)) &&
         r.incarnation == inc)
       return !t->sink.raw || t->sink.raw(t->sink.context, rank, &r, now);
   }
@@ -728,8 +1001,12 @@ static void prepare_control(PeakMpiCausalTransport *t, Peer *p, double now) {
         (!p->feedback_sent || p->feedback_generation != f.generation)) {
       p->feedback_sent = 1;
       p->feedback_generation = f.generation;
-      n = feedback_encode(p->out + HDR, &f);
-      p->out_n = frame(t, p->out, FEEDBACK, n, 0);
+      n = packed_feedback(p->out + HDR, &f);
+      unsigned type = PACKED_FEEDBACK;
+      if (n >= 300 + RECOVERY_BYTES + 4) {
+        n = feedback_encode(p->out + HDR, &f); type = FEEDBACK;
+      }
+      p->out_n = frame(t, p->out, type, n, 0);
       p->out_at = 0;
     }
   }
@@ -828,14 +1105,10 @@ static void owner_tick(PeakMpiCausalTransport *t, double now, size_t *budget) {
       continue;
     }
     if (rc) {
-      q = p->in;
-      (void)g32(&q);
-      type = g32(&q);
-      n = g32(&q);
-      rank = g32(&q);
-      job = g64(&q);
-      inc = g64(&q);
-      seq = g64(&q);
+      FrameHeader h;
+      if (frame_header(t, p->in, p->have, &h) != 1) { close_peer(p); continue; }
+      type = h.type; n = h.length; rank = h.rank; job = h.job;
+      inc = h.incarnation; seq = h.sequence; q = p->in + h.bytes;
       if (rank >= t->c.world_size || rank == t->c.owner_rank ||
           job != t->c.job_context || !inc || (p->ready && p->rank != rank)) {
         fault(t, rank, PEAK_MPI_POLICY_BAD_IDENTITY);
@@ -853,7 +1126,7 @@ static void owner_tick(PeakMpiCausalTransport *t, double now, size_t *budget) {
         p->ready = 1;
         reset_input(p);
         t->receive_progress = 1;
-      } else if (p->ready && t->incarnations[rank] == inc && type == RAW &&
+      } else if (p->ready && t->incarnations[rank] == inc && (type == RAW || type == PACKED_RAW) &&
                  !seq) {
         rc = deliver(t, rank, inc, type, q, n, now);
         if (rc < 0) {
@@ -915,7 +1188,7 @@ static void client_tick(PeakMpiCausalTransport *t, double now, size_t *budget) {
   int rc;
   const unsigned char *q;
   unsigned type, rank;
-  uint64_t job, inc, seq;
+  uint64_t inc, seq;
   size_t n;
   if (p->fd < 0 && now >= t->retry_at) {
     int fd = socket(t->addr.ss_family, SOCK_STREAM, 0);
@@ -954,8 +1227,11 @@ static void client_tick(PeakMpiCausalTransport *t, double now, size_t *budget) {
   /* RAW is cumulative control, independent of the fine replay/ACK lane.
    * Do not interleave its bytes into a partially written event frame. */
   if (t->raw_pending && !t->send_at && p->ready) {
-    n = raw_encode(p->out + HDR, &t->raw);
-    p->out_n = frame(t, p->out, RAW, n, 0);
+    n = packed_raw(p->out + HDR, &t->raw, t->c.incarnation);
+    unsigned raw_type = PACKED_RAW;
+    size_t dense = 140 + RECOVERY_BYTES + t->raw.peer_count + 8 * t->raw.slot_count;
+    if (n >= dense) { n = raw_encode(p->out + HDR, &t->raw); raw_type = RAW; }
+    p->out_n = frame(t, p->out, raw_type, n, 0);
     p->out_at = 0;
     t->raw_pending = 0;
     rc = write_buf(t, p->fd, p->out, p->out_n, &p->out_at, budget);
@@ -983,15 +1259,13 @@ static void client_tick(PeakMpiCausalTransport *t, double now, size_t *budget) {
         break;
       continue;
     }
-    q = p->in;
-    (void)g32(&q);
-    type = g32(&q);
-    n = g32(&q);
-    rank = g32(&q);
-    job = g64(&q);
-    inc = g64(&q);
-    seq = g64(&q);
-    if (rank != t->c.owner_rank || job != t->c.job_context ||
+    FrameHeader h;
+    if (frame_header(t, p->in, p->have, &h) != 1) { close_peer(p); return; }
+    q = p->in + h.bytes;
+    type = h.type; n = h.length; inc = h.incarnation; seq = h.sequence;
+    rank = h.rank;
+    if (!p->ready || type == HELLO || rank != t->c.owner_rank ||
+        h.job != t->c.job_context || !inc ||
         (t->incarnations[rank] && t->incarnations[rank] != inc)) {
       fault(t, t->c.rank, PEAK_MPI_POLICY_BAD_IDENTITY);
       close_peer(p);
@@ -1005,8 +1279,12 @@ static void client_tick(PeakMpiCausalTransport *t, double now, size_t *budget) {
         return;
       }
       while (t->count) {
-        const unsigned char *h = t->queue + t->head * t->cap + 32;
-        uint64_t s = g64(&h);
+        FrameHeader queued;
+        if (frame_header(t, t->queue + t->head * t->cap,
+                         t->lengths[t->head], &queued) != 1) {
+          fault(t, t->c.rank, PEAK_MPI_POLICY_BAD_IDENTITY); close_peer(p); return;
+        }
+        uint64_t s = queued.sequence;
         if (s > seq)
           break;
         t->head = (t->head + 1) % t->c.queue_frames;
@@ -1020,8 +1298,16 @@ static void client_tick(PeakMpiCausalTransport *t, double now, size_t *budget) {
       uint64_t nonce = g64(&q);
       if (nonce > t->requested_nonce)
         t->requested_nonce = nonce;
-    } else if (type == FEEDBACK && n == 300 + RECOVERY_BYTES + 4) {
-      feedback_decode(q, &t->feedback);
+    } else if ((type == FEEDBACK && n == 300 + RECOVERY_BYTES + 4) ||
+               type == PACKED_FEEDBACK) {
+      PeakMpiPolicyFeedback next;
+      if (type == PACKED_FEEDBACK) {
+        if (!unpack_feedback(q, n, &next)) {
+          fault(t, t->c.rank, PEAK_MPI_POLICY_BAD_IDENTITY);
+          close_peer(p); return;
+        }
+      } else feedback_decode(q, &next);
+      t->feedback = next;
       t->have_feedback = 1;
       t->stats.feedbacks++;
     } else {
