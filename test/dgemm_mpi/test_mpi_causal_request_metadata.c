@@ -18,6 +18,9 @@ static int concurrent_test, concurrent_free_test, require_buffer_activation;
 static uint64_t snapshot_ids[2][2];
 static unsigned remote_active, failures, completed;
 static uint64_t completed_uid[8], completed_start[8];
+static unsigned native_buffer_results;
+static uint64_t native_buffer_ids[16];
+static int check_native_buffer;
 int peak_mpi_causal_runtime_enabled(void) { return 1; }
 int peak_mpi_causal_runtime_capture_enabled(void) {
   return peak_mpi_observer_coarse_reason(observer) ==
@@ -44,6 +47,18 @@ void peak_mpi_causal_runtime_submit(PeakMpiObserverRecord *r, int actual) {
       r->operation == PEAK_MPI_CAUSAL_BSEND) {
     assert((r->flags & PEAK_MPI_OBSERVER_PROGRESS_ESTIMATED) &&
            !(r->flags & PEAK_MPI_OBSERVER_PROGRESS_SEALED));
+  }
+  if (check_native_buffer && r->operation == PEAK_MPI_CAUSAL_BSEND &&
+      (r->phase == PEAK_MPI_CAUSAL_CALL_BEGIN ||
+       r->phase == PEAK_MPI_CAUSAL_CALL_END)) {
+    assert((r->flags & PEAK_MPI_OBSERVER_PROGRESS_ESTIMATED) &&
+           !(r->flags & PEAK_MPI_OBSERVER_PROGRESS_SEALED));
+    if (r->phase == PEAK_MPI_CAUSAL_CALL_END) {
+      assert(native_buffer_results < 16 && observed_open_buffered);
+      for (unsigned i = 0; i < native_buffer_results; ++i)
+        assert(native_buffer_ids[i] != r->op_uid);
+      native_buffer_ids[native_buffer_results++] = r->op_uid;
+    }
   }
   if (actual)
     remote_active = 1;
@@ -316,6 +331,71 @@ int main(int argc, char **argv) {
     printf("native wrapper metadata rank=%d shared_handles=%u "
            "unique_completions=%u registry_empty=1 lost=0\n",
            world_rank, aliases, completed);
+  } else if (!strcmp(argv[1], "native-buffer")) {
+    contract = (PeakMpiProgressContract){
+        .profile = PEAK_MPI_PROGRESS_OMPI_5_0_5_UCX_1_17_RC_PROTO2_HOST_OBSERVED,
+        .observed_p2p_completion = 1, .observed_buffer_detach = 1,
+        .name = "unit", .reason = "unit"};
+    int packed;
+    assert(PMPI_Pack_size(1, MPI_INT, MPI_COMM_WORLD, &packed) == MPI_SUCCESS);
+    int capacity = 16 * (packed + MPI_BSEND_OVERHEAD);
+    void *buffer = malloc((size_t)capacity);
+    assert(buffer && MPI_Buffer_attach(buffer, capacity) == MPI_SUCCESS);
+    check_native_buffer = 1;
+    for (int i = 0; i < 16; ++i) {
+      int sent = world_rank * 100 + i, received = -1;
+      MPI_Status st;
+      assert(MPI_Bsend(&sent, 1, MPI_INT, 1 - world_rank, 73,
+                       MPI_COMM_WORLD) == MPI_SUCCESS);
+      assert(MPI_Recv(&received, 1, MPI_INT, 1 - world_rank, 73,
+                      MPI_COMM_WORLD, &st) == MPI_SUCCESS);
+      assert(received == (1 - world_rank) * 100 + i &&
+             st.MPI_SOURCE == 1 - world_rank && st.MPI_TAG == 73 &&
+             native_buffer_results == (unsigned)i + 1 &&
+             observed_open_buffered == (uint64_t)i + 1);
+    }
+    /* The observed delivery cuts precede the only terminal resource cleanup. */
+    assert(native_buffer_results == 16 && !failures && !completed);
+    void *detached = NULL;
+    int detached_size = 0;
+    assert(MPI_Buffer_detach(&detached, &detached_size) == MPI_SUCCESS &&
+           detached == buffer && detached_size == capacity &&
+           !observed_open_buffered);
+    free(buffer);
+    no_live_requests();
+    printf("native buffered rank=%d estimated_results=16 unique=16 before_detach=1\n",
+           world_rank);
+  } else if (!strcmp(argv[1], "native-latewait")) {
+    for (unsigned i = 0; i < 8; ++i) {
+      int value = (int)i + 100, ack = -1;
+      MPI_Status st;
+      if (world_rank == 0) {
+        MPI_Request r;
+        assert(MPI_Isend(&value, 1, MPI_INT, 1, 74, MPI_COMM_WORLD, &r) ==
+               MPI_SUCCESS);
+        Request start;
+        assert(snapshot_request_at(r, &r, &start));
+        assert(MPI_Recv(&ack, 1, MPI_INT, 1, 75, MPI_COMM_WORLD, &st) ==
+               MPI_SUCCESS && ack == value && st.MPI_SOURCE == 1 &&
+               st.MPI_TAG == 75);
+        Request before_wait;
+        assert(completed == i && observed_open_requests == 1 &&
+               snapshot_request_at(r, &r, &before_wait) &&
+               before_wait.uid == start.uid && before_wait.start_uid == start.start_uid);
+        assert(MPI_Wait(&r, &st) == MPI_SUCCESS && completed == i + 1 &&
+               completed_uid[i] == start.uid && completed_start[i] == start.start_uid);
+        for (unsigned j = 0; j < i; ++j)
+          assert(completed_uid[i] != completed_uid[j]);
+        no_live_requests();
+      } else {
+        assert(MPI_Recv(&ack, 1, MPI_INT, 0, 74, MPI_COMM_WORLD, &st) ==
+               MPI_SUCCESS && ack == value && st.MPI_SOURCE == 0 &&
+               st.MPI_TAG == 74);
+        assert(MPI_Send(&ack, 1, MPI_INT, 0, 75, MPI_COMM_WORLD) == MPI_SUCCESS);
+      }
+    }
+    printf("native latewait rank=%d completions=%u request_retained=1\n",
+           world_rank, completed);
   } else if (!strcmp(argv[1], "concurrent")) {
     MPI_Request r[4];
     for (unsigned i = 0; i < 4; i++)
@@ -593,6 +673,12 @@ int main(int argc, char **argv) {
       }
     }
     assert(found && remote_active);
+  }
+  if (!strcmp(argv[1], "native-buffer") || !strcmp(argv[1], "native-latewait")) {
+    PeakMpiObserverSlotState state;
+    assert(!failures && peak_mpi_observer_slot_state(observer, 0, &state) &&
+           !state.lost && peak_mpi_observer_coarse_reason(observer) ==
+                              PEAK_MPI_OBSERVER_REASON_NONE);
   }
   no_reservations();
   assert(PMPI_Finalize() == MPI_SUCCESS);

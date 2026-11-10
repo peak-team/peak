@@ -175,7 +175,8 @@ if(BUILD_TESTING)
 
             foreach(_peak_request_case alias copy overwrite any some reuse
                     persistent null self singleton concurrent false status partial
-                    free-wait batch128 batch256 native reserved-lookup persistent-buffer)
+                    free-wait batch128 batch256 native reserved-lookup persistent-buffer
+                    native-buffer native-latewait)
                 add_test(NAME test_mpi_request_metadata_${_peak_request_case}
                     COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2
                         ${MPIEXEC_PREFLAGS}
