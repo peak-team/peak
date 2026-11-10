@@ -51,6 +51,7 @@ int main(void) {
   assert(status == 0 && !peak_mpi_cost_model_delay(m, ns[255], &d) && d == 256);
   fprintf(stderr, "chain work=%zu finalDFS=%u D=%.0f\n", work, dfs, d);
   assert(!dfs);
+  assert(work < 5897);
   peak_mpi_cost_model_destroy(m);
   m = model(8);
   PeakMpiCostRef x = node(m, 2, 0), y = node(m, 3, 0);

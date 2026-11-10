@@ -603,7 +603,8 @@ static void topology_step(PeakMpiCostModel *m)
             double upper = a->value + e->wait;
             if (upper < b->min_wait) b->min_wait = upper;
         }
-        if (--b->indegree == 0) m->queue[m->queue_tail++] = m->nodes[e->target].component;
+        if (--b->indegree == 0 && !m->final_dag)
+            m->queue[m->queue_tail++] = m->nodes[e->target].component;
     } else {
         m->topology_current = NONE;
     }
@@ -890,7 +891,21 @@ static void run_step(PeakMpiCostModel *m)
             if (n->active && !n->settled && n->defined && n->sealed &&
                 n->spec.kind == PEAK_MPI_COST_COLLECTIVE && n->input_count != n->spec.participants)
                 fail(m, PEAK_MPI_COST_CONFLICTING_DEFINITION);
-        } else { m->phase = QUEUE_COMPONENTS; m->cursor = 0; m->queue_head = m->queue_tail = 0; }
+        } else {
+            m->cursor = 0;
+            m->queue_head = 0;
+            if (m->final_dag) {
+                /* The preserved guaranteed Kahn queue is nondecreasing in G
+                 * depth; every retained final edge increases that depth. */
+                m->queue_tail = m->component_count;
+                m->phase = TOPOLOGY;
+                m->topology_current = NONE;
+                m->topology_done = 0;
+            } else {
+                m->phase = QUEUE_COMPONENTS;
+                m->queue_tail = 0;
+            }
+        }
         break;
     case QUEUE_COMPONENTS:
         if (m->cursor < m->component_count) {
