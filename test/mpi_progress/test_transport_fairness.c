@@ -2,6 +2,86 @@
 #include "../../src/mpi_causal_transport.c"
 #include <assert.h>
 #include <stdio.h>
+static unsigned many_order[1024], many_count;
+static int many_record(void *v, unsigned rank, const PeakMpiObserverRecord *r) {
+  (void)v;
+  (void)r;
+  assert(many_count < sizeof many_order / sizeof many_order[0]);
+  many_order[many_count++] = rank;
+  return 1;
+}
+static void test_many_peer_fairness(void) {
+  PeakMpiCausalServiceConfig c = {0};
+  c.world_size = 8;
+  c.owner_rank = 0;
+  c.job_context = 113305103;
+  c.address = "127.0.0.1";
+  c.port = 23575;
+  c.queue_frames = 32;
+  c.slots = 288;
+  PeakMpiCausalTransportSink sink = {.record = many_record};
+  PeakMpiCausalTransport *t[8];
+  for (unsigned r = 0; r < 8; r++) {
+    c.rank = r;
+    c.incarnation = UINT64_C(0x0012c93b14158000) + r;
+    t[r] = peak_mpi_causal_transport_create(&c, &sink);
+    assert(t[r]);
+  }
+  unsigned char peers[8] = {1, 1, 1, 1, 1, 1, 1, 1};
+  PeakMpiCausalRaw raw = {0}, dormant = {0};
+  raw.active = 1;
+  raw.generation = 1;
+  raw.peer_count = 8;
+  raw.known_peers = peers;
+  for (unsigned k = 0; k < 32; k++) {
+    peak_mpi_causal_transport_tick(t[0], NULL, &dormant, 1, 65536);
+    for (unsigned r = 1; r < 8; r++) {
+      raw.incarnation = t[r]->c.incarnation;
+      peak_mpi_causal_transport_tick(t[r], NULL, &raw, 1, 65536);
+    }
+  }
+  for (unsigned r = 1; r < 8; r++) {
+    assert(t[r]->peers[0].ready);
+    for (unsigned j = 0; j < 20; j++) {
+      PeakMpiObserverRecord e = {0};
+      e.incarnation = t[r]->c.incarnation;
+      e.thread_uid = e.thread_generation = 1;
+      e.sequence = j + 1;
+      e.op_uid = e.batch_uid = 100 + j;
+      e.L_cut = e.A_cut = e.P_cut = 1000000000;
+      e.kind = PEAK_MPI_OBSERVER_EVENT_START;
+      e.operation = PEAK_MPI_CAUSAL_ALLREDUCE;
+      e.phase = PEAK_MPI_CAUSAL_CALL_BEGIN;
+      e.flags = PEAK_MPI_CAUSAL_APP_COST_KNOWN | PEAK_MPI_CAUSAL_COLLECTIVE |
+                PEAK_MPI_CAUSAL_ORDERED_CALLER;
+      e.peer = e.root = e.tag = -1;
+      assert(enqueue(t[r], RECORD, &e));
+    }
+    raw.incarnation = t[r]->c.incarnation;
+    peak_mpi_causal_transport_tick(t[r], NULL, &raw, 1, 65536);
+    assert(t[r]->send_index == t[r]->count);
+  }
+  peak_mpi_causal_transport_tick(t[0], NULL, &dormant, 2, 4096);
+  unsigned unvisited = 0;
+  for (unsigned i = 0; i < 8; i++) {
+    Peer *p = &t[0]->peers[i];
+    if (p->ready && !p->have && !t[0]->accepted[p->rank]) {
+      unvisited = p->rank;
+      break;
+    }
+  }
+  assert(unvisited);
+  unsigned before = many_count;
+  peak_mpi_causal_transport_tick(t[0], NULL, &dormant, 3, 4096);
+  fprintf(stderr, "firstunvisited=%u nextdelivered=%u firstturnrecords=%u\n",
+          unvisited, many_order[before], before);
+  assert(many_count > before && many_order[before] == unvisited);
+  for (unsigned r = 0; r < 8; r++)
+    peak_mpi_causal_transport_destroy(t[r]);
+  puts("bounded remote peer roundrobin progress PASS");
+  return;
+}
+
 static unsigned local_records, remote_records, faults;
 static int replenish, control;
 static PeakMpiObserver *local_capture;
@@ -156,4 +236,5 @@ int main(int argc, char **argv) {
   peak_mpi_causal_transport_destroy(t);
   peak_mpi_causal_transport_destroy(o);
   peak_mpi_observer_destroy(local_capture);
+  test_many_peer_fairness();
 }

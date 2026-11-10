@@ -1023,7 +1023,6 @@ static void prepare_ack(PeakMpiCausalTransport *t, Peer *p, int force) {
 }
 static void owner_tick(PeakMpiCausalTransport *t, double now, size_t *budget) {
   size_t i, start = t->peer_cursor;
-  t->peer_cursor = (t->peer_cursor + 1) % t->peer_n;
   int fd, on = 1;
   if (t->listener < 0 && now >= t->retry_at) {
     fd = socket(t->addr.ss_family, SOCK_STREAM, 0);
@@ -1053,7 +1052,10 @@ static void owner_tick(PeakMpiCausalTransport *t, double now, size_t *budget) {
       }
   }
   for (i = 0; i < t->peer_n && *budget; i++) {
-    Peer *p = &t->peers[(start + i) % t->peer_n];
+    size_t at = (start + i) % t->peer_n;
+    Peer *p = &t->peers[at];
+    /* Resume after the last attempted peer when the shared allowance ends. */
+    t->peer_cursor = (at + 1) % t->peer_n;
     const unsigned char *q;
     unsigned type, rank;
     uint64_t job, inc, seq;
