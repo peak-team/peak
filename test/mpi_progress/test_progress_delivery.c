@@ -1181,7 +1181,8 @@ static uint64_t recovery_group(RecoveryGroups *c, unsigned rank,
     if (i == 2)
       r.flags |= PEAK_MPI_OBSERVER_PROGRESS_SEALED;
     if (i == 0 || i == 3)
-      r.progress_end = UINT64_C(2000000000) + ordinal * UINT64_C(1000000);
+      r.progress_end = (uint64_t)(fmax(2 + (double)ordinal / 1000,
+          c->raw[rank].elapsed + .001) * 1e9);
     if (i == 3)
       r.completion_count = 1;
     if (deferred)
@@ -1196,7 +1197,8 @@ static uint64_t recovery_group(RecoveryGroups *c, unsigned rank,
 static void recovery_drain(RecoveryGroups *c, unsigned turns, int fresh,
                             size_t budget) {
   for (unsigned turn = 0; turn < turns; ++turn) {
-    double now = 10 + (double)c->raw[0].generation / 1000;
+    double now = fmax(10 + (double)c->raw[0].generation / 1000,
+        fmax(c->service->now, fmax(c->raw[0].elapsed, c->raw[1].elapsed))) + .001;
     if (fresh)
       for (unsigned rank = 0; rank < 2; ++rank)
         recovery_raw(c, rank, now);
@@ -1260,6 +1262,8 @@ static void test_recovery_collective_boundary(void) {
   recovery_drain(&c, 32, 1, 100000);
   o = find_op(c.service, 0, first);
   assert(o && !o->legacy_resolved && !o->collective_built &&
+         !c.service->contexts[o->context - 1].built_collective_ordinal &&
+         c.service->contexts[context_for(c.service, 0, 2) - 1].built_collective_ordinal == 3 &&
          !c.service->hard_fault);
   peak_mpi_causal_service_destroy(c.service);
   for (unsigned excluded = 0; excluded < 3; ++excluded) {
@@ -1449,7 +1453,125 @@ static void test_recovered_prefix_reply(void) {
        "old epochs/echoes and open requests cannot complete them PASS");
 }
 
+static void recovery_groups_again(RecoveryGroups *c, uint64_t ordinal) {
+  double now = fmax(c->service->now,
+      fmax(c->raw[0].elapsed, c->raw[1].elapsed)) + .001;
+  c->raw[0].lost_events++;
+  c->raw[0].coarse_reason = PEAK_MPI_OBSERVER_REASON_RING_OVERFLOW;
+  c->raw[0].recovery.fault_mask =
+      UINT64_C(1) << PEAK_MPI_OBSERVER_REASON_RING_OVERFLOW;
+  for (unsigned rank = 0; rank < 2; ++rank) {
+    PeakMpiCausalRecovery *r = &c->raw[rank].recovery;
+    r->state = PEAK_MPI_RECOVERY_NONE;
+    r->comm = 1;
+    r->ordinal = ordinal;
+    r->operation = PEAK_MPI_CAUSAL_BARRIER;
+    r->loss = c->raw[rank].lost_events;
+    recovery_raw(c, rank, now);
+  }
+  peak_mpi_causal_service_tick(c->service, NULL, NULL, now, 65536, 100000);
+  assert(c->service->recovery.state == PEAK_MPI_RECOVERY_QUERY);
+  for (unsigned rank = 0; rank < 2; ++rank) {
+    PeakMpiCausalRecovery *r = &c->raw[rank].recovery;
+    r->state = PEAK_MPI_RECOVERY_READY;
+    r->epoch = c->service->recovery.epoch;
+    r->uid_floor = c->next_uid;
+    r->L = (double)c->A[rank] / 1e9;
+    r->P = .02;
+    r->elapsed = now + .001;
+    recovery_raw(c, rank, now + .001);
+  }
+  for (unsigned turn = 0; turn < 100 &&
+      c->service->recovery.state != PEAK_MPI_RECOVERY_ACK; ++turn)
+    peak_mpi_causal_service_tick(c->service, NULL, NULL,
+        now + .002 + turn * .001, 65536, 100000);
+  assert(c->service->recovery.state == PEAK_MPI_RECOVERY_ACK &&
+         !c->service->hard_fault);
+  for (unsigned rank = 0; rank < 2; ++rank) {
+    c->raw[rank].recovery.state = PEAK_MPI_RECOVERY_ACK;
+    c->raw[rank].recovery.fault_mask = 0;
+    c->raw[rank].coarse_reason = 0;
+  }
+  /* The frontend resets only capture-group/call anchors, not MPI ordinals. */
+  memset(c->previous_group, 0, sizeof c->previous_group);
+  memset(c->previous_call, 0, sizeof c->previous_call);
+}
+static void test_collective_proof_reuse(void) {
+  RecoveryGroups c;
+  recovery_groups_init(&c);
+  for (unsigned k = 0; k < 8; ++k)
+    recovery_group(&c, 0, 0, k + 2, 1, 0, NULL);
+  for (unsigned k = 0; k < 40; ++k) {
+    PeakMpiObserverRecord records[4];
+    recovery_group(&c, 0, 0, k + 10, 1, 0, records);
+    for (unsigned i = 0; i < 4; ++i) {
+      if (i == 1 || i == 2) {
+        records[i].flags &= ~PEAK_MPI_CAUSAL_COLLECTIVE;
+        records[i].operation = PEAK_MPI_CAUSAL_SEND;
+        records[i].peer = 1;
+        records[i].tag = k;
+        records[i].collective_ordinal = 0;
+      }
+      assert(peak_mpi_causal_service_ingest_record(c.service, 0, &records[i]));
+    }
+    recovery_drain(&c, 4, 1, 100000);
+  }
+  recovery_drain(&c, 32, 1, 100000);
+  assert(!c.service->contexts[0].built_collective_ordinal &&
+         c.service->ranks[0].covered_index == 0 && !c.service->hard_fault);
+  size_t legacy = 0;
+  for (size_t i = 0; i < c.service->operation_count; ++i)
+    legacy += c.service->operations[c.service->active[i]].legacy_resolved != 0;
+  assert(legacy); /* Ordinary approximate paid anchors are not group proofs. */
+  recovery_drain(&c, 20, 1, 100000);
+  assert(!c.service->contexts[0].built_collective_ordinal &&
+         c.service->ranks[0].covered_index == 0 && !c.service->hard_fault);
+  recovery_group(&c, 0, 1, 10, 1, 0, NULL);
+  recovery_group(&c, 1, 1, 10, 1, 0, NULL);
+  recovery_drain(&c, 64, 1, 100000);
+  assert(c.service->contexts[0].built_collective_ordinal == 10 &&
+         c.service->operation_count <= 3 && !c.service->hard_fault);
+  double D;
+  assert(peak_mpi_cost_model_delay(c.service->model,
+      c.service->ranks[0].covered_ref, &D) == PEAK_MPI_COST_OK &&
+      fabs(D - .2) < 1e-12 && c.service->ranks[0].A == .1 &&
+      c.service->ranks[0].P == .02);
+  peak_mpi_causal_service_destroy(c.service);
+  recovery_groups_init(&c);
+  uint64_t old = recovery_group(&c, 0, 0, 2, 1, 0, NULL);
+  recovery_group(&c, 1, 0, 2, 1, 0, NULL);
+  recovery_drain(&c, 32, 1, 100000);
+  assert(c.service->contexts[0].built_collective_ordinal == 2);
+  recovery_group(&c, 0, 0, 3, 1, 0, NULL);
+  recovery_group(&c, 1, 0, 3, 1, 0, NULL);
+  recovery_drain(&c, 32, 1, 100000);
+  assert(!find_op(c.service, 0, old) &&
+         c.service->contexts[0].built_collective_ordinal == 3);
+  recovery_groups_again(&c, 4);
+  assert(c.service->contexts[0].built_collective_ordinal == 3);
+  uint64_t gap = recovery_group(&c, 0, 0, 5, 1, 0, NULL);
+  recovery_drain(&c, 32, 1, 100000);
+  Operation *o = find_op(c.service, 0, gap);
+  assert(o && !o->legacy_resolved &&
+         c.service->contexts[0].built_collective_ordinal == 3);
+  uint64_t nbc = recovery_group(&c, 0, 1, 6, 1,
+      PEAK_MPI_CAUSAL_NONBLOCKING, NULL);
+  recovery_group(&c, 1, 1, 6, 1, PEAK_MPI_CAUSAL_NONBLOCKING, NULL);
+  recovery_drain(&c, 64, 1, 100000);
+  o = find_op(c.service, 0, gap);
+  Operation *witness = find_op(c.service, 0, nbc);
+  assert(o && o->legacy_resolved && !o->collective_built && witness &&
+         witness->collective_built && !witness->completed &&
+         !witness->result_defined &&
+         c.service->contexts[0].built_collective_ordinal == 6 &&
+         !c.service->hard_fault);
+  peak_mpi_causal_service_destroy(c.service);
+  puts("collective group proofs reused across unrelated sends, operation GC "
+       "and recovery; old/legacy proofs cannot close newer gaps PASS");
+}
+
 int main(void) {
+  test_collective_proof_reuse();
   test_recovered_prefix_reply();
   test_recovery_collective_boundary();
   test_recovery_reset_runnable();

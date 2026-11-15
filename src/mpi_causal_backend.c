@@ -27,6 +27,7 @@ typedef struct {
   uint64_t ordinal;
   int color, size;
   unsigned self;
+  uint64_t built_collective_ordinal;
 } Context;
 typedef struct {
   unsigned rank;
@@ -528,7 +529,7 @@ static unsigned canonical(PeakMpiCausalService *s, unsigned rank, Comm *c) {
   if (s->context_count >= s->config.max_context_parts)
     return 0;
   Context *x = &s->contexts[s->context_count++];
-  *x = (Context){parent, c->kind, c->ordinal, c->color, c->size, self};
+  *x = (Context){parent, c->kind, c->ordinal, c->color, c->size, self, 0};
   return (unsigned)s->context_count;
 }
 /* Membership and local receipt state are separate from communication context.
@@ -1652,7 +1653,6 @@ enum {
   TASK_CLOSE_SENDS,
   TASK_CLOSE_COMMIT,
   TASK_COLLECTIVE_SCAN,
-  TASK_COLLECTIVE_BOUNDARY,
   TASK_COLLECTIVE_PAID_BOUND,
   TASK_COLLECTIVE_INPUT,
   TASK_COLLECTIVE_OUTPUT
@@ -2135,10 +2135,18 @@ static void matcher_work(PeakMpiCausalService *s, size_t budget) {
               s->task_count < (unsigned)s->contexts[o->context - 1].size &&
               o->completed && !o->matched && !o->sealed && !(o->begin.flags &
                   (PEAK_MPI_CAUSAL_NONBLOCKING | PEAK_MPI_CAUSAL_INTERCOMM))) {
-            s->task_cursor = 0;
-            s->task_stage = TASK_COLLECTIVE_BOUNDARY;
-          } else
-            s->task_stage = 0;
+            /* A genuinely built higher group proves all members' ordered
+             * inputs passed this gap. Preserve that proof after its nodes GC. */
+            if (s->contexts[o->context - 1].built_collective_ordinal >
+                o->begin.collective_ordinal) {
+              s->task_paid_bound = 0;
+              s->task_cursor = 0;
+              s->task_stage = TASK_COLLECTIVE_PAID_BOUND;
+              continue;
+            }
+            o->analysis_waiting = 1;
+          }
+          s->task_stage = 0;
           continue;
         }
         PeakMpiCostNodeSpec spec = {PEAK_MPI_COST_COLLECTIVE,
@@ -2199,23 +2207,6 @@ static void matcher_work(PeakMpiCausalService *s, size_t budget) {
         s->task_ready = 0;
       if (!(x->begin.flags & PEAK_MPI_OBSERVER_SLACK_S1))
         s->task_s1 = 0;
-    } else if (s->task_stage == TASK_COLLECTIVE_BOUNDARY) {
-      if (s->task_cursor == s->task_limit) {
-        o->analysis_waiting = 1;
-        s->task_stage = 0;
-        continue;
-      }
-      Operation *x = &s->operations[s->active[s->task_cursor++]];
-      /* ACK receipt is asynchronous: a paused rank can omit an early call.
-       * A later genuinely complete group proves every member's ordered input
-       * has passed that gap. A merely delayed or estimated group cannot. */
-      if (x->context == o->context && x->collective_built &&
-          !x->legacy_resolved &&
-          x->begin.collective_ordinal > o->begin.collective_ordinal) {
-        s->task_paid_bound = 0;
-        s->task_cursor = 0;
-        s->task_stage = TASK_COLLECTIVE_PAID_BOUND;
-      }
     } else if (s->task_stage == TASK_COLLECTIVE_PAID_BOUND) {
       if (s->task_cursor < s->config.world_size) {
         Rank *r = &s->ranks[s->task_cursor++];
@@ -2239,6 +2230,9 @@ static void matcher_work(PeakMpiCausalService *s, size_t budget) {
       x->join = s->task_join;
       x->join_s1 = s->task_s1;
       x->collective_built = 1;
+      Context *context = &s->contexts[x->context - 1];
+      if (x->begin.collective_ordinal > context->built_collective_ordinal)
+        context->built_collective_ordinal = x->begin.collective_ordinal;
       PeakMpiCostRef input = launch_input(x);
       edge(s, x->rank, input, s->task_join,
            s->task_s1 ? PEAK_MPI_COST_SLACK_INPUT
