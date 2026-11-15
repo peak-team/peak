@@ -2621,6 +2621,14 @@ static int operation_live(PeakMpiCausalService *s, Operation *o) {
   return !o->ended || o->group_index > s->ranks[o->rank].covered_index ||
          branch_live_at_cut(s, o);
 }
+/* Completed local Wait/Test identities have no later communication matches.
+ * Their per-thread order anchor is retained separately by the GC predicate. */
+static int observation_metadata_done(const Operation *o) {
+  return o->ended &&
+      (o->begin.operation == PEAK_MPI_CAUSAL_WAIT ||
+       o->begin.operation == PEAK_MPI_CAUSAL_TEST);
+}
+
 static void keep_ref(PeakMpiCausalService *s, PeakMpiCostRef ref) {
   if (ref.generation && ref.slot < s->config.model.max_nodes)
     s->keep[ref.slot] = s->gc_generation;
@@ -2734,7 +2742,7 @@ static void checkpoint(PeakMpiCausalService *s, size_t budget) {
       }
       size_t slot = s->active[s->gc_cursor++];
       Operation *o = &s->operations[slot];
-      if (operation_live(s, o) ||
+      if ((operation_live(s, o) && !observation_metadata_done(o)) ||
           s->ranks[o->rank].anchor[o->begin.thread_uid - 1] ==
               o->begin.op_uid ||
           ((o->begin.flags & PEAK_MPI_CAUSAL_NONBLOCKING) && !o->retired))

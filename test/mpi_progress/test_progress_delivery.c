@@ -1206,6 +1206,77 @@ static void recovery_drain(RecoveryGroups *c, unsigned turns, int fresh,
     assert(c->service->last_tick_work <= budget);
   }
 }
+static uint64_t local_observation(RecoveryGroups *c, unsigned slot,
+    unsigned ordinal, unsigned operation) {
+  PeakMpiObserverRecord records[4];
+  uint64_t uid = recovery_group(c, 0, slot, ordinal, 0, 0, records);
+  uint64_t A = c->A[0], P = 20000000 + (A - 100000000) / 3;
+  for (unsigned i = 0; i < 4; ++i) {
+    if (i == 1 || i == 2) {
+      records[i].flags &= ~PEAK_MPI_CAUSAL_COLLECTIVE;
+      records[i].operation = operation;
+    }
+    records[i].L_cut = records[i].A_cut = A + i * 10000;
+    records[i].P_cut = P + i * 10000 / 3;
+    assert(peak_mpi_causal_service_ingest_record(c->service, 0, &records[i]));
+  }
+  c->A[0] += 30000;
+  c->raw[0].P = .02 + (double)(c->A[0] - 100000000) / 3e9;
+  return uid;
+}
+static void test_observation_metadata_retirement(void) {
+  RecoveryGroups c;
+  recovery_groups_init(&c);
+  PeakMpiObserverRecord records[4];
+  uint64_t receive = recovery_group(&c, 0, 0, 2, 1, 0, records);
+  for (unsigned i = 1; i <= 2; ++i) {
+    records[i].flags &= ~PEAK_MPI_CAUSAL_COLLECTIVE;
+    records[i].flags |= PEAK_MPI_OBSERVER_PROGRESS_ESTIMATED;
+    records[i].operation = PEAK_MPI_CAUSAL_RECV;
+    records[i].peer = records[i].actual_source = 1;
+    records[i].tag = records[i].actual_tag = 7;
+    records[i].capability_uid = PEAK_MPI_PROGRESS_INTEL_2021_11_OPX_ASYNC0_APPROX;
+  }
+  for (unsigned i = 0; i < 4; ++i)
+    assert(peak_mpi_causal_service_ingest_record(c.service, 0, &records[i]));
+  recovery_drain(&c, 4, 0, 100000);
+  uint64_t anchors[2] = {0}, first = 0;
+  for (unsigned k = 0; k < 100; ++k) {
+    unsigned slot = k % 2;
+    if (anchors[slot])
+      assert(find_op(c.service, 0, anchors[slot]));
+    anchors[slot] = local_observation(&c, slot, k + 3,
+        k % 3 ? PEAK_MPI_CAUSAL_WAIT : PEAK_MPI_CAUSAL_TEST);
+    if (!k)
+      first = anchors[slot];
+    recovery_drain(&c, 4, 0, 100000);
+    assert(!c.service->hard_fault && c.service->operation_count <= 3);
+  }
+  assert(find_op(c.service, 0, receive) && !find_op(c.service, 0, first) &&
+         !c.service->ranks[0].covered_index);
+  /* Both slots' next calls must still find their current input_ref anchors. */
+  for (unsigned slot = 0; slot < 2; ++slot) {
+    assert(find_op(c.service, 0, anchors[slot]));
+    anchors[slot] = local_observation(&c, slot, 103 + slot, PEAK_MPI_CAUSAL_WAIT);
+  }
+  recovery_drain(&c, 32, 1, 100000);
+  double A, P, D;
+  assert(!c.service->hard_fault && c.service->ranks[0].covered_index == 103 &&
+         peak_mpi_cost_model_accounted(c.service->model, 0, &A, &P) == PEAK_MPI_COST_OK &&
+         peak_mpi_cost_model_delay(c.service->model,
+             c.service->ranks[0].covered_ref, &D) == PEAK_MPI_COST_OK);
+  assert(fabs(A - sec(c.A[0] - 10000)) < 1e-12 &&
+         fabs(P - sec(20000000 + (c.A[0] - 100000000 - 30000) / 3 + 20000 / 3)) < 1e-12 &&
+         fabs(D - (sec(c.A[0]) + A)) < 1e-12 &&
+         c.service->ranks[0].A == sec(c.A[0]) &&
+         c.service->ranks[0].P == c.raw[0].P);
+  for (unsigned slot = 0; slot < 2; ++slot)
+    assert(find_op(c.service, 0, anchors[slot]));
+  peak_mpi_causal_service_destroy(c.service);
+  puts("unsettled Wait/Test graph costs survive metadata retirement; both "
+       "thread order anchors and covered accounting preserved PASS");
+}
+
 static void test_recovery_collective_boundary(void) {
   for (unsigned asynchronous = 0; asynchronous < 2; ++asynchronous) {
     RecoveryGroups c;
@@ -1571,6 +1642,7 @@ static void test_collective_proof_reuse(void) {
 }
 
 int main(void) {
+  test_observation_metadata_retirement();
   test_collective_proof_reuse();
   test_recovered_prefix_reply();
   test_recovery_collective_boundary();
