@@ -864,7 +864,7 @@ int peak_mpi_causal_service_ingest_raw(PeakMpiCausalService *s, unsigned r,
   }
   /* A newer request does not invalidate an older unverified reply. Freeze its
    * coherent prefix before later RAW cuts can replace it. */
-  if (!a->coarse && !s->approximate && !s->recovery_reset &&
+  if (!a->coarse && !s->recovery_reset &&
       !s->recovery_needed && a->have_prefix && !a->verify_active &&
       a->requested_nonce > a->verified_nonce &&
       a->echoed_nonce > a->verified_nonce &&

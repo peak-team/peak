@@ -1331,7 +1331,126 @@ static void test_recovery_collective_boundary(void) {
        "slot/context/nonapprox/NBC guards and immutable costs PASS");
 }
 
+static void test_recovered_prefix_reply(void) {
+  for (unsigned nonblocking = 0; nonblocking < 2; ++nonblocking) {
+    RecoveryGroups c;
+    recovery_groups_init(&c);
+    PeakMpiObserverRecord records[4];
+    uint64_t uid = recovery_group(&c, 0, 0, 2, 1,
+        nonblocking ? PEAK_MPI_CAUSAL_NONBLOCKING : 0, records);
+    for (unsigned i = 0; i < 4; ++i) {
+      if (nonblocking)
+        records[i].flags &= ~PEAK_MPI_CAUSAL_ORDERED_CALLER;
+      if (i == 1 || i == 2) {
+        records[i].operation = PEAK_MPI_CAUSAL_SEND;
+        records[i].flags &= ~PEAK_MPI_CAUSAL_COLLECTIVE;
+        records[i].peer = 1;
+        records[i].tag = 7;
+        records[i].collective_ordinal = 0;
+      }
+      assert(peak_mpi_causal_service_ingest_record(c.service, 0, &records[i]));
+    }
+    uint64_t output_uid = uid;
+    if (nonblocking) {
+      recovery_drain(&c, 8, 1, 100000);
+      Operation *open = find_op(c.service, 0, uid);
+      assert(open && !open->completed && !open->result_defined &&
+             !open->legacy_resolved);
+      output_uid = recovery_group(&c, 0, 1, 0, 1, 0, records);
+      for (unsigned i = 0; i < 4; ++i) {
+        records[i].flags &= ~(PEAK_MPI_CAUSAL_COLLECTIVE |
+                              PEAK_MPI_CAUSAL_ORDERED_CALLER);
+        if (i == 1 || i == 2)
+          records[i].operation = PEAK_MPI_CAUSAL_WAIT;
+      }
+      PeakMpiObserverRecord done = records[1];
+      done.sequence++;
+      done.phase = PEAK_MPI_CAUSAL_REQUEST_COMPLETE;
+      done.kind = PEAK_MPI_OBSERVER_EVENT_COMPLETE;
+      done.operation = PEAK_MPI_CAUSAL_SEND;
+      done.op_uid = uid;
+      done.batch_uid = output_uid;
+      done.flags |= PEAK_MPI_CAUSAL_NONBLOCKING | PEAK_MPI_CAUSAL_RECLAIMED |
+                    PEAK_MPI_CAUSAL_STATUS_OBSERVED | PEAK_MPI_CAUSAL_SUCCESS |
+                    PEAK_MPI_OBSERVER_PROGRESS_SEALED;
+      records[2].sequence++;
+      records[2].completion_count = 1;
+      records[3].sequence++;
+      c.prefix[0][1]++;
+      assert(peak_mpi_causal_service_ingest_record(c.service, 0, &records[0]));
+      assert(peak_mpi_causal_service_ingest_record(c.service, 0, &records[1]));
+      assert(peak_mpi_causal_service_ingest_record(c.service, 0, &done));
+      assert(peak_mpi_causal_service_ingest_record(c.service, 0, &records[2]));
+      assert(peak_mpi_causal_service_ingest_record(c.service, 0, &records[3]));
+    }
+    recovery_drain(&c, 32, 0, 100000);
+    Operation *o = find_op(c.service, 0, uid);
+    assert(o && o->analysis_waiting && !o->legacy_wait);
+    for (unsigned rank = 0; rank < 2; ++rank)
+      recovery_raw(&c, rank, 10.1);
+    recovery_drain(&c, 32, 0, 100000);
+    assert(o->legacy_wait && o->analysis_waiting && !o->legacy_resolved);
+    uint64_t required[2] = {o->self_nonce, o->match_nonce};
+    uint64_t finite_prefix[2][2];
+    memcpy(finite_prefix, c.prefix, sizeof finite_prefix);
+    /* Old READY metadata with the old echo, or even a high echo from an
+     * earlier recovery epoch, cannot acknowledge this new nonce. */
+    for (unsigned rank = 0; rank < 2; ++rank) {
+      PeakMpiCausalRaw stale = c.raw[rank];
+      stale.generation = ++c.raw[rank].generation;
+      stale.recovery.state = PEAK_MPI_RECOVERY_READY;
+      assert(peak_mpi_causal_service_ingest_raw(c.service, rank, &stale, 10.1));
+      stale.generation = ++c.raw[rank].generation;
+      stale.recovery.epoch--;
+      stale.watermark_nonce = required[rank];
+      assert(peak_mpi_causal_service_ingest_raw(c.service, rank, &stale, 10.1));
+    }
+    recovery_drain(&c, 8, 0, 100000);
+    for (unsigned rank = 0; rank < 2; ++rank)
+      assert(c.service->ranks[rank].verified_nonce < required[rank]);
+    assert(!o->legacy_resolved);
+    /* The retained early-reply guards also apply after recovery. */
+    for (unsigned guarded = 0; guarded < 3; ++guarded) {
+      c.service->ranks[0].coarse = guarded == 0;
+      c.service->recovery_reset = guarded == 1;
+      c.service->recovery_needed = guarded == 2;
+      recovery_raw(&c, 0, 10.2);
+      assert(!c.service->ranks[0].verify_active);
+      c.service->ranks[0].coarse = c.service->recovery_reset =
+          c.service->recovery_needed = 0;
+    }
+    for (unsigned rank = 0; rank < 2; ++rank)
+      recovery_raw(&c, rank, 10.2);
+    /* New publications are legitimately beyond the older finite reply but
+     * remain in transit. They must not replace or falsely complete it. */
+    PeakMpiObserverRecord pending[2][4];
+    for (unsigned rank = 0; rank < 2; ++rank) {
+      recovery_group(&c, rank, 0, 3, 1, 0, pending[rank]);
+      recovery_raw(&c, rank, 10.3);
+    }
+    recovery_drain(&c, 32, 0, 100000);
+    o = find_op(c.service, 0, uid);
+    assert(o && o->legacy_resolved && !c.service->hard_fault &&
+           c.service->ranks[0].covered_index != 0);
+    for (unsigned rank = 0; rank < 2; ++rank) {
+      Rank *r = &c.service->ranks[rank];
+      assert(r->verified_nonce >= required[rank] &&
+             r->sequence[0] < c.prefix[rank][0] && r->A == .1 && r->P == .02);
+      assert(!memcmp(r->verified_prefix, finite_prefix[rank],
+                     sizeof finite_prefix[rank]));
+    }
+    double D;
+    Operation *output = find_op(c.service, 0, output_uid);
+    assert(output && peak_mpi_cost_model_delay(c.service->model, output->exit,
+                &D) == PEAK_MPI_COST_OK && fabs(D - .2) < 1e-12);
+    peak_mpi_causal_service_destroy(c.service);
+  }
+  puts("recovered finite nonce replies survive newer in-transit RAW tails; "
+       "old epochs/echoes and open requests cannot complete them PASS");
+}
+
 int main(void) {
+  test_recovered_prefix_reply();
   test_recovery_collective_boundary();
   test_recovery_reset_runnable();
   test_fault_cache();
