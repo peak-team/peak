@@ -1084,7 +1084,255 @@ static void test_recovery_reset_runnable(void) {
   puts("CPU-only recovery reset drains to ACK; remote waits/faults/idle stay "
        "blocked PASS");
 }
+/* A resumed rank can record a collective which peers executed while paused. */
+typedef struct {
+  PeakMpiCausalService *service;
+  PeakMpiCausalRaw raw[2];
+  uint64_t prefix[2][2], previous_group[2], previous_call[2][2], next_uid;
+  uint64_t A[2];
+  unsigned char peers[2];
+} RecoveryGroups;
+static void recovery_raw(RecoveryGroups *c, unsigned rank, double now) {
+  PeakMpiCausalRaw *r = &c->raw[rank];
+  r->generation++;
+  r->L = (double)c->A[rank] / 1e9;
+  r->elapsed = now;
+  r->watermark_nonce = c->service->ranks[rank].requested_nonce;
+  assert(peak_mpi_causal_service_ingest_raw(c->service, rank, r, now));
+}
+static void recovery_groups_init(RecoveryGroups *c) {
+  memset(c, 0, sizeof *c);
+  c->service = make();
+  c->next_uid = 1000;
+  c->peers[0] = c->peers[1] = 1;
+  for (unsigned rank = 0; rank < 2; ++rank) {
+    c->prefix[rank][0] = 10;
+    c->A[rank] = 100000000;
+    PeakMpiCausalRaw *r = &c->raw[rank];
+    r->incarnation = 100 + rank;
+    r->P = .02;
+    r->active = 1;
+    r->contract_profile = PEAK_MPI_PROGRESS_INTEL_2021_11_ASYNC;
+    r->slot_prefixes = c->prefix[rank];
+    r->slot_count = 2;
+    r->known_peers = c->peers;
+    r->peer_count = 2;
+    r->recovery.comm = r->recovery.ordinal = 1;
+    r->recovery.operation = PEAK_MPI_CAUSAL_BARRIER;
+    r->recovery.loss = r->lost_events = rank;
+    r->recovery.fault_mask = rank ?
+        UINT64_C(1) << PEAK_MPI_OBSERVER_REASON_RING_OVERFLOW : 0;
+    r->coarse_reason = rank ? PEAK_MPI_OBSERVER_REASON_RING_OVERFLOW : 0;
+    recovery_raw(c, rank, 1);
+  }
+  peak_mpi_causal_service_tick(c->service, NULL, NULL, 1, 65536, 100000);
+  assert(c->service->recovery.state == PEAK_MPI_RECOVERY_QUERY);
+  for (unsigned rank = 0; rank < 2; ++rank) {
+    PeakMpiCausalRecovery *r = &c->raw[rank].recovery;
+    r->epoch = c->service->recovery.epoch;
+    r->state = PEAK_MPI_RECOVERY_READY;
+    r->uid_floor = 1000;
+    r->L = .1;
+    r->P = .02;
+    r->elapsed = 1;
+    recovery_raw(c, rank, 1.1);
+  }
+  for (unsigned turn = 0; turn < 100 &&
+      c->service->recovery.state != PEAK_MPI_RECOVERY_ACK; ++turn)
+    peak_mpi_causal_service_tick(c->service, NULL, NULL, 1.2, 65536, 100000);
+  assert(c->service->recovery.state == PEAK_MPI_RECOVERY_ACK &&
+         c->service->approximate && !c->service->hard_fault);
+  for (unsigned rank = 0; rank < 2; ++rank) {
+    c->raw[rank].recovery.state = PEAK_MPI_RECOVERY_ACK;
+    c->raw[rank].recovery.fault_mask = 0;
+    c->raw[rank].coarse_reason = 0;
+  }
+}
+static uint64_t recovery_group(RecoveryGroups *c, unsigned rank,
+    unsigned slot, uint64_t ordinal, uint64_t comm, unsigned flags,
+    PeakMpiObserverRecord deferred[4]) {
+  uint64_t group = c->next_uid++, uid = c->next_uid++;
+  static const unsigned phases[] = {PEAK_MPI_CAUSAL_GROUP_BEGIN,
+      PEAK_MPI_CAUSAL_CALL_BEGIN, PEAK_MPI_CAUSAL_CALL_END,
+      PEAK_MPI_CAUSAL_GROUP_END};
+  for (unsigned i = 0; i < 4; ++i) {
+    PeakMpiObserverRecord r = {0};
+    r.incarnation = 100 + rank;
+    r.thread_uid = slot + 1;
+    r.thread_generation = 1;
+    r.sequence = ++c->prefix[rank][slot];
+    r.phase = phases[i];
+    r.op_uid = i == 0 || i == 3 ? group : uid;
+    r.batch_uid = group;
+    r.input_ref = i == 0 ? c->previous_group[rank]
+                       : i == 1 ? c->previous_call[rank][slot] : 0;
+    r.kind = PEAK_MPI_OBSERVER_EVENT_START;
+    r.flags = PEAK_MPI_CAUSAL_ORDERED_CALLER | PEAK_MPI_CAUSAL_APP_COST_KNOWN;
+    r.L_cut = r.A_cut = c->A[rank];
+    r.P_cut = 20000000;
+    r.communicator_uid = comm;
+    r.capability_uid = PEAK_MPI_PROGRESS_INTEL_2021_11_ASYNC;
+    r.progress_scope = PEAK_MPI_OBSERVER_SCOPE_AUTONOMOUS;
+    r.collective_ordinal = ordinal;
+    if (i == 1 || i == 2) {
+      r.operation = PEAK_MPI_CAUSAL_ALLREDUCE;
+      r.flags |= PEAK_MPI_CAUSAL_COLLECTIVE | flags;
+    }
+    if (i == 2)
+      r.flags |= PEAK_MPI_OBSERVER_PROGRESS_SEALED;
+    if (i == 0 || i == 3)
+      r.progress_end = UINT64_C(2000000000) + ordinal * UINT64_C(1000000);
+    if (i == 3)
+      r.completion_count = 1;
+    if (deferred)
+      deferred[i] = r;
+    else
+      assert(peak_mpi_causal_service_ingest_record(c->service, rank, &r));
+  }
+  c->previous_group[rank] = group;
+  c->previous_call[rank][slot] = uid;
+  return uid;
+}
+static void recovery_drain(RecoveryGroups *c, unsigned turns, int fresh,
+                            size_t budget) {
+  for (unsigned turn = 0; turn < turns; ++turn) {
+    double now = 10 + (double)c->raw[0].generation / 1000;
+    if (fresh)
+      for (unsigned rank = 0; rank < 2; ++rank)
+        recovery_raw(c, rank, now);
+    peak_mpi_causal_service_tick(c->service, NULL, NULL, now, 65536, budget);
+    assert(c->service->last_tick_work <= budget);
+  }
+}
+static void test_recovery_collective_boundary(void) {
+  for (unsigned asynchronous = 0; asynchronous < 2; ++asynchronous) {
+    RecoveryGroups c;
+    recovery_groups_init(&c);
+    for (unsigned ordinal = 2; ordinal < 102; ++ordinal) {
+      for (unsigned rank = 0; rank < 2; ++rank)
+        if (!asynchronous || rank == 0 || ordinal != 2)
+          recovery_group(&c, rank, 0, ordinal, 1, 0, NULL);
+      recovery_drain(&c, 32, 1, 100000);
+      assert(!c.service->hard_fault && c.service->operation_count <= 2);
+    }
+    assert(c.service->ranks[0].covered_index == 100 &&
+           c.service->ranks[1].covered_index == 100 - asynchronous);
+    peak_mpi_causal_service_destroy(c.service);
+  }
+  /* Later input from another slot cannot jump its missing predecessor group. */
+  RecoveryGroups c;
+  recovery_groups_init(&c);
+  uint64_t first = recovery_group(&c, 0, 0, 2, 1, 0, NULL);
+  recovery_group(&c, 0, 1, 3, 1, 0, NULL);
+  PeakMpiObserverRecord delayed[4];
+  recovery_group(&c, 1, 0, 2, 1, 0, delayed);
+  recovery_group(&c, 1, 1, 3, 1, 0, NULL);
+  recovery_drain(&c, 32, 1, 100000);
+  Operation *o = find_op(c.service, 0, first);
+  assert(o && !o->legacy_resolved && !o->collective_built);
+  for (unsigned i = 0; i < 4; ++i)
+    assert(peak_mpi_causal_service_ingest_record(c.service, 1, &delayed[i]));
+  recovery_drain(&c, 32, 1, 100000);
+  o = find_op(c.service, 0, first);
+  assert(o && o->collective_built && !o->legacy_resolved &&
+         c.service->ranks[0].covered_index == 2 &&
+         c.service->ranks[1].covered_index == 2 && !c.service->hard_fault);
+  peak_mpi_causal_service_destroy(c.service);
+  /* Same members are not sufficient: a different context supplies no proof. */
+  recovery_groups_init(&c);
+  for (unsigned rank = 0; rank < 2; ++rank) {
+    PeakMpiObserverObject object = {0};
+    object.kind = PEAK_MPI_CAUSAL_OBJECT_COMM;
+    object.part_count = 1;
+    PeakMpiCausalCommPart part = {0};
+    part.local_uid = 2;
+    part.parent_uid = part.creation_ordinal = 1;
+    part.creation_kind = PEAK_MPI_CAUSAL_COMM_DUPLICATED;
+    part.world_size = part.local_size = part.member_count = 2;
+    part.members[1] = 1;
+    memcpy(object.payload, &part, sizeof part);
+    assert(peak_mpi_causal_service_ingest_object(c.service, rank, 100 + rank,
+                                                &object));
+  }
+  first = recovery_group(&c, 0, 0, 2, 1, 0, NULL);
+  recovery_group(&c, 0, 1, 3, 2, 0, NULL);
+  recovery_group(&c, 1, 1, 3, 2, 0, NULL);
+  recovery_drain(&c, 32, 1, 100000);
+  o = find_op(c.service, 0, first);
+  assert(o && !o->legacy_resolved && !o->collective_built &&
+         !c.service->hard_fault);
+  peak_mpi_causal_service_destroy(c.service);
+  for (unsigned excluded = 0; excluded < 3; ++excluded) {
+    recovery_groups_init(&c);
+    if (!excluded)
+      c.service->approximate = 0;
+    unsigned flags = excluded == 1 ? PEAK_MPI_CAUSAL_NONBLOCKING
+        : excluded == 2 ? PEAK_MPI_CAUSAL_INTERCOMM : 0;
+    first = recovery_group(&c, 0, 0, 2, 1, flags, NULL);
+    recovery_group(&c, 0, 1, 3, 1, 0, NULL);
+    recovery_group(&c, 1, 1, 3, 1, 0, NULL);
+    recovery_drain(&c, 32, 1, 100000);
+    o = find_op(c.service, 0, first);
+    assert(o && !o->legacy_resolved && !o->collective_built &&
+           !c.service->hard_fault);
+    if (excluded == 1)
+      assert(!o->completed && !o->result_defined);
+    peak_mpi_causal_service_destroy(c.service);
+  }
+  /* Error returns were already matched/sealed by the existing completion
+   * path; a later complete group must not add dependencies to that output. */
+  recovery_groups_init(&c);
+  first = recovery_group(&c, 0, 0, 2, 1, 0, delayed);
+  delayed[2].mpi_error = 1;
+  for (unsigned i = 0; i < 4; ++i)
+    assert(peak_mpi_causal_service_ingest_record(c.service, 0, &delayed[i]));
+  recovery_group(&c, 0, 1, 3, 1, 0, NULL);
+  recovery_group(&c, 1, 1, 3, 1, 0, NULL);
+  recovery_drain(&c, 32, 1, 100000);
+  o = find_op(c.service, 0, first);
+  assert(o && o->matched && o->sealed && !o->legacy_resolved &&
+         !c.service->hard_fault);
+  peak_mpi_causal_service_destroy(c.service);
+  /* Parsed immutable costs can lead RAW; the estimate must not use old RAW
+   * as if it covered those costs, nor overwrite either raw accounting lane. */
+  recovery_groups_init(&c);
+  c.A[0] = 200000000;
+  first = recovery_group(&c, 0, 0, 2, 1, 0, NULL);
+  recovery_group(&c, 0, 1, 3, 1, 0, NULL);
+  c.A[1] = 300000000;
+  recovery_group(&c, 1, 1, 3, 1, 0, NULL);
+  recovery_drain(&c, 3000, 0, 16);
+  o = find_op(c.service, 0, first);
+  assert(o && o->legacy_resolved && o->matched && !o->collective_built);
+  double D;
+  assert(peak_mpi_cost_model_delay(c.service->model, o->exit, &D) ==
+             PEAK_MPI_COST_OK && fabs(D - .5) < 1e-12);
+  for (unsigned rank = 0; rank < 2; ++rank) {
+    double A, P;
+    assert(peak_mpi_cost_model_accounted(c.service->model, rank, &A, &P) ==
+           PEAK_MPI_COST_OK);
+    assert(fabs(A - (rank ? .3 : .2)) < 1e-12 && fabs(P - .02) < 1e-12);
+    assert(c.service->ranks[rank].A == .1 && c.service->ranks[rank].P == .02);
+  }
+  /* The next complete group uses MAX for parallel increments, rather than
+   * extending the missing-boundary estimate into permanent sum accounting. */
+  c.A[0] = 300000000;
+  first = recovery_group(&c, 0, 1, 4, 1, 0, NULL);
+  c.A[1] = 400000000;
+  recovery_group(&c, 1, 1, 4, 1, 0, NULL);
+  recovery_drain(&c, 32, 1, 100000);
+  o = find_op(c.service, 0, first);
+  assert(o && o->collective_built && !o->legacy_resolved &&
+         peak_mpi_cost_model_delay(c.service->model, o->exit, &D) ==
+             PEAK_MPI_COST_OK && fabs(D - .6) < 1e-12 &&
+         !c.service->hard_fault);
+  peak_mpi_causal_service_destroy(c.service);
+  puts("asynchronous recovery collective gap: bounded retirement, delayed/cross-"
+       "slot/context/nonapprox/NBC guards and immutable costs PASS");
+}
+
 int main(void) {
+  test_recovery_collective_boundary();
   test_recovery_reset_runnable();
   test_fault_cache();
   test_input_backpressure();

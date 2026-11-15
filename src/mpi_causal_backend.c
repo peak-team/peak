@@ -184,6 +184,7 @@ struct PeakMpiCausalService {
   size_t task_receives, task_sends;
   uint64_t task_epoch;
   PeakMpiCostRef task_join, task_data;
+  double task_paid_bound;
   int pub_stage, pub_complete, pub_coarse;
   size_t pub_sample;
   unsigned pub_root, pub_rank;
@@ -921,10 +922,8 @@ static void seal_output(PeakMpiCausalService *s, Operation *o) {
     o->sealed = 1;
   }
 }
-static void legacy_resolve(PeakMpiCausalService *s, Operation *o) {
-  double bound = 0;
-  for (unsigned r = 0; r < s->config.world_size; r++)
-    bound += s->ranks[r].A;
+static void legacy_resolve_at(PeakMpiCausalService *s, Operation *o,
+                              double bound) {
   /* This is an ownerless paid-history upper anchor, never another raw owner. */
   PeakMpiCostRef ref;
   if (!reserve(s, o->rank, &ref))
@@ -951,6 +950,12 @@ static void legacy_resolve(PeakMpiCausalService *s, Operation *o) {
                                             (size_t)(o - s->operations));
   }
   seal_output(s, o);
+}
+static void legacy_resolve(PeakMpiCausalService *s, Operation *o) {
+  double bound = 0;
+  for (unsigned r = 0; r < s->config.world_size; r++)
+    bound += s->ranks[r].A;
+  legacy_resolve_at(s, o, bound);
 }
 int peak_mpi_causal_service_ingest_record(PeakMpiCausalService *s, unsigned r,
                                           const PeakMpiObserverRecord *rec) {
@@ -1149,7 +1154,8 @@ static void analysis_wake(PeakMpiCausalService *s, Operation *o) {
   if (!o->analysis_waiting || !o->used)
     return;
   if (o->begin.flags & PEAK_MPI_CAUSAL_COLLECTIVE) {
-    if (o->ended && (!o->collective_built || o->result_defined || o->immediate))
+    if (!o->legacy_resolved && o->ended &&
+        (!o->collective_built || o->result_defined || o->immediate))
       analysis_enqueue(s, o, 0);
     return;
   }
@@ -1643,6 +1649,8 @@ enum {
   TASK_CLOSE_SENDS,
   TASK_CLOSE_COMMIT,
   TASK_COLLECTIVE_SCAN,
+  TASK_COLLECTIVE_BOUNDARY,
+  TASK_COLLECTIVE_PAID_BOUND,
   TASK_COLLECTIVE_INPUT,
   TASK_COLLECTIVE_OUTPUT
 };
@@ -1668,7 +1676,7 @@ static void matcher_work(PeakMpiCausalService *s, size_t budget) {
       s->task_ready = s->task_ordered = 1;
       s->task_was_ambiguous = s->task_identity_ordered = 0;
       if (o->begin.flags & PEAK_MPI_CAUSAL_COLLECTIVE) {
-        if (!o->ended)
+        if (!o->ended || o->legacy_resolved)
           continue;
         if (o->collective_built) {
           collective_output(s, o);
@@ -2120,7 +2128,14 @@ static void matcher_work(PeakMpiCausalService *s, size_t budget) {
       if (s->task_cursor == SIZE_MAX) {
         if (!s->task_ready || !s->task_count || !o->context ||
             s->task_count != (unsigned)s->contexts[o->context - 1].size) {
-          s->task_stage = 0;
+          if (s->approximate && s->task_ready && s->task_count && o->context &&
+              s->task_count < (unsigned)s->contexts[o->context - 1].size &&
+              o->completed && !o->matched && !o->sealed && !(o->begin.flags &
+                  (PEAK_MPI_CAUSAL_NONBLOCKING | PEAK_MPI_CAUSAL_INTERCOMM))) {
+            s->task_cursor = 0;
+            s->task_stage = TASK_COLLECTIVE_BOUNDARY;
+          } else
+            s->task_stage = 0;
           continue;
         }
         PeakMpiCostNodeSpec spec = {PEAK_MPI_COST_COLLECTIVE,
@@ -2181,6 +2196,32 @@ static void matcher_work(PeakMpiCausalService *s, size_t budget) {
         s->task_ready = 0;
       if (!(x->begin.flags & PEAK_MPI_OBSERVER_SLACK_S1))
         s->task_s1 = 0;
+    } else if (s->task_stage == TASK_COLLECTIVE_BOUNDARY) {
+      if (s->task_cursor == s->task_limit) {
+        o->analysis_waiting = 1;
+        s->task_stage = 0;
+        continue;
+      }
+      Operation *x = &s->operations[s->active[s->task_cursor++]];
+      /* ACK receipt is asynchronous: a paused rank can omit an early call.
+       * A later genuinely complete group proves every member's ordered input
+       * has passed that gap. A merely delayed or estimated group cannot. */
+      if (x->context == o->context && x->collective_built &&
+          !x->legacy_resolved &&
+          x->begin.collective_ordinal > o->begin.collective_ordinal) {
+        s->task_paid_bound = 0;
+        s->task_cursor = 0;
+        s->task_stage = TASK_COLLECTIVE_PAID_BOUND;
+      }
+    } else if (s->task_stage == TASK_COLLECTIVE_PAID_BOUND) {
+      if (s->task_cursor < s->config.world_size) {
+        Rank *r = &s->ranks[s->task_cursor++];
+        s->task_paid_bound += fmax(r->A, r->last_A);
+        continue;
+      }
+      legacy_resolve_at(s, o, s->task_paid_bound);
+      o->matched = o->legacy_resolved;
+      s->task_stage = 0;
     } else if (s->task_stage == TASK_COLLECTIVE_INPUT) {
       if (s->task_cursor == s->task_count) {
         if (s->task_all)
