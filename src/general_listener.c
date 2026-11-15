@@ -5364,9 +5364,9 @@ peak_heartbeat_wait_with_mpi_service(unsigned int sleep_us,
         for (;;) {
             double now = peak_second();
             if (now >= due) return TRUE;
+            pthread_mutex_lock(&heartbeat_mutex);
             int available = peak_mpi_causal_runtime_service_available();
             double next_due = available ? service_due : due;
-            pthread_mutex_lock(&heartbeat_mutex);
             if (!atomic_load(&heartbeat_running)) {
                 pthread_mutex_unlock(&heartbeat_mutex);
                 return FALSE;
