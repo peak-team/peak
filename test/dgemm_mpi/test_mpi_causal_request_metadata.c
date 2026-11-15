@@ -49,6 +49,11 @@ void peak_mpi_causal_runtime_prepare_submit(PeakMpiObserverRecord *r) {
 }
 void peak_mpi_causal_runtime_submit(PeakMpiObserverRecord *r, int actual) {
   pthread_mutex_lock(&collected);
+  if (r->phase == PEAK_MPI_CAUSAL_CALL_BEGIN &&
+      (r->operation == PEAK_MPI_CAUSAL_WAIT ||
+       r->operation == PEAK_MPI_CAUSAL_TEST ||
+       r->operation == PEAK_MPI_CAUSAL_START))
+    assert(!r->communicator_uid);
   if (require_buffer_activation &&
       r->phase == PEAK_MPI_CAUSAL_REQUEST_ACTIVATE &&
       r->operation == PEAK_MPI_CAUSAL_BSEND) {

@@ -502,6 +502,9 @@ static int merge(PeakMpiCausalService *s, unsigned a, unsigned b) {
 }
 static unsigned context_for(PeakMpiCausalService *s, unsigned rank,
                             uint64_t uid) {
+  /* Wait/Test/Start have no communicator; the frontend reserves UID zero. */
+  if (!uid)
+    return 0;
   for (size_t i = 0; i < s->comm_count; i++)
     if (s->comm_ranks[i] == rank && s->comms[i].uid == uid)
       return s->comms[i].canonical;

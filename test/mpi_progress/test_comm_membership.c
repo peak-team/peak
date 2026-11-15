@@ -63,8 +63,11 @@ static void listpart(PeakMpiCausalService *s, unsigned rank, uint64_t uid,
 }
 static void immutable_tests(void) {
   PeakMpiCausalService *s = make(8);
+  assert(!context_for(s, 0, 0) && !context_for(s, 7, 0));
   for (unsigned r = 0; r < 8; r++)
     part(s, r, 1, 0, PEAK_MPI_CAUSAL_COMM_WORLD, 0, 0, 8);
+  assert(!context_for(s, 0, 0) && !context_for(s, 7, 0) &&
+         !context_for(s, 0, 999) && !context_for(s, 7, 999));
   int a[] = {0, 2, 4, 6}, b[] = {1, 3, 5, 7};
   listpart(s, 0, 10, 1, 2, 2, a + 2);
   assert(!context_for(s, 0, 10));
