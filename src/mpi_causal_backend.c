@@ -3865,7 +3865,8 @@ int peak_mpi_causal_service_runnable(const PeakMpiCausalService *s) {
           (!s->recovery_needed && !s->recovery_reset && !s->recovery_incomplete &&
            (s->recovery.state == PEAK_MPI_RECOVERY_NONE ||
             s->recovery.state == PEAK_MPI_RECOVERY_ACK) &&
-           peak_mpi_causal_batches_runnable(s->batches)));
+           (peak_mpi_causal_batches_runnable(s->batches) ||
+            s->model_running || s->root_plan_stage)));
 }
 int peak_mpi_causal_service_feedback(const PeakMpiCausalService *s,
                                      PeakMpiPolicyFeedback *f) {

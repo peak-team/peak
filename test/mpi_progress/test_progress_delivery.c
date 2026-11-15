@@ -1935,7 +1935,60 @@ static void test_collective_proof_reuse(void) {
        "and recovery; old/legacy proofs cannot close newer gaps PASS");
 }
 
+static void test_model_cpu_continuation(void) {
+  const unsigned budgets[] = {64, 66, 256};
+  int saw_model_only = 0, saw_root_only = 0;
+  for (size_t b = 0; b < sizeof budgets / sizeof budgets[0]; ++b) {
+    RecoveryGroups c;
+    recovery_groups_init(&c);
+    for (unsigned k = 0; k < 6; ++k)
+      for (unsigned rank = 0; rank < 2; ++rank)
+        recovery_group(&c, rank, 0, k + 2, 1, 0, NULL);
+    int witnessed = 0;
+    unsigned turns = 0;
+    for (; turns < 2000; ++turns) {
+      size_t bytes = 65536, work = budgets[b];
+      peak_mpi_causal_service_tick_budget(c.service, NULL, NULL, 2, &bytes, &work);
+      assert(work <= budgets[b] && !c.service->hard_fault);
+      if (!peak_mpi_causal_batches_runnable(c.service->batches) &&
+          (c.service->model_running || c.service->root_plan_stage)) {
+        saw_model_only |= c.service->model_running && !c.service->root_plan_stage;
+        saw_root_only |= !c.service->model_running && c.service->root_plan_stage;
+        assert(peak_mpi_causal_service_runnable(c.service));
+        witnessed = 1;
+        do {
+          bytes = 65536;
+          work = budgets[b];
+          peak_mpi_causal_service_tick_budget(c.service, NULL, NULL, 2,
+                                              &bytes, &work);
+          assert(work < budgets[b] && ++turns < 2000);
+        } while (c.service->model_running || c.service->root_plan_stage);
+        assert(!peak_mpi_causal_service_runnable(c.service));
+        break;
+      }
+    }
+    assert(witnessed);
+    peak_mpi_causal_service_destroy(c.service);
+  }
+  assert(saw_model_only && saw_root_only);
+  /* An incomplete remote collective needs input, not repeated CPU service. */
+  RecoveryGroups c;
+  recovery_groups_init(&c);
+  recovery_group(&c, 0, 0, 2, 1, 0, NULL);
+  for (unsigned turn = 0; turn < 100; ++turn) {
+    size_t bytes = 65536, work = 256;
+    peak_mpi_causal_service_tick_budget(c.service, NULL, NULL, 2, &bytes, &work);
+    assert(work <= 256 && !c.service->hard_fault);
+  }
+  assert(c.service->operation_count && !c.service->model_running &&
+         !c.service->root_plan_stage &&
+         !peak_mpi_causal_service_runnable(c.service));
+  peak_mpi_causal_service_destroy(c.service);
+  puts("YIELDED model and root-only CPU work resume within quota, clear readiness; remote dependency waits without spin PASS");
+}
+
 int main(void) {
+  test_model_cpu_continuation();
   test_stale_recovery_scale();
   test_observation_metadata_retirement();
   test_retained_send_inputs();
