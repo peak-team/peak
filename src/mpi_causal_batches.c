@@ -584,9 +584,16 @@ static void free_record(PeakMpiCausalBatches *b, size_t index) {
  * Avoid walking empty phase lists and copying those same references into a
  * second plan. Generic/concurrent groups still use the materialized plan. */
 static size_t record_index_at(const PeakMpiCausalBatches *b, size_t index) {
-  if (!b->compact_plan)
-    return b->plan[index];
   const BatchGroup *g = &b->groups[b->current];
+  if (!b->compact_plan) {
+    if (!g->implicit)
+      return b->plan[index];
+    if (!index)
+      return g->begin;
+    if (index + 1 == b->plan_count)
+      return g->end;
+    return b->plan[index - 1];
+  }
   const BatchOperation *o = &b->operations[g->operation_head];
   switch (index) {
   case 0:
@@ -633,8 +640,9 @@ int peak_mpi_causal_batches_prepare_next_work(PeakMpiCausalBatches *b,
           *work_used = used;
         return 1;
       }
-      b->plan_count = 1;
-      b->plan[0] = g->begin;
+      b->plan_count = g->implicit ? 0 : 1;
+      if (!g->implicit)
+        b->plan[0] = g->begin;
       b->cursor = g->begin_head;
       b->state = BUILD_BEGIN;
     } else if (b->state == BUILD_BEGIN) {
@@ -674,7 +682,10 @@ int peak_mpi_causal_batches_prepare_next_work(PeakMpiCausalBatches *b,
         b->cursor = parent->next;
       }
     } else if (b->state == BUILD_MARKER) {
-      b->plan[b->plan_count++] = b->groups[b->current].end;
+      if (b->groups[b->current].implicit)
+        b->plan_count += 2; /* Group markers have no physical entries. */
+      else
+        b->plan[b->plan_count++] = b->groups[b->current].end;
       b->state = READY;
       view(b, v);
       if (work_used)

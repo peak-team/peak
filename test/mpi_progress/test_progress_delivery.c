@@ -545,7 +545,7 @@ static void test_compact_batches(void) {
     assert(peak_mpi_causal_batches_prepare_next(b, 100, &v) == -1);
     peak_mpi_causal_batches_destroy(b);
   }
-  b = peak_mpi_causal_batches_create_with_slots(1, 2, 32);
+  b = peak_mpi_causal_batches_create_with_slots(1, 2, 4);
   PeakMpiObserverRecord body[4] = {
       compact[0], compact_rec(PEAK_MPI_CAUSAL_REQUEST_COMPLETE, 2, 30, 5),
       compact_rec(PEAK_MPI_CAUSAL_REQUEST_COMPLETE, 3, 31, 5), compact[1]};
@@ -559,7 +559,13 @@ static void test_compact_batches(void) {
   }
   for (unsigned i = 0; i < 4; i++)
     assert(peak_mpi_causal_batches_ingest(b, 0, &body[i]));
-  v = compact_ready(b);
+  int ready = 0;
+  for (unsigned turn = 0; !ready; ++turn) {
+    size_t used;
+    assert(turn < 100);
+    ready = peak_mpi_causal_batches_prepare_next_work(b, 1, &v, &used);
+    assert(ready >= 0 && used <= 1);
+  }
   assert(v.record_count == 6 && v.native_count == 1 &&
          v.end->completion_count == 1 &&
          peak_mpi_causal_batches_pending(b) == 4);
@@ -570,6 +576,31 @@ static void test_compact_batches(void) {
   assert(peak_mpi_causal_batches_record_at(b, 4)->phase ==
              PEAK_MPI_CAUSAL_CALL_END &&
          peak_mpi_causal_batches_record_at(b, 4)->completion_count == 2);
+  uint64_t prefix[2] = {4, 0};
+  size_t cursor = 0, work = 2;
+  assert(!peak_mpi_causal_batches_prefix_clear(b, 0, prefix, 2, &cursor, &work));
+  peak_mpi_causal_batches_commit(b);
+  for (unsigned turn = 0; peak_mpi_causal_batches_last_group(b, 0) != 100; ++turn) {
+    size_t used;
+    assert(turn < 100 &&
+           !peak_mpi_causal_batches_prepare_next_work(b, 1, &v, &used) && used <= 1);
+  }
+  cursor = 0; work = 2;
+  assert(!peak_mpi_causal_batches_pending(b) &&
+         peak_mpi_causal_batches_prefix_clear(b, 0, prefix, 2, &cursor, &work) == 1);
+  /* Reuse every physical slot: virtual group markers must not free twice. */
+  for (unsigned i = 0; i < 4; ++i) {
+    body[i].sequence += 4;
+    if (i == 0 || i == 3) {
+      body[i].op_uid = 20;
+      body[i].batch_uid = 200;
+      body[i].result_ref = 100;
+    } else
+      body[i].batch_uid = 20;
+    assert(peak_mpi_causal_batches_ingest(b, 0, &body[i]));
+  }
+  v = compact_ready(b);
+  assert(v.group_uid == 200 && v.record_count == 6);
   peak_mpi_causal_batches_commit(b);
   assert(!peak_mpi_causal_batches_prepare_next(b, 100, &v) &&
          !peak_mpi_causal_batches_pending(b));
