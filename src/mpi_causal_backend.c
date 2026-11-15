@@ -5,6 +5,7 @@
 #include "internal/mpi_causal_transport.h"
 #include "internal/mpi_progress_contract.h"
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -233,6 +234,23 @@ static void coarse(PeakMpiCausalService *s, unsigned r,
                    PeakMpiPolicyReason reason, uint64_t lost) {
   Rank *a = &s->ranks[r];
   int prior_hard_fault = s->hard_fault;
+  if (reason == PEAK_MPI_POLICY_RESOURCE_LIMIT && !prior_hard_fault) {
+    PeakMpiCostStats ms = {0};
+    peak_mpi_cost_model_stats(s->model, &ms);
+    fprintf(stderr, "[peak mpi causal resource limit] rank=%u records=%llu "
+            "nodes=%zu/%u free_ops=%zu/%zu free_cuts=%zu/%u free_deps=%zu/%u "
+            "comms=%zu contexts=%zu context_capacity=%zu "
+            "model_nodes=%u model_edges=%u model_owners=%u model_settled=%u "
+            "model_reason=%d model_coarse=%d\n",
+            r, (unsigned long long)s->stats.records,
+            s->node_count, s->config.model.max_nodes,
+            s->free_count, s->config.max_operations,
+            s->free_cut_count, s->config.model.max_nodes,
+            s->free_dep_count, s->config.model.max_edges,
+            s->comm_count, s->context_count, s->config.max_context_parts,
+            ms.active_nodes, ms.active_edges, ms.active_owners,
+            ms.settled_nodes, ms.reason, ms.coarse);
+  }
   if (reason != PEAK_MPI_POLICY_EVENT_LOSS || !a->recovery.loss)
     s->hard_fault = 1;
   unsigned cohort = root(s, r);
@@ -259,6 +277,8 @@ static int good(PeakMpiCausalService *s, unsigned r, PeakMpiCostStatus st) {
       s->graph_pending = 1;
     return 1;
   }
+  if (!s->hard_fault)
+    fprintf(stderr, "[peak mpi causal model error] rank=%u status=%d\n", r, st);
   coarse(s, r, PEAK_MPI_POLICY_RESOURCE_LIMIT, 0);
   return 0;
 }
