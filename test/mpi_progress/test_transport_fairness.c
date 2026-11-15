@@ -1,7 +1,12 @@
 #define _POSIX_C_SOURCE 200809L
+#include <sys/socket.h>
+static ssize_t counted_recv(int, void *, size_t, int);
+#define recv counted_recv
 #include "../../src/mpi_causal_transport.c"
+#undef recv
 #include <assert.h>
 #include <stdio.h>
+#include <time.h>
 static unsigned many_order[1024], many_count;
 static int many_record(void *v, unsigned rank, const PeakMpiObserverRecord *r) {
   (void)v;
@@ -184,6 +189,210 @@ static void test_drain_raw(void) {
        "accepted RAW or refresh received_at");
 }
 
+/* A stable-control burst must not rescan each idle/backpressured peer for
+ * every active frame. The recv wrapper counts real syscalls only in this case. */
+static int watching, busy_fd, reject_rank;
+static unsigned rx_calls, rx_success, rx_eagain, idle_eagain;
+static unsigned busy_accepted, rejected_calls;
+static unsigned nonce_calls, feedback_calls;
+static PeakMpiCausalTransport *fresh_client;
+static int fresh_fd, fresh_idle_seen, fresh_sent;
+static unsigned fresh_received, fresh_after, blocked_accepted, reject_after;
+static ssize_t counted_recv(int fd, void *b, size_t n, int flags) {
+  ssize_t result = recv(fd, b, n, flags);
+  if (watching) {
+    ++rx_calls;
+    rx_success += result > 0;
+    if (result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      ++rx_eagain;
+      idle_eagain += fd != busy_fd;
+      if (fresh_client && fd == fresh_fd) fresh_idle_seen = 1;
+    }
+  }
+  return result;
+}
+static int measured_record(void *p, unsigned rank,
+                            const PeakMpiObserverRecord *r) {
+  (void)p;
+  (void)r;
+  if (fresh_client && rank == 3) {
+    ++fresh_received;
+    fresh_after = busy_accepted;
+    return 1;
+  }
+  if ((int)rank == reject_rank) {
+    if (blocked_accepted < reject_after) {
+      ++blocked_accepted;
+      return 1;
+    }
+    ++rejected_calls;
+    return 0;
+  }
+  assert(rank == 1);
+  ++busy_accepted;
+  if (fresh_client && !fresh_sent) {
+    assert(busy_accepted == 1 && fresh_idle_seen);
+    PeakMpiObserverRecord e = {0};
+    e.incarnation = 103;
+    e.thread_uid = e.thread_generation = e.sequence = e.op_uid = 1;
+    e.kind = PEAK_MPI_OBSERVER_EVENT_START;
+    assert(enqueue(fresh_client, RECORD, &e));
+    watching = 0;
+    peak_mpi_causal_transport_tick(fresh_client, NULL, NULL, 2, 65536);
+    watching = 1;
+    assert(fresh_client->send_index == fresh_client->count);
+    fresh_sent = 1;
+  }
+  return 1;
+}
+static uint64_t measured_nonce(void *p, unsigned rank) {
+  (void)p;
+  (void)rank;
+  if (watching) ++nonce_calls;
+  return watching ? 4 : 0;
+}
+static int measured_feedback(void *p, unsigned rank, double now,
+                               PeakMpiPolicyFeedback *f) {
+  (void)p;
+  (void)now;
+  if (!watching) return 0;
+  ++feedback_calls;
+  memset(f, 0, sizeof *f);
+  f->generation = 77;
+  f->cohort = (PeakMpiPolicyCohortKey){123, 0, 1};
+  f->member.process = rank;
+  f->member.incarnation = 123;
+  f->g = 64;
+  f->q = .1;
+  f->mode = PEAK_MPI_POLICY_COARSE;
+  f->reason = PEAK_MPI_POLICY_MISSING_CONTRACT;
+  f->member_count = 64;
+  return 1;
+}
+static void test_owner_round_batches(void) {
+  const unsigned world = 64;
+  PeakMpiCausalServiceConfig c = {0};
+  c.world_size = world;
+  c.owner_rank = 0;
+  c.job_context = 123;
+  c.address = "127.0.0.1";
+  c.port = 23671;
+  c.slots = 1;
+  PeakMpiCausalTransportSink sink = {
+      .record = measured_record, .feedback = measured_feedback,
+      .request_nonce = measured_nonce};
+  PeakMpiCausalTransport *t[64];
+  unsigned char members[64];
+  memset(members, 1, sizeof members);
+  uint64_t prefix = 0;
+  PeakMpiCausalRaw raw = {0}, dormant = {0};
+  raw.active = raw.generation = 1;
+  raw.elapsed = 1;
+  raw.peer_count = world;
+  raw.known_peers = members;
+  raw.slot_count = 1;
+  raw.slot_prefixes = &prefix;
+  for (unsigned r = 0; r < world; ++r) {
+    c.rank = r;
+    c.incarnation = 100 + r;
+    c.queue_frames = !r ? 4096 : r == 1 ? 512 : r == 2 ? 16 : 4;
+    t[r] = peak_mpi_causal_transport_create(&c, &sink);
+    assert(t[r]);
+  }
+  watching = 0;
+  for (unsigned k = 0; k < 1000; ++k) {
+    peak_mpi_causal_transport_tick(t[0], NULL, &dormant, 1, 65536);
+    for (unsigned r = 1; r < world; ++r) {
+      raw.incarnation = 100 + r;
+      peak_mpi_causal_transport_tick(t[r], NULL, &raw, 1, 65536);
+    }
+    unsigned ready = 0;
+    for (unsigned i = 0; i < world; ++i)
+      ready += t[0]->peers[i].ready != 0;
+    if (ready == world - 1) break;
+    const struct timespec pause = {0, 1000000};
+    nanosleep(&pause, NULL);
+  }
+  unsigned ready = 0;
+  for (unsigned i = 0; i < world; ++i) {
+    ready += t[0]->peers[i].ready != 0;
+    if (t[0]->peers[i].ready && t[0]->peers[i].rank == 1)
+      busy_fd = t[0]->peers[i].fd;
+  }
+  assert(ready == world - 1 && t[1]->peers[0].ready);
+  fresh_client = t[3];
+  fresh_idle_seen = fresh_sent = fresh_received = fresh_after = 0;
+  for (unsigned i = 0; i < world; ++i)
+      if (t[0]->peers[i].ready && t[0]->peers[i].rank == 3) {
+        fresh_fd = t[0]->peers[i].fd;
+        t[0]->peer_cursor = i;
+      }
+  for (unsigned i = 0; i < 256; ++i) {
+    PeakMpiObserverRecord r = {0};
+    r.incarnation = 101;
+    r.thread_uid = r.thread_generation = 1;
+    r.sequence = i + 1;
+    r.kind = PEAK_MPI_OBSERVER_EVENT_START;
+    r.phase = PEAK_MPI_CAUSAL_CALL_BEGIN;
+    r.operation = PEAK_MPI_CAUSAL_SEND;
+    r.op_uid = 10 + i;
+    r.peer = 0;
+    assert(enqueue(t[1], RECORD, &r));
+  }
+  peak_mpi_causal_transport_tick(t[1], NULL, NULL, 2, 65536);
+  assert(t[1]->send_index == t[1]->count);
+  {
+    for (unsigned i = 0; i < 6; ++i) {
+      PeakMpiObserverRecord r = {0};
+      r.incarnation = 102;
+      r.thread_uid = r.thread_generation = 1;
+      r.sequence = r.op_uid = 1 + i;
+      r.kind = PEAK_MPI_OBSERVER_EVENT_START;
+      assert(enqueue(t[2], RECORD, &r));
+    }
+    peak_mpi_causal_transport_tick(t[2], NULL, NULL, 2, 65536);
+    assert(t[2]->send_index == t[2]->count);
+  }
+  rx_calls = rx_success = rx_eagain = idle_eagain = 0;
+  busy_accepted = rejected_calls = nonce_calls = feedback_calls = 0;
+  reject_rank = 2;
+  reject_after = 5;
+  blocked_accepted = 0;
+  watching = 1;
+  uint64_t before = t[0]->stats.sent_bytes + t[0]->stats.received_bytes;
+  size_t left = peak_mpi_causal_transport_tick(t[0], NULL, &dormant, 2, 65536);
+  unsigned measured_rx = rx_calls, measured_success = rx_success;
+  unsigned measured_eagain = rx_eagain, measured_idle_eagain = idle_eagain;
+  unsigned measured_nonce = nonce_calls, measured_feedbacks = feedback_calls;
+  uint64_t spent = t[0]->stats.sent_bytes + t[0]->stats.received_bytes - before;
+  assert(spent <= 65536 && spent + left == 65536 && busy_accepted == 256);
+  assert(measured_idle_eagain <= (world - 2) * (256 / SEND_BATCH_FRAMES + 2));
+  assert(rejected_calls <= 256 / SEND_BATCH_FRAMES + 2);
+  assert(t[0]->accepted[2] == 5 && rejected_calls > 1);
+  assert(fresh_sent && fresh_received == 1 && fresh_after <= SEND_BATCH_FRAMES);
+  for (unsigned r = 1; r < world; ++r) {
+    peak_mpi_causal_transport_tick(t[r], NULL, NULL, 3, 65536);
+    assert(t[r]->requested_nonce == 4);
+    PeakMpiPolicyFeedback f;
+    assert(peak_mpi_causal_transport_feedback(t[r], &f) && f.generation == 77);
+    if (r == 2)
+      assert(t[r]->count == 1);
+  }
+  watching = 0;
+  printf("world=%u busy_records=%u rejected_attempts=%u owner_recv=%u "
+         "recv_success=%u EAGAIN=%u idle_EAGAIN=%u nonce_callbacks=%u "
+         "feedback_callbacks=%u charged_bytes=%llu left=%zu accepted_blocked=%u "
+         "fresh_after_busy=%u\n",
+         world, busy_accepted, rejected_calls, measured_rx, measured_success,
+         measured_eagain, measured_idle_eagain, measured_nonce,
+         measured_feedbacks, (unsigned long long)spent, left, blocked_accepted,
+         fresh_after);
+
+  for (unsigned r = 0; r < world; ++r)
+    peak_mpi_causal_transport_destroy(t[r]);
+  fresh_client = NULL;
+}
+
 int main(int argc, char **argv) {
   size_t budget = argc > 1 ? (size_t)strtoul(argv[1], NULL, 10) : 256;
   PeakMpiCausalServiceConfig c = {0};
@@ -288,4 +497,5 @@ int main(int argc, char **argv) {
   peak_mpi_observer_destroy(local_capture);
   test_many_peer_fairness();
   test_drain_raw();
+  test_owner_round_batches();
 }

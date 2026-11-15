@@ -17,7 +17,8 @@
 enum { SEND_BATCH_FRAMES = 16 };
 enum { HELLO = 1, RECORD, OBJECT, RAW, ACK, FEEDBACK, WMRQ, PACKED_RECORD, PACKED_RAW, PACKED_FEEDBACK };
 typedef struct {
-  int fd, ready, feedback_sent;
+  /* Owner input hint; each bounded read batch revisits quiet peers. */
+  int fd, ready, feedback_sent, quiet;
   uint64_t feedback_generation, nonce_sent, pending_ack;
   unsigned ack_count;
   int ack_due;
@@ -647,6 +648,7 @@ static void close_peer(Peer *p) {
     close(p->fd);
   p->fd = -1;
   p->ready = 0;
+  p->quiet = 0;
   p->feedback_sent = 0;
   p->nonce_sent = 0;
   p->pending_ack = 0;
@@ -1048,6 +1050,7 @@ static void owner_tick(PeakMpiCausalTransport *t, double now, size_t *budget) {
           break;
         }
         t->peers[i].fd = fd;
+        t->peers[i].quiet = 0;
         *budget -= 1;
       }
   }
@@ -1063,6 +1066,11 @@ static void owner_tick(PeakMpiCausalTransport *t, double now, size_t *budget) {
     int rc, read_idle = 0;
     if (p->fd < 0)
       continue;
+    /* Suppress repeated idle reads/rejected-frame decodes within this batch.
+     * A queued or partial control write must still make progress. */
+    if (p->quiet && !p->out_n)
+      continue;
+    p->quiet = 0;
     if (p->out_n) {
       rc = write_buf(t, p->fd, p->out, p->out_n, &p->out_at, budget);
       if (rc < 0) {
@@ -1102,6 +1110,7 @@ static void owner_tick(PeakMpiCausalTransport *t, double now, size_t *budget) {
     size_t before_read = *budget;
     rc = read_frame(t, p, budget);
     read_idle = !rc && before_read == *budget;
+    if (read_idle) p->quiet = 1;
     if (rc < 0) {
       close_peer(p);
       continue;
@@ -1135,8 +1144,10 @@ static void owner_tick(PeakMpiCausalTransport *t, double now, size_t *budget) {
           close_peer(p);
           continue;
         }
-        if (!rc)
+        if (!rc) {
+          p->quiet = 1;
           continue;
+        }
         reset_input(p);
         t->receive_progress = 1;
       } else if (p->ready && t->incarnations[rank] == inc && seq) {
@@ -1153,8 +1164,10 @@ static void owner_tick(PeakMpiCausalTransport *t, double now, size_t *budget) {
           close_peer(p);
           continue;
         }
-        if (!rc)
+        if (!rc) {
+          p->quiet = 1;
           continue;
+        }
         if (seq > t->accepted[rank])
           t->accepted[rank] = seq;
         p->pending_ack = t->accepted[rank];
@@ -1336,6 +1349,10 @@ static void transport_io(PeakMpiCausalTransport *t,
   size_t rounds, before;
   if (owner) {
     for (rounds = 0; rounds < t->c.queue_frames + 2; ++rounds) {
+      /* New data can arrive during another peer's burst. Revisit all peers
+       * using the existing batch quantum, including each new IO pass. */
+      if (rounds % SEND_BATCH_FRAMES == 0)
+        for (size_t i = 0; i < t->peer_n; ++i) t->peers[i].quiet = 0;
       before = *budget;
       t->receive_progress = 0;
       owner_tick(t, now, budget);

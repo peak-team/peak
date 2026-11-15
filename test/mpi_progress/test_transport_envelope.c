@@ -24,7 +24,8 @@ static int connection(PeakMpiCausalTransport *o) {
 static void pump(PeakMpiCausalTransport *o) {
   for (unsigned k = 0; k < 8; k++) {
     size_t budget = 65536;
-    owner_tick(o, 1 + k * .01, &budget);
+    PeakMpiCausalRaw dormant = {0};
+    transport_io(o, &dormant, 1 + k * .01, &budget);
   }
 }
 static void send_frame(int fd, PeakMpiCausalTransport *sender, unsigned type,
@@ -142,7 +143,7 @@ int main(void) {
   c.incarnation = 11;
   c.address = "127.0.0.1";
   c.port = 23573;
-  c.queue_frames = 8;
+  c.queue_frames = 4;
   c.slots = 1;
   PeakMpiCausalTransportSink sink = {.record = got, .fault = bad};
   for (unsigned scenario = 0; scenario < 9; scenario++) {
@@ -223,7 +224,8 @@ int main(void) {
   for (size_t i = 0; i < hello_size; i++) {
     assert(write(fd, hello + i, 1) == 1);
     size_t one = 1;
-    owner_tick(o, 1, &one);
+    PeakMpiCausalRaw dormant = {0};
+    transport_io(o, &dormant, 1, &one);
   }
   send_frame(fd, &sender, HELLO, 0);
   send_frame(fd, &sender, HELLO, 0);
@@ -244,6 +246,37 @@ int main(void) {
   send_frame(fd, &sender, RECORD, 1);
   pump(o);
   assert(records == 1 && !faults && o->stats.duplicates == 1);
+  /* A partial queued control must bypass the quiet-input hint. Admitting
+   * that peer must also keep its next already-buffered record runnable. */
+  Peer *peer = NULL;
+  size_t peer_index = 0;
+  for (size_t i = 0; i < o->peer_n; ++i)
+    if (o->peers[i].ready && o->peers[i].rank == 1) {
+      peer = &o->peers[i];
+      peer_index = i;
+    }
+  assert(peer && peer->quiet && !peer->out_n);
+  send_frame(fd, &sender, RECORD, 2);
+  send_frame(fd, &sender, RECORD, 3);
+  unsigned char *control = peer->out + HDR;
+  p64(&control, 99);
+  peer->out_n = frame(o, peer->out, WMRQ, 8, 0);
+  peer->out_at = 0;
+  size_t one = 1;
+  assert(!write_buf(o, peer->fd, peer->out, peer->out_n, &peer->out_at, &one));
+  assert(!one && peer->out_at == 1);
+  o->peer_cursor = peer_index;
+  one = 1;
+  owner_tick(o, 2, &one);
+  assert(!one && peer->out_at == 2);
+  for (unsigned i = 0; i < 2; ++i) {
+    size_t budget = 65536;
+    o->peer_cursor = peer_index;
+    owner_tick(o, 2, &budget);
+    assert(o->accepted[1] == 2 + i && records == 2 + i);
+  }
+  pump(o);
+  assert(!peer->ack_count && !peer->out_n && !faults);
   close(fd);
   peak_mpi_causal_transport_destroy(o);
   /* Malformed feedback must not partially overwrite an already published tuple.
