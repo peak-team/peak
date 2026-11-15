@@ -1255,6 +1255,168 @@ static uint64_t local_observation(RecoveryGroups *c, unsigned slot,
   c->raw[0].P = .02 + (double)(c->A[0] - 100000000) / 3e9;
   return uid;
 }
+/* These calls reuse the recovery fixture's actual record/RAW path. */
+static uint64_t retained_call(RecoveryGroups *c, unsigned rank, unsigned slot,
+    unsigned operation, unsigned flags, uint64_t probe) {
+  PeakMpiObserverRecord records[4];
+  unsigned remote = send_op(operation) || recv_op(operation) || probe_op(operation);
+  uint64_t uid = recovery_group(c, rank, slot, 2, remote ? 1 : 0,
+      flags & ~PEAK_MPI_CAUSAL_INACTIVE_REQUEST, records);
+  uint64_t A = c->A[rank], P = 20000000 + (A - 100000000) / 3;
+  for (unsigned i = 0; i < 4; ++i) {
+    if (i == 1 || i == 2) {
+      records[i].flags &= ~PEAK_MPI_CAUSAL_COLLECTIVE;
+      records[i].operation = operation;
+      records[i].peer = records[i].actual_source = 1 - rank;
+      records[i].tag = records[i].actual_tag = 7;
+      if (recv_op(operation)) records[i].flags |= PEAK_MPI_CAUSAL_RECEIVE;
+      if (flags & PEAK_MPI_CAUSAL_NONBLOCKING)
+        records[i].progress_scope = PEAK_MPI_OBSERVER_SCOPE_INTERVAL;
+      if (i == 2) records[i].flags |= flags & PEAK_MPI_CAUSAL_INACTIVE_REQUEST;
+      if (operation == PEAK_MPI_CAUSAL_MPROBE && i == 2)
+        records[i].request_uid = 9000;
+      if (operation == PEAK_MPI_CAUSAL_MRECV) {
+        records[i].request_uid = 9000;
+        records[i].progress_begin = probe;
+      }
+    }
+    records[i].L_cut = records[i].A_cut = A + i * 10000;
+    records[i].P_cut = P + i * 10000 / 3;
+    assert(peak_mpi_causal_service_ingest_record(c->service, rank, &records[i]));
+  }
+  c->A[rank] += 30000;
+  c->raw[rank].P = .02 + (double)(c->A[rank] - 100000000) / 3e9;
+  return uid;
+}
+static void retained_request_observation(RecoveryGroups *c, uint64_t send,
+                                          int retire) {
+  PeakMpiObserverRecord records[4];
+  uint64_t wait = recovery_group(c, 0, 0, 3, 0, 0, records);
+  uint64_t A = c->A[0], P = 20000000 + (A - 100000000) / 3;
+  for (unsigned i = 0; i < 4; ++i) {
+    records[i].sequence += i >= 2;
+    records[i].L_cut = records[i].A_cut = A + i * 10000;
+    records[i].P_cut = P + i * 10000 / 3;
+    if (i == 1 || i == 2) {
+      records[i].flags &= ~PEAK_MPI_CAUSAL_COLLECTIVE;
+      records[i].operation = retire ? PEAK_MPI_CAUSAL_WAIT : PEAK_MPI_CAUSAL_TEST;
+    }
+  }
+  c->prefix[0][0]++;
+  records[2].completion_count = !retire;
+  assert(peak_mpi_causal_service_ingest_record(c->service, 0, &records[0]));
+  assert(peak_mpi_causal_service_ingest_record(c->service, 0, &records[1]));
+  PeakMpiObserverRecord done = records[1];
+  done.sequence++;
+  done.kind = retire ? PEAK_MPI_OBSERVER_EVENT_LOCAL_COST : PEAK_MPI_OBSERVER_EVENT_COMPLETE;
+  done.phase = retire ? PEAK_MPI_CAUSAL_REQUEST_RETIRED : PEAK_MPI_CAUSAL_REQUEST_COMPLETE;
+  done.op_uid = send;
+  done.batch_uid = wait;
+  done.operation = PEAK_MPI_CAUSAL_SEND;
+  done.flags |= PEAK_MPI_CAUSAL_NONBLOCKING | (retire ? PEAK_MPI_CAUSAL_RECLAIMED :
+      PEAK_MPI_CAUSAL_STATUS_ONLY | PEAK_MPI_CAUSAL_STATUS_OBSERVED |
+      PEAK_MPI_CAUSAL_SUCCESS | PEAK_MPI_OBSERVER_PROGRESS_SEALED);
+  assert(peak_mpi_causal_service_ingest_record(c->service, 0, &done));
+  assert(peak_mpi_causal_service_ingest_record(c->service, 0, &records[2]));
+  assert(peak_mpi_causal_service_ingest_record(c->service, 0, &records[3]));
+  c->A[0] += 30000;
+  c->raw[0].P = .02 + (double)(c->A[0] - 100000000) / 3e9;
+}
+static void retained_actual_cost(RecoveryGroups *c, unsigned rank, unsigned calls) {
+  double A, P;
+  assert(!peak_mpi_cost_model_accounted(c->service->model, rank, &A, &P));
+  assert(fabs(A - sec(100000000 + calls * 30000 - 10000)) < 1e-12 &&
+         fabs(P - sec(20000000 + (calls - 1) * 10000 + 20000 / 3)) < 1e-12 &&
+         c->service->ranks[rank].A == sec(c->A[rank]) &&
+         c->service->ranks[rank].P == c->raw[rank].P);
+}
+static void test_retained_send_inputs(void) {
+  for (unsigned mode = 0; mode < 3; ++mode) {
+    RecoveryGroups c;
+    recovery_groups_init(&c);
+    unsigned flags = mode ? PEAK_MPI_CAUSAL_NONBLOCKING : 0;
+    if (mode == 1) flags |= PEAK_MPI_CAUSAL_INACTIVE_REQUEST;
+    uint64_t send = retained_call(&c, 0, 0, PEAK_MPI_CAUSAL_SEND, flags, 0);
+    if (mode == 2) {
+      retained_request_observation(&c, send, 0);
+      local_observation(&c, 0, 4, PEAK_MPI_CAUSAL_TEST);
+    }
+    recovery_drain(&c, 32, 1, 100000);
+    Operation *o = find_op(c.service, 0, send);
+    assert(o && o->legacy_resolved && !o->send_matched && !operation_live(c.service, o));
+    assert(mode != 2 || (!o->retired && c.service->ranks[0].anchor[0] != send));
+    PeakMpiCostRef entry = o->entry, scope = progress_input(c.service, o);
+    double entry_D, scope_D, D;
+    assert(!peak_mpi_cost_model_delay(c.service->model, entry, &entry_D) &&
+           !peak_mpi_cost_model_delay(c.service->model, scope, &scope_D));
+    /* A newer local tail cannot replace either immutable send input. */
+    c.A[0] += 70000000;
+    c.raw[0].P = .02 + (double)(c.A[0] - 100000000) / 3e9;
+    recovery_drain(&c, 8, 1, 100000);
+    assert(!peak_mpi_cost_model_delay(c.service->model, entry, &D) && D == entry_D);
+    assert(!peak_mpi_cost_model_delay(c.service->model, scope, &D) && D == scope_D);
+    uint64_t receive = retained_call(&c, 1, 0, PEAK_MPI_CAUSAL_RECV, 0, 0);
+    recovery_drain(&c, 32, 1, 100000);
+    Operation *r = find_op(c.service, 1, receive);
+    assert(r && r->matched && !r->legacy_resolved && !c.service->hard_fault &&
+           !peak_mpi_cost_model_delay(c.service->model, output(r), &D));
+    assert(fabs(D - (mode == 0 ? .20004 : mode == 1 ? .20003 : .20010)) < 1e-12);
+    retained_actual_cost(&c, 0, mode == 2 ? 3 : 1);
+    retained_actual_cost(&c, 1, 1);
+    if (mode == 2) retained_request_observation(&c, send, 1);
+    else local_observation(&c, 0, 4, PEAK_MPI_CAUSAL_WAIT);
+    recovery_drain(&c, 32, 1, 100000);
+    assert(!find_op(c.service, 0, send) && !c.service->hard_fault &&
+           peak_mpi_cost_model_delay(c.service->model, entry, &D) == PEAK_MPI_COST_INVALID &&
+           peak_mpi_cost_model_delay(c.service->model, scope, &D) == PEAK_MPI_COST_INVALID);
+    peak_mpi_causal_service_destroy(c.service);
+  }
+  puts("retained send identities keep immutable inputs through late receive; raw costs and reclaim unchanged PASS");
+}
+static void test_reserved_message_metadata(void) {
+  RecoveryGroups c;
+  recovery_groups_init(&c);
+  uint64_t send = retained_call(&c, 0, 0, PEAK_MPI_CAUSAL_SEND, 0, 0);
+  recovery_drain(&c, 32, 1, 100000);
+  uint64_t probe = retained_call(&c, 1, 0, PEAK_MPI_CAUSAL_MPROBE, 0, 0);
+  recovery_drain(&c, 32, 1, 100000);
+  Operation *o = find_op(c.service, 0, send), *p = find_op(c.service, 1, probe);
+  assert(o && p && p->matched && !p->legacy_resolved);
+  size_t send_slot = (size_t)(o - c.service->operations);
+  assert(o->reserved_by == (size_t)(p - c.service->operations) && p->peer_op == send_slot);
+  PeakMpiCostRef entry = o->entry, scope = progress_input(c.service, o);
+  local_observation(&c, 0, 4, PEAK_MPI_CAUSAL_WAIT);
+  recovery_drain(&c, 32, 1, 100000);
+  double D;
+  assert(find_op(c.service, 0, send) && !c.service->hard_fault &&
+         !peak_mpi_cost_model_delay(c.service->model, entry, &D) &&
+         !peak_mpi_cost_model_delay(c.service->model, scope, &D));
+  uint64_t receive = retained_call(&c, 1, 1, PEAK_MPI_CAUSAL_MRECV, 0, probe);
+  recovery_drain(&c, 32, 1, 100000);
+  o = find_op(c.service, 0, send); p = find_op(c.service, 1, probe);
+  Operation *r = find_op(c.service, 1, receive);
+  assert(o && p && r && r->matched && !r->legacy_resolved && r->peer_op == send_slot &&
+         !c.service->hard_fault && !peak_mpi_cost_model_delay(c.service->model, output(r), &D));
+  assert(fabs(D - .20007) < 1e-12 && !branch_live_at_cut(c.service, o) &&
+         !branch_live_at_cut(c.service, p) && c.service->ranks[1].anchor[0] == probe &&
+         fabs(c.service->pub_F - fmax(c.service->ranks[0].covered.D,
+                                     c.service->ranks[1].covered.D)) < 1e-12);
+  retained_actual_cost(&c, 0, 2); retained_actual_cost(&c, 1, 2);
+  assert(peak_mpi_cost_model_delay(c.service->model, entry, &D) == PEAK_MPI_COST_INVALID &&
+         peak_mpi_cost_model_delay(c.service->model, scope, &D) == PEAK_MPI_COST_INVALID);
+  uint64_t other = local_observation(&c, 1, 5, PEAK_MPI_CAUSAL_TEST);
+  recovery_drain(&c, 32, 1, 100000);
+  r = find_op(c.service, 0, other); o = find_op(c.service, 0, send);
+  p = find_op(c.service, 1, probe);
+  assert(r && o && p && (size_t)(r - c.service->operations) != send_slot &&
+         p->peer_op == send_slot && !branch_live_at_cut(c.service, p));
+  retained_call(&c, 1, 0, PEAK_MPI_CAUSAL_WAIT, 0, 0);
+  recovery_drain(&c, 32, 1, 100000);
+  assert(!find_op(c.service, 0, send) && !find_op(c.service, 1, probe) && !c.service->hard_fault);
+  peak_mpi_causal_service_destroy(c.service);
+  puts("Mprobe reservation pins identity until Probe metadata retires, without retaining consumed graph pressure PASS");
+}
+
 static void test_observation_metadata_retirement(void) {
   RecoveryGroups c;
   recovery_groups_init(&c);
@@ -1674,6 +1836,8 @@ static void test_collective_proof_reuse(void) {
 
 int main(void) {
   test_observation_metadata_retirement();
+  test_retained_send_inputs();
+  test_reserved_message_metadata();
   test_collective_proof_reuse();
   test_recovered_prefix_reply();
   test_recovery_collective_boundary();

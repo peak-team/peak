@@ -2629,6 +2629,16 @@ static int observation_metadata_done(const Operation *o) {
        o->begin.operation == PEAK_MPI_CAUSAL_TEST);
 }
 
+static int operation_metadata_pinned(PeakMpiCausalService *s, Operation *o) {
+  if (s->ranks[o->rank].anchor[o->begin.thread_uid - 1] == o->begin.op_uid ||
+      ((o->begin.flags & PEAK_MPI_CAUSAL_NONBLOCKING) && !o->retired))
+    return 1;
+  if (!send_op(o->begin.operation) || o->reserved_by == SIZE_MAX)
+    return 0;
+  Operation *probe = &s->operations[o->reserved_by];
+  return probe->used && probe->begin.operation == PEAK_MPI_CAUSAL_MPROBE &&
+         probe->peer_op == (size_t)(o - s->operations);
+}
 static void keep_ref(PeakMpiCausalService *s, PeakMpiCostRef ref) {
   if (ref.generation && ref.slot < s->config.model.max_nodes)
     s->keep[ref.slot] = s->gc_generation;
@@ -2694,6 +2704,12 @@ static void checkpoint(PeakMpiCausalService *s, size_t budget) {
         analysis_enqueue(s, o, 0);
       if (s->ranks[o->rank].anchor[o->begin.thread_uid - 1] == o->begin.op_uid)
         keep_ref(s, o->exit);
+      /* Retained send identities still expose these inputs to later matches. */
+      if (send_op(o->begin.operation) && !o->send_matched &&
+          operation_metadata_pinned(s, o)) {
+        keep_ref(s, o->entry);
+        keep_ref(s, progress_input(s, o));
+      }
       if (operation_live(s, o)) {
         keep_ref(s, o->entry);
         keep_ref(s, o->exit);
@@ -2743,9 +2759,7 @@ static void checkpoint(PeakMpiCausalService *s, size_t budget) {
       size_t slot = s->active[s->gc_cursor++];
       Operation *o = &s->operations[slot];
       if ((operation_live(s, o) && !observation_metadata_done(o)) ||
-          s->ranks[o->rank].anchor[o->begin.thread_uid - 1] ==
-              o->begin.op_uid ||
-          ((o->begin.flags & PEAK_MPI_CAUSAL_NONBLOCKING) && !o->retired))
+          operation_metadata_pinned(s, o))
         s->active[s->gc_kept++] = slot;
       else {
         analysis_remove(s, o);
