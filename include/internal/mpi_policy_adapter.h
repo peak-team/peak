@@ -130,6 +130,8 @@ typedef struct {
 } PeakMpiPolicyFeedback;
 
 typedef struct PeakMpiPolicy PeakMpiPolicy;
+/* Learned rate, excluding the temporary STALE feedback multiplier. */
+double peak_mpi_policy_learned_multiplier(const PeakMpiPolicy *policy);
 void peak_mpi_policy_recover(PeakMpiPolicy *policy, double now, double g);
 void peak_mpi_policy_recover_begin(PeakMpiPolicy *, double now, double g);
 int peak_mpi_policy_recover_work(PeakMpiPolicy *, size_t budget, size_t *used);

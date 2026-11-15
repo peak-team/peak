@@ -1179,6 +1179,107 @@ static void recovery_groups_init(RecoveryGroups *c) {
     c->raw[rank].coarse_reason = 0;
   }
 }
+static void recovery_scale_init(RecoveryGroups *c, int age, double learned) {
+  memset(c, 0, sizeof *c);
+  c->service = make();
+  fault_seed(c->service, 1);
+  PeakMpiPolicySample samples[2];
+  stale_samples(samples, 2, .02, .02, 1.1);
+  PeakMpiPolicyCut cut = stale_cut(samples, 2, 0);
+  cut.cohort = c->service->ranks[0].key;
+  cut.F = .01 + learned * .01;
+  assert(peak_mpi_policy_submit_cut(c->service->ranks[0].policy, &cut, 1.1) ==
+         PEAK_MPI_POLICY_OK);
+  c->service->now = 1.1;
+  assert(prepare_feedback_cache(c->service, 100000));
+  assert(fabs(c->service->feedback_cache[0].g - learned) < 1e-12);
+  if (age) {
+    assert(peak_mpi_policy_tick(c->service->ranks[0].policy, 5) == PEAK_MPI_POLICY_OK);
+    c->service->now = 5;
+    c->service->cache_dirty = 1;
+    assert(prepare_feedback_cache(c->service, 100000));
+    assert(c->service->feedback_cache[0].mode == PEAK_MPI_POLICY_STALE &&
+           c->service->feedback_cache[0].g == 2);
+  }
+  c->next_uid = 1000;
+  c->peers[0] = c->peers[1] = 1;
+  for (unsigned rank = 0; rank < 2; ++rank) {
+    c->prefix[rank][0] = 10;
+    c->A[rank] = 100000000;
+    PeakMpiCausalRaw *r = &c->raw[rank];
+    r->generation = 10;
+    r->incarnation = 100 + rank;
+    r->P = .02;
+    r->active = 1;
+    r->contract_profile = PEAK_MPI_PROGRESS_INTEL_2021_11_ASYNC;
+    r->slot_prefixes = c->prefix[rank];
+    r->slot_count = 2;
+    r->known_peers = c->peers;
+    r->peer_count = 2;
+    r->recovery.comm = r->recovery.ordinal = 1;
+    r->recovery.operation = PEAK_MPI_CAUSAL_BARRIER;
+    r->recovery.loss = r->lost_events = rank;
+    r->recovery.fault_mask = rank ?
+        UINT64_C(1) << PEAK_MPI_OBSERVER_REASON_RING_OVERFLOW : 0;
+    r->coarse_reason = rank ? PEAK_MPI_OBSERVER_REASON_RING_OVERFLOW : 0;
+    recovery_raw(c, rank, 6);
+  }
+  peak_mpi_causal_service_tick(c->service, NULL, NULL, 6, 65536, 100000);
+  assert(c->service->recovery.state == PEAK_MPI_RECOVERY_QUERY);
+  for (unsigned rank = 0; rank < 2; ++rank) {
+    PeakMpiCausalRecovery *r = &c->raw[rank].recovery;
+    r->epoch = c->service->recovery.epoch;
+    r->state = PEAK_MPI_RECOVERY_READY;
+    r->uid_floor = 1000;
+    r->L = .1;
+    r->P = .02;
+    r->elapsed = 1;
+    recovery_raw(c, rank, 6.1);
+  }
+  for (unsigned turn = 0; turn < 100 &&
+      c->service->recovery.state != PEAK_MPI_RECOVERY_ACK; ++turn)
+    peak_mpi_causal_service_tick(c->service, NULL, NULL, 6.2, 65536, 100000);
+  assert(c->service->recovery.state == PEAK_MPI_RECOVERY_ACK &&
+         c->service->approximate && !c->service->hard_fault);
+  for (unsigned rank = 0; rank < 2; ++rank) {
+    c->raw[rank].recovery.state = PEAK_MPI_RECOVERY_ACK;
+    c->raw[rank].recovery.fault_mask = 0;
+    c->raw[rank].coarse_reason = 0;
+  }
+}
+
+static void test_stale_recovery_scale(void) {
+  for (unsigned scale = 0; scale < 2; ++scale) {
+    double learned = scale ? 1.5 : 1;
+    for (int aged = 0; aged < 2; ++aged) {
+      RecoveryGroups c;
+      recovery_scale_init(&c, aged, learned);
+      PeakMpiCausalService *s = c.service;
+      assert(fabs(s->recovery_g - learned) < 1e-12);
+      for (unsigned gen = 100; gen < 103; ++gen) {
+        PeakMpiPolicySample samples[2];
+        stale_samples(samples, gen, .1, .1, 6.3 + (gen - 100)*.1);
+        for (unsigned rank = 0; rank < 2; ++rank) {
+          samples[rank].P = .02;
+          samples[rank].cut.P_ns = 20000000;
+        }
+        PeakMpiPolicyCut cut = stale_cut(samples, gen, 0);
+        cut.cohort = s->ranks[0].key;
+        cut.F = .1;
+        cut.quality = PEAK_MPI_POLICY_OBSERVED_PROGRESS_CUT;
+        assert(peak_mpi_policy_submit_cut(s->ranks[0].policy, &cut,
+            6.3 + (gen - 100)*.1) == PEAK_MPI_POLICY_OK);
+      }
+      PeakMpiPolicyFeedback feedback;
+      assert(peak_mpi_policy_feedback(s->ranks[0].policy, stale_ids[0],
+                                     6.5, &feedback) == PEAK_MPI_POLICY_OK);
+      assert(feedback.mode == PEAK_MPI_POLICY_APPROX &&
+             fabs(feedback.g - learned) < 1e-12);
+      peak_mpi_causal_service_destroy(s);
+    }
+  }
+  puts("STALE effective N does not replace learned 1/1.5 across ACK; fresh zero-P-delta cuts preserve learned scale PASS");
+}
 static uint64_t recovery_group(RecoveryGroups *c, unsigned rank,
     unsigned slot, uint64_t ordinal, uint64_t comm, unsigned flags,
     PeakMpiObserverRecord deferred[4]) {
@@ -1835,6 +1936,7 @@ static void test_collective_proof_reuse(void) {
 }
 
 int main(void) {
+  test_stale_recovery_scale();
   test_observation_metadata_retirement();
   test_retained_send_inputs();
   test_reserved_message_metadata();

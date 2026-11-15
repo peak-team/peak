@@ -216,6 +216,9 @@ PeakMpiPolicy *peak_mpi_policy_create(const PeakMpiPolicyConfig *c,
     }
     return p;
 }
+double peak_mpi_policy_learned_multiplier(const PeakMpiPolicy *p) {
+    return p ? p->g : 1;
+}
 void peak_mpi_policy_recover_begin(PeakMpiPolicy *p, double now, double g) {
     if (!p || (p->mode == PEAK_MPI_POLICY_COARSE &&
                p->reason != PEAK_MPI_POLICY_EVENT_LOSS))

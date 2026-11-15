@@ -261,7 +261,7 @@ static void coarse(PeakMpiCausalService *s, unsigned r,
   if (!a->coarse &&
       (!s->recovery.state || s->recovery.state == PEAK_MPI_RECOVERY_ACK))
     s->recovery_g =
-        s->feedback_valid && s->feedback_valid[r] ? s->feedback_cache[r].g : 1;
+        peak_mpi_policy_learned_multiplier(s->ranks[cohort].policy);
   a->coarse = 1;
   a->reason = reason;
   a->lost += lost;
