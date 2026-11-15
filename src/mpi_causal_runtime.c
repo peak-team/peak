@@ -33,6 +33,8 @@ static size_t slots;
 static size_t observer_work_budget = 16384;
 static size_t configured_owner_byte_budget = 65536;
 static size_t effective_byte_budget = 65536;
+/* Single heartbeat writer; finish IO that used the preceding turn's quota. */
+static int transport_budget_exhausted;
 extern void peak_mpi_causal_listener_notify(void) __attribute__((weak));
 extern void peak_mpi_causal_listener_calibrate_notify(void) __attribute__((weak));
 static int rank_id, world_size;
@@ -140,7 +142,7 @@ static int observation_needed(void) {
 }
 int peak_mpi_causal_runtime_queue_pending(void) {
   return atomic_load_explicit(&active, memory_order_relaxed) &&
-         (peak_mpi_observer_has_pending(capture) ||
+         (transport_budget_exhausted || peak_mpi_observer_has_pending(capture) ||
           peak_mpi_causal_service_runnable(service) ||
           (service && observation_needed()));
 }
@@ -745,6 +747,7 @@ int peak_mpi_causal_runtime_tick(double now, double elapsed, double C,
 
   size_t bytes_left = effective_byte_budget, work_left = observer_work_budget;
   peak_mpi_causal_service_tick_budget(service, capture, &raw, now, &bytes_left, &work_left);
+  transport_budget_exhausted = bytes_left == 0;
   int progressed = bytes_left < effective_byte_budget || work_left < observer_work_budget;
   accept_service_feedback(now);
   reason = peak_mpi_observer_coarse_reason(capture);
@@ -789,6 +792,7 @@ int peak_mpi_causal_runtime_drain(double now, double elapsed, double C,
   bind_observer_worker();
   size_t bytes = effective_byte_budget, work = observer_work_budget;
   peak_mpi_causal_service_tick_budget(service, capture, NULL, now, &bytes, &work);
+  transport_budget_exhausted = bytes == 0;
   accept_service_feedback(now);
   latch_capture_coarse();
   return bytes < effective_byte_budget || work < observer_work_budget;

@@ -19,6 +19,7 @@ static void after_store(const volatile void *);
   })
 #endif
 #include "../../src/mpi_causal_runtime.c"
+#include "internal/mpi_causal_transport.h"
 #include <assert.h>
 static pthread_barrier_t enter, finished;
 static _Thread_local int pause_reload;
@@ -102,6 +103,139 @@ static PeakMpiPolicySample sample(PeakMpiObserverRecord *r, unsigned gen) {
   s.app_cost_known = 1;
   s.elapsed = gen;
   return s;
+}
+static void test_transport_continuation(int scheduled) {
+  /* Real TCP input after capture loss does not make the normal parser
+   * runnable. A full IO turn must nevertheless continue before the timer. */
+  PeakMpiCausalServiceConfig c = {0};
+  c.world_size = 2;
+  c.job_context = 99;
+  c.incarnation = 100;
+  c.address = "127.0.0.1";
+  c.port = 39879;
+  c.slots = 1;
+  c.queue_frames = 4096;
+  c.max_operations = 64;
+  c.max_context_parts = 32;
+  c.max_pending_records = 64;
+  c.model = (PeakMpiCostConfig){1024, 4096, 1024, 128, 2, 64};
+  c.policy = (PeakMpiPolicyConfig){2, .1, 1, .5, 0, 0, 1};
+  service = peak_mpi_causal_service_create(&c);
+  assert(service);
+  for (unsigned r = 0; r < 2; ++r) {
+    PeakMpiObserverObject object = {0};
+    object.kind = PEAK_MPI_CAUSAL_OBJECT_COMM;
+    object.part_count = 1;
+    PeakMpiCausalCommPart part = {0};
+    part.local_uid = 1;
+    part.creation_kind = PEAK_MPI_CAUSAL_COMM_WORLD;
+    part.world_size = part.local_size = part.member_count = 2;
+    part.members[1] = 1;
+    memcpy(object.payload, &part, sizeof part);
+    assert(peak_mpi_causal_service_ingest_object(service, r, 100 + r, &object));
+  }
+  PeakMpiCausalTransportSink sink = {0};
+  c.rank = 1;
+  c.incarnation = 101;
+  PeakMpiCausalTransport *client = peak_mpi_causal_transport_create(&c, &sink);
+  assert(client);
+  unsigned char members[2] = {1, 1};
+  uint64_t prefix = 0;
+  PeakMpiCausalRaw raw[2];
+  memset(raw, 0, sizeof raw);
+  for (unsigned r = 0; r < 2; ++r) {
+    raw[r].incarnation = 100 + r;
+    raw[r].generation = raw[r].active = 1;
+    raw[r].elapsed = 1;
+    raw[r].known_peers = members;
+    raw[r].peer_count = 2;
+    raw[r].slot_prefixes = &prefix;
+    raw[r].slot_count = 1;
+  }
+  PeakMpiCausalServiceStats sent = {0};
+  for (unsigned k = 0; k < 2000; ++k) {
+    peak_mpi_causal_service_tick(service, NULL, &raw[0], 1, 65536, 16384);
+    peak_mpi_causal_transport_tick(client, NULL, &raw[1], 1, 65536);
+    peak_mpi_causal_transport_stats(client, &sent);
+    if (sent.connected)
+      break;
+    const struct timespec pause = {0, 1000000};
+    nanosleep(&pause, NULL);
+  }
+  assert(sent.connected);
+  raw[1].generation++;
+  raw[1].lost_events = raw[1].recovery.loss = 1;
+  raw[1].coarse_reason = PEAK_MPI_OBSERVER_REASON_RING_OVERFLOW;
+  raw[1].recovery.fault_mask =
+      UINT64_C(1) << PEAK_MPI_OBSERVER_REASON_RING_OVERFLOW;
+  raw[1].recovery.comm = raw[1].recovery.ordinal = 1;
+  raw[1].recovery.operation = PEAK_MPI_CAUSAL_BARRIER;
+  assert(peak_mpi_causal_service_ingest_raw(service, 1, &raw[1], 2));
+  peak_mpi_causal_service_tick(service, NULL, NULL, 2, 65536, 16384);
+  PeakMpiObserverConfig cfg = {1, 256, 1, 101};
+  PeakMpiObserver *source = peak_mpi_observer_create(&cfg);
+  PeakMpiObserverProducer writer;
+  assert(source);
+  peak_mpi_observer_activate(source);
+  assert(peak_mpi_observer_claim(source, 0, 1, 1, &writer) == PEAK_MPI_OBSERVER_OK);
+  for (unsigned i = 0; i < 4000; ++i) {
+    PeakMpiObserverRecord r = {0};
+    r.kind = PEAK_MPI_OBSERVER_EVENT_START;
+    r.op_uid = 10 + i / 2;
+    r.operation = PEAK_MPI_CAUSAL_SEND;
+    r.phase = i % 2 ? PEAK_MPI_CAUSAL_CALL_END : PEAK_MPI_CAUSAL_CALL_BEGIN;
+    r.flags = PEAK_MPI_CAUSAL_NONBLOCKING;
+    r.communicator_uid = 1;
+    assert(peak_mpi_observer_emit(source, &writer, &r) == PEAK_MPI_OBSERVER_OK);
+    if (i % 64 == 63)
+      peak_mpi_causal_transport_tick(client, source, NULL, 2, 65536);
+  }
+  peak_mpi_causal_transport_tick(client, source, NULL, 2, 65536);
+  assert(!peak_mpi_observer_has_pending(source));
+  peak_mpi_causal_transport_stats(client, &sent);
+  assert(sent.connected && sent.sent_bytes > 65536);
+  policy = c.policy;
+  assert(!peak_mpi_policy_receiver_init(&receiver, &policy,
+      (PeakMpiPolicyCohortKey){99, 0, 1}, (PeakMpiPolicyMemberId){0, 99}, 2));
+  atomic_store(&active, 1);
+  atomic_store(&backend_ready, 1);
+  heartbeat_enabled = 1;
+  _Atomic unsigned char membership[2];
+  atomic_init(&membership[0], 0);
+  atomic_init(&membership[1], 1);
+  rank_id = owner_rank = 0;
+  world_size = 2;
+  incarnation = 100;
+  raw_generation = 1;
+  peers = membership;
+  peer_snapshot = members;
+  slot_prefixes = &prefix;
+  assert(!peak_mpi_causal_runtime_queue_pending());
+  assert(scheduled ? peak_mpi_causal_runtime_tick(2, 2, 0, 0, 2)
+                   : peak_mpi_causal_runtime_drain(2, 2, 0, 0, 2));
+  PeakMpiCausalServiceStats stats;
+  peak_mpi_causal_service_stats(service, &stats);
+  assert(stats.records < 4000 && peak_mpi_causal_runtime_queue_pending());
+  unsigned turns = 1;
+  while (peak_mpi_causal_runtime_queue_pending()) {
+    assert(peak_mpi_causal_runtime_drain(2, 2, 0, 0, 2));
+    assert(++turns < 8);
+  }
+  peak_mpi_causal_service_stats(service, &stats);
+  assert(stats.records == 4000);
+  /* Backend housekeeping may consume work; no IO must not request a retry. */
+  peak_mpi_causal_runtime_drain(2, 2, 0, 0, 2);
+  assert(!peak_mpi_causal_runtime_queue_pending());
+  printf("real TCP IO continuation: scheduled=%d records=%llu bounded_turns=%u "
+         "idle_pending=0\n", scheduled, (unsigned long long)stats.records, turns);
+  peak_mpi_observer_release(source, &writer);
+  peak_mpi_observer_destroy(source);
+  peak_mpi_causal_transport_destroy(client);
+  peak_mpi_causal_service_destroy(service);
+  service = NULL;
+  peers = NULL;
+  peer_snapshot = NULL;
+  slot_prefixes = NULL;
 }
 int main(void) {
   PeakMpiObserverConfig cfg = {1, 8, 1, 1};
@@ -201,6 +335,9 @@ int main(void) {
   assert(!pthread_barrier_destroy(&finished));
   peak_mpi_observer_release(capture, &producer);
   peak_mpi_observer_destroy(capture);
+  capture = NULL;
+  test_transport_continuation(0);
+  test_transport_continuation(1);
   puts("coherent event/RAW control generation survives stale heartbeat store "
        "PASS");
 }
