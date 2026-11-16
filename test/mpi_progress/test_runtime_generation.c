@@ -237,6 +237,111 @@ static void test_transport_continuation(int scheduled) {
   peer_snapshot = NULL;
   slot_prefixes = NULL;
 }
+static unsigned retry_notices, retry_accepted;
+static void retry_notify(void) { ++retry_notices; }
+static int retry_record(void *context, unsigned rank,
+                        const PeakMpiObserverRecord *record) {
+  (void)context;
+  (void)record;
+  assert(rank == 1);
+  ++retry_accepted;
+  return 1;
+}
+static void test_nonempty_retry_notification(int ack_available) {
+  PeakMpiCausalServiceConfig c = {0};
+  c.world_size = 2;
+  c.owner_rank = 0;
+  c.incarnation = 100;
+  c.job_context = 99;
+  c.address = "127.0.0.1";
+  c.port = 39887;
+  c.slots = 1;
+  c.queue_frames = 256;
+  c.max_operations = 64;
+  c.max_context_parts = 32;
+  c.max_pending_records = 64;
+  c.model = (PeakMpiCostConfig){1024, 4096, 1024, 128, 2, 64};
+  c.policy = (PeakMpiPolicyConfig){2, .1, 1, .5, 0, 0, 1};
+  PeakMpiCausalTransportSink sink = {.record = retry_record};
+  PeakMpiCausalTransport *owner = peak_mpi_causal_transport_create(&c, &sink);
+  assert(owner);
+  c.rank = 1;
+  c.incarnation = 101;
+  service = peak_mpi_causal_service_create(&c);
+  assert(service);
+  unsigned char members[2] = {1, 1};
+  uint64_t prefix = 0;
+  PeakMpiCausalRaw raw = {.incarnation = 101, .generation = 1, .active = 1,
+      .elapsed = 1, .known_peers = members, .peer_count = 2,
+      .slot_prefixes = &prefix, .slot_count = 1};
+  PeakMpiCausalRaw owner_raw = raw;
+  owner_raw.incarnation = 100;
+  peak_mpi_causal_transport_tick(owner, NULL, &owner_raw, 1, 65536);
+  for (unsigned i = 0; i < 32; ++i) {
+    peak_mpi_causal_service_tick(service, NULL, &raw, 1, 65536, 16384);
+    peak_mpi_causal_transport_tick(owner, NULL, NULL, 1, 65536);
+  }
+  PeakMpiObserverConfig config = {1, 256, 1, 101};
+  capture = peak_mpi_observer_create(&config);
+  assert(capture);
+  peak_mpi_observer_activate(capture);
+  peak_mpi_observer_set_notify(capture, retry_notify);
+  PeakMpiObserverProducer writer;
+  assert(!peak_mpi_observer_claim(capture, 0, 1, 1, &writer));
+  PeakMpiObserverRecord event = {.kind = PEAK_MPI_OBSERVER_EVENT_START, .op_uid = 1};
+  for (unsigned i = 0; i < 256; ++i)
+    assert(!peak_mpi_observer_emit(capture, &writer, &event));
+  peak_mpi_causal_service_tick(service, capture, NULL, 1, 65536, 16384);
+  atomic_store(&active, 1);
+  atomic_store(&backend_ready, 1);
+  heartbeat_enabled = 1;
+  rank_id = 1;
+  owner_rank = 0;
+  world_size = 2;
+  incarnation = 101;
+  effective_byte_budget = 65536;
+  observer_work_budget = 16384;
+  assert(!peak_mpi_policy_receiver_init(&receiver, &c.policy,
+      (PeakMpiPolicyCohortKey){99, 0, 1}, (PeakMpiPolicyMemberId){1, 101}, 2));
+  int progress = 1;
+  for (unsigned i = 0; progress && i < 16; ++i)
+    progress = peak_mpi_causal_runtime_drain(1, 1, 0, 0, 0);
+  assert(!progress && peak_mpi_causal_runtime_queue_pending());
+  PeakMpiObserverSlotState before, after;
+  assert(peak_mpi_observer_slot_state(capture, 0, &before));
+  assert(before.published == 256 && before.consumed == 254);
+  retry_accepted = 0;
+  PeakMpiCausalServiceStats sent_before, sent_after;
+  peak_mpi_causal_transport_stats(owner, &sent_before);
+  if (ack_available)
+    for (unsigned i = 0; i < 32; ++i)
+      peak_mpi_causal_transport_tick(owner, NULL, NULL, 1, 65536);
+  peak_mpi_causal_transport_stats(owner, &sent_after);
+  assert(ack_available ? retry_accepted == 254 &&
+      sent_after.sent_bytes > sent_before.sent_bytes : !retry_accepted);
+  /* The ring never empties while replay waits for ACK: empty-only notification
+   * cannot restart the heartbeat's suppressed zero-progress retry. */
+  unsigned notices = retry_notices;
+  for (unsigned i = 0; i < 64; ++i)
+    assert(!peak_mpi_observer_emit(capture, &writer, &event));
+  assert(retry_notices == notices + 1);
+  progress = peak_mpi_causal_runtime_drain(1, 1, 0, 0, 0);
+  assert(ack_available ? progress : !progress);
+  assert(peak_mpi_observer_slot_state(capture, 0, &after));
+  assert(ack_available ? after.consumed > before.consumed :
+      after.consumed == before.consumed);
+  assert(!after.lost);
+  peak_mpi_causal_service_destroy(service);
+  service = NULL;
+  peak_mpi_causal_transport_destroy(owner);
+  peak_mpi_observer_destroy(capture);
+  capture = NULL;
+  atomic_store(&active, 0);
+  atomic_store(&backend_ready, 0);
+  printf("nonempty retry notification ACK_available=%d progress=%d consumed=%llu PASS\n",
+      ack_available, progress, (unsigned long long)after.consumed);
+}
+
 int main(void) {
   PeakMpiObserverConfig cfg = {1, 8, 1, 1};
   capture = peak_mpi_observer_create(&cfg);
@@ -338,6 +443,8 @@ int main(void) {
   capture = NULL;
   test_transport_continuation(0);
   test_transport_continuation(1);
+  test_nonempty_retry_notification(1);
+  test_nonempty_retry_notification(0);
   puts("coherent event/RAW control generation survives stale heartbeat store "
        "PASS");
 }

@@ -31,6 +31,7 @@ _Static_assert(sizeof(PeakMpiObserverSlot) == 256,
 
 struct PeakMpiObserver {
     void (*notify)(void);
+    uint64_t notify_mask;
     PeakMpiObserverConfig config;
     PeakMpiObserverSlot *slots;
     PeakMpiObserverRecord *records;
@@ -110,6 +111,11 @@ PeakMpiObserver *peak_mpi_observer_create(const PeakMpiObserverConfig *c) {
     PeakMpiObserver *o = calloc(1, sizeof(*o));
     if (!o) return NULL;
     o->config = *c;
+    /* Retry opportunities follow published sequence, not oscillating occupancy. */
+    uint64_t quantum = 1;
+    while (quantum < 64 && quantum <= c->records_per_slot / 8)
+        quantum *= 2;
+    o->notify_mask = quantum - 1;
     o->slots = allocate_aligned(c->slots * sizeof(*o->slots));
     o->records = allocate_aligned(c->slots * c->records_per_slot * sizeof(*o->records));
     o->objects = calloc(c->object_capacity, sizeof(*o->objects));
@@ -332,7 +338,10 @@ PeakMpiObserverStatus peak_mpi_observer_emit(PeakMpiObserver *o,
      * cannot both miss each other on weakly ordered machines. */
     atomic_thread_fence(memory_order_seq_cst);
     uint64_t notified_tail = atomic_load_explicit(&s->tail, memory_order_acquire);
-    if (notified_tail == head && o->notify) o->notify();
+    /* A nonempty ring may outlive replay backpressure. Published prefixes
+     * provide bounded retry opportunities without occupancy oscillation. */
+    if ((notified_tail == head || !((head + 1) & o->notify_mask)) && o->notify)
+        o->notify();
     return PEAK_MPI_OBSERVER_OK;
 }
 

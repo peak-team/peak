@@ -37,7 +37,38 @@ static void *waiter(void *unused) {
   pthread_mutex_unlock(&mutex);
   return NULL;
 }
+static unsigned quantum_notices;
+static void quantum_notify(void) { ++quantum_notices; }
+static void test_quantum(void) {
+  const struct {
+    unsigned capacity, seed, occupancy, quantum;
+  } cases[] = {{2, 1, 1, 1}, {4, 3, 1, 1}, {8, 3, 1, 2},
+               {256, 67, 63, 64}, {256, 230, 223, 64}};
+  for (unsigned c = 0; c < sizeof cases / sizeof cases[0]; ++c) {
+    PeakMpiObserverConfig config = {1, cases[c].capacity, 1, 1};
+    PeakMpiObserver *o = peak_mpi_observer_create(&config);
+    PeakMpiObserverProducer p;
+    PeakMpiObserverRecord r = {.kind = PEAK_MPI_OBSERVER_EVENT_START, .op_uid = 1};
+    assert(o && !peak_mpi_observer_claim(o, 0, 1, 1, &p));
+    peak_mpi_observer_activate(o);
+    peak_mpi_observer_set_notify(o, quantum_notify);
+    for (unsigned i = 0; i < cases[c].seed; ++i)
+      assert(!peak_mpi_observer_emit(o, &p, &r));
+    for (unsigned i = 0; i < cases[c].seed - cases[c].occupancy; ++i)
+      assert(peak_mpi_observer_consume(o, 0, &r));
+    unsigned before = quantum_notices;
+    for (unsigned i = 0; i < 128; ++i) {
+      assert(!peak_mpi_observer_emit(o, &p, &r));
+      assert(peak_mpi_observer_consume(o, 0, &r));
+    }
+    assert(quantum_notices - before == 128 / cases[c].quantum);
+    peak_mpi_observer_destroy(o);
+  }
+  puts("small rings/unaligned publication/high occupancy notification bounds PASS");
+}
+
 int main(void) {
+  test_quantum();
   PeakMpiObserverConfig c = {1, 256, 1, 1};
   observer = peak_mpi_observer_create(&c);
   assert(observer);
