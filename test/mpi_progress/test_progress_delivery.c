@@ -1842,7 +1842,7 @@ static void recovery_groups_again(RecoveryGroups *c, uint64_t ordinal) {
     r->epoch = c->service->recovery.epoch;
     r->uid_floor = c->next_uid;
     r->L = (double)c->A[rank] / 1e9;
-    r->P = .02;
+    r->P = c->raw[rank].P;
     r->elapsed = now + .001;
     recovery_raw(c, rank, now + .001);
   }
@@ -1935,6 +1935,56 @@ static void test_collective_proof_reuse(void) {
        "and recovery; old/legacy proofs cannot close newer gaps PASS");
 }
 
+/* A recovery may take over a quota-yielded in-place GC compaction. */
+static void test_recovery_interrupted_operation_gc(void) {
+  for (unsigned duplicate = 0; duplicate < 2; ++duplicate) {
+    RecoveryGroups c;
+    recovery_groups_init(&c);
+    local_observation(&c, 0, 2, PEAK_MPI_CAUSAL_WAIT);
+    local_observation(&c, duplicate ? 1 : 0, 3, PEAK_MPI_CAUSAL_WAIT);
+    local_observation(&c, 0, 4, PEAK_MPI_CAUSAL_WAIT);
+    parse_batches(c.service, 10000);
+    for (unsigned rank = 0; rank < 2; ++rank)
+      recovery_raw(&c, rank, 3);
+    assert(c.service->operation_count == 3);
+    size_t first_slot = c.service->active[0];
+    for (unsigned turn = 0; turn < 10000; ++turn) {
+      checkpoint(c.service, 1);
+      if (c.service->gc_stage == 4 &&
+          c.service->gc_cursor == (duplicate ? 2 : 1))
+        break;
+      assert(turn + 1 < 10000);
+    }
+    assert(!c.service->operations[first_slot].used);
+    if (duplicate)
+      assert(c.service->active[0] == c.service->active[1] &&
+             c.service->operations[c.service->active[0]].used);
+    recovery_groups_again(&c, 5);
+    assert(c.service->free_count == c.service->config.max_operations &&
+           !c.service->operation_count);
+    unsigned char seen[64] = {0};
+    assert(c.service->config.max_operations == sizeof seen);
+    for (size_t i = 0; i < c.service->free_count; ++i) {
+      size_t slot = c.service->free_ops[i];
+      assert(slot < sizeof seen && !seen[slot]);
+      seen[slot] = 1;
+    }
+    for (unsigned rank = 0; rank < 2; ++rank) {
+      PeakMpiObserverRecord records[4];
+      recovery_group(&c, rank, 0, 6, 1, 0, records);
+      for (unsigned i = 0; i < 4; ++i) {
+        records[i].P_cut = (uint64_t)(c.raw[rank].P * 1e9 + .5);
+        assert(peak_mpi_causal_service_ingest_record(c.service, rank, &records[i]));
+      }
+    }
+    recovery_drain(&c, 32, 1, 100000);
+    assert(!c.service->hard_fault &&
+           c.service->recovery.state == PEAK_MPI_RECOVERY_ACK);
+    peak_mpi_causal_service_destroy(c.service);
+  }
+  puts("recovery safely takes over yielded operation GC with freed and duplicate retained slots PASS");
+}
+
 static void test_model_cpu_continuation(void) {
   const unsigned budgets[] = {64, 66, 256};
   int saw_model_only = 0, saw_root_only = 0;
@@ -1988,6 +2038,7 @@ static void test_model_cpu_continuation(void) {
 }
 
 int main(void) {
+  test_recovery_interrupted_operation_gc();
   test_model_cpu_continuation();
   test_stale_recovery_scale();
   test_observation_metadata_retirement();

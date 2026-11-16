@@ -3295,6 +3295,10 @@ static int recovery_work(PeakMpiCausalService *s, size_t budget, size_t *used) {
       if (s->operation_count) {
         size_t slot = s->active[s->operation_count - 1];
         Operation *o = &s->operations[slot];
+        if (!o->used) {
+          --s->operation_count;
+          continue;
+        }
         if (o->dep_head != SIZE_MAX) {
           size_t d = o->dep_head;
           o->dep_head = s->deps[d].next;
