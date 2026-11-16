@@ -115,6 +115,16 @@ typedef struct {
   PeakMpiCostRef root_ref;
   int root_valid;
 } Rank;
+enum {
+  ENGINE_PARSE,
+  ENGINE_VERIFY,
+  ENGINE_MATCH,
+  ENGINE_MODEL,
+  ENGINE_ADVANCE,
+  ENGINE_PUBLISH,
+  ENGINE_GC
+};
+
 typedef enum { ROOT_PLAN_IDLE, ROOT_PLAN_RANKS, ROOT_PLAN_OPERATIONS,
   ROOT_PLAN_CUTS, ROOT_PLAN_BEGIN, ROOT_PLAN_CONTINUATIONS,
   ROOT_PLAN_BRANCHES, ROOT_PLAN_READY } RootPlanStage;
@@ -205,7 +215,7 @@ struct PeakMpiCausalService {
   int cache_dirty;
   SettledCut *cuts;
   size_t *free_cuts, free_cut_count;
-  unsigned settle_rank;
+  unsigned settle_rank, settle_idle;
   int settle_done;
   size_t analysis_head, analysis_tail;
   int model_running, graph_pending;
@@ -1103,24 +1113,23 @@ static int queue_cut(PeakMpiCausalService *s, unsigned rank, PeakMpiCostRef ref,
 }
 static size_t advance_covered(PeakMpiCausalService *s, size_t allowance) {
   size_t used = 0;
-  unsigned idle = 0;
   s->settle_done = 0;
-  while (used < allowance && idle < s->config.world_size) {
+  while (used < allowance && s->settle_idle < s->config.world_size) {
     unsigned rank = s->settle_rank++ % s->config.world_size;
     Rank *r = &s->ranks[rank];
     used++;
     if (r->cut_head == SIZE_MAX) {
-      idle++;
+      s->settle_idle++;
       continue;
     }
     SettledCut *cut = &s->cuts[r->cut_head];
     double d;
     if (s->root_cut_active && cut->index > r->root_index) {
-      idle++;
+      s->settle_idle++;
       continue;
     }
     if (peak_mpi_cost_model_delay(s->model, cut->ref, &d) != PEAK_MPI_COST_OK) {
-      idle++;
+      s->settle_idle++;
       continue;
     }
     size_t at = r->cut_head;
@@ -1135,9 +1144,9 @@ static size_t advance_covered(PeakMpiCausalService *s, size_t allowance) {
     if (r->cut_head == SIZE_MAX)
       r->cut_tail = SIZE_MAX;
     s->free_cuts[s->free_cut_count++] = at;
-    idle = 0;
+    s->settle_idle = 0;
   }
-  s->settle_done = idle == s->config.world_size;
+  s->settle_done = s->settle_idle == s->config.world_size;
   return used;
 }
 static void analysis_remove(PeakMpiCausalService *s, Operation *o) {
@@ -3173,6 +3182,7 @@ static int recovery_work(PeakMpiCausalService *s, size_t budget, size_t *used) {
     s->recovery_incomplete = 1;
     s->recovery_reset = s->recovery_prepare = s->recovery_rank = 0;
     s->recovery.state = PEAK_MPI_RECOVERY_NONE;
+    s->settle_idle = 0;
     s->recovery_cursor = 0;
   }
   if (!s->recovery_needed)
@@ -3285,6 +3295,7 @@ static int recovery_work(PeakMpiCausalService *s, size_t budget, size_t *used) {
     s->verify_batch_stage = s->verify_batch_rank = 0;
     s->verify_batch_op = s->verify_batch_limit = 0;
     s->pub_stage = s->gc_stage = s->task_stage = 0;
+    s->settle_idle = 0;
     s->graph_pending = 0;
     s->analysis_head = s->analysis_tail = SIZE_MAX;
     peak_mpi_cost_model_reset_begin(s->model);
@@ -3712,17 +3723,7 @@ void peak_mpi_causal_service_tick_budget(PeakMpiCausalService *s,
       goto accounting;
     }
     size_t left = work - recovery_used, used = prepare_feedback_cache(s, left);
-    int parsed_this_tick = 0;
     left -= used;
-    enum {
-      ENGINE_PARSE,
-      ENGINE_VERIFY,
-      ENGINE_MATCH,
-      ENGINE_MODEL,
-      ENGINE_ADVANCE,
-      ENGINE_PUBLISH,
-      ENGINE_GC
-    };
     while (left) {
       if (s->model_running || s->root_plan_stage)
         s->engine_phase = ENGINE_MODEL;
@@ -3736,7 +3737,6 @@ void peak_mpi_causal_service_tick_budget(PeakMpiCausalService *s,
         s->engine_phase = ENGINE_PARSE;
       size_t allowance = left;
       if (s->engine_phase == ENGINE_PARSE) {
-        parsed_this_tick = 1;
         if (!s->parse_window_open) {
           s->parse_window_left = work / 3 ? work / 3 : work;
           s->parse_window_open = 1;
@@ -3790,6 +3790,7 @@ void peak_mpi_causal_service_tick_budget(PeakMpiCausalService *s,
         if (!s->graph_pending && !s->model_running && !s->root_plan_stage) {
           left--;
           s->engine_phase = ENGINE_ADVANCE;
+          s->settle_idle = 0;
           continue;
         }
         if (!s->model_running && !s->root_plan_stage) {
@@ -3818,6 +3819,8 @@ void peak_mpi_causal_service_tick_budget(PeakMpiCausalService *s,
             if (!s->ranks[rank].coarse)
               coarse(s, rank, PEAK_MPI_POLICY_RESOURCE_LIMIT, 0);
         s->engine_phase = s->task_stage ? ENGINE_MATCH : ENGINE_ADVANCE;
+        if (!s->task_stage)
+          s->settle_idle = 0;
       } else if (s->engine_phase == ENGINE_ADVANCE) {
         size_t spent = advance_covered(s, left);
         left -= spent;
@@ -3845,7 +3848,7 @@ void peak_mpi_causal_service_tick_budget(PeakMpiCausalService *s,
         s->cycle_records = s->parsed_records;
         s->cycle_idle_progress = 0;
         s->engine_phase = ENGINE_PARSE;
-        if (!progress && parsed_this_tick)
+        if (!progress)
           break;
       }
     }
@@ -3885,7 +3888,8 @@ int peak_mpi_causal_service_runnable(const PeakMpiCausalService *s) {
             s->recovery.state == PEAK_MPI_RECOVERY_ACK) &&
            (peak_mpi_causal_batches_runnable(s->batches) ||
             s->model_running || s->root_plan_stage || s->pub_stage ||
-            s->gc_stage)));
+            s->gc_stage || s->engine_phase != ENGINE_PARSE ||
+            s->graph_pending)));
 }
 int peak_mpi_causal_service_feedback(const PeakMpiCausalService *s,
                                      PeakMpiPolicyFeedback *f) {

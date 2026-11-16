@@ -60,6 +60,7 @@ static void run(PeakMpiCausalService *s) {
       st = peak_mpi_cost_model_run(s->model, 100000, &used);
     } while (st == PEAK_MPI_COST_YIELDED);
     assert(st == PEAK_MPI_COST_OK || st == PEAK_MPI_COST_PENDING);
+    s->settle_idle = 0; /* Direct helper starts a new ADVANCE phase. */
     advance_covered(s, 100000);
   }
 }
@@ -1106,7 +1107,7 @@ static void test_recovery_reset_runnable(void) {
     }
   }
   assert(productive >= 2 && !s->recovery_reset &&
-         !peak_mpi_causal_service_runnable(s));
+         peak_mpi_causal_service_runnable(s));
   peak_mpi_causal_service_tick(s, NULL, NULL, s->now, 65536, 16384);
   PeakMpiPolicyFeedback feedback;
   assert(sink_feedback(s, 0, s->now, &feedback));
@@ -2148,9 +2149,10 @@ static void test_immediate_ordered_send(void) {
 }
 
 static void test_model_cpu_continuation(void) {
-  const unsigned budgets[] = {16, 64, 66, 256};
+  const unsigned budgets[] = {16, 64, 66, 67, 68, 93, 128, 256};
   int saw_model_only = 0, saw_root_only = 0;
   int saw_publish_any = 0, saw_gc_any = 0;
+  unsigned saw_phase_boundary = 0;
   for (size_t b = 0; b < sizeof budgets / sizeof budgets[0]; ++b) {
     RecoveryGroups c;
     recovery_groups_init(&c);
@@ -2166,7 +2168,13 @@ static void test_model_cpu_continuation(void) {
       assert(!continuing || work < budgets[b]);
       if (!peak_mpi_causal_batches_runnable(c.service->batches) &&
           (c.service->model_running || c.service->root_plan_stage ||
-           c.service->pub_stage || c.service->gc_stage)) {
+           c.service->pub_stage || c.service->gc_stage ||
+           c.service->engine_phase != ENGINE_PARSE ||
+           c.service->graph_pending)) {
+        if (!c.service->model_running && !c.service->root_plan_stage &&
+            !c.service->pub_stage && !c.service->gc_stage) {
+          saw_phase_boundary |= 1u << c.service->engine_phase;
+        }
         saw_model_only |= c.service->model_running && !c.service->root_plan_stage;
         saw_root_only |= !c.service->model_running && c.service->root_plan_stage;
         saw_publish |= c.service->pub_stage != 0;
@@ -2175,8 +2183,15 @@ static void test_model_cpu_continuation(void) {
         witnessed = 1;
       }
       continuing = peak_mpi_causal_service_runnable(c.service);
-      if (witnessed && !continuing)
+      if (!continuing && c.service->parsed_records == 48)
         break;
+    }
+    for (unsigned rank = 0; rank < 2; ++rank) {
+      const PeakMpiPolicySample *covered = &c.service->ranks[rank].covered;
+      assert(covered->event_cut == c.prefix[rank][0]);
+      assert(fabs(covered->A - .1) < 1e-12 &&
+             fabs(covered->P - .02) < 1e-12 &&
+             fabs(covered->D - .2) < 1e-12);
     }
     saw_publish_any |= saw_publish;
     saw_gc_any |= saw_gc;
@@ -2185,10 +2200,56 @@ static void test_model_cpu_continuation(void) {
       assert(peak_mpi_causal_service_feedback(c.service, &feedback));
       assert(feedback.event_cut == c.prefix[0][0]);
     }
-    assert(witnessed && turns < 2000);
+    assert(turns < 2000);
+    if (budgets[b] == 16 || budgets[b] == 64 || budgets[b] == 66 ||
+        budgets[b] == 256)
+      assert(witnessed);
     peak_mpi_causal_service_destroy(c.service);
   }
   assert(saw_model_only && saw_root_only && saw_publish_any && saw_gc_any);
+  assert((saw_phase_boundary & (1u << ENGINE_VERIFY)) &&
+         (saw_phase_boundary & (1u << ENGINE_MATCH)) &&
+         (saw_phase_boundary & (1u << ENGINE_ADVANCE)));
+  PeakMpiCausalService *empty = make();
+  assert(advance_covered(empty, 1) == 1 && !empty->settle_done);
+  assert(advance_covered(empty, 1) == 1 && empty->settle_done);
+  peak_mpi_causal_service_destroy(empty);
+  /* A RAW arriving during an empty GC continuation may wait until the next
+   * scheduled service call; its coherent prefix must remain available. */
+  RecoveryGroups late;
+  recovery_groups_init(&late);
+  for (unsigned k = 0; k < 6; ++k)
+    for (unsigned rank = 0; rank < 2; ++rank)
+      recovery_group(&late, rank, 0, k + 2, 1, 0, NULL);
+  unsigned late_turn;
+  for (late_turn = 0; late_turn < 2000; ++late_turn) {
+    size_t bytes = 65536, work = 16;
+    peak_mpi_causal_service_tick_budget(late.service, NULL, NULL, 2,
+                                        &bytes, &work);
+    if (late.service->gc_stage &&
+        !peak_mpi_causal_batches_pending(late.service->batches) &&
+        late.service->parsed_records == late.service->cycle_records &&
+        !late.service->cycle_idle_progress)
+      break;
+  }
+  assert(late_turn < 2000);
+  uint64_t parsed = late.service->parsed_records;
+  double now = late.service->now + .1;
+  for (unsigned rank = 0; rank < 2; ++rank)
+    recovery_raw(&late, rank, now);
+  for (late_turn = 0; late_turn < 2000 && late.service->gc_stage; ++late_turn) {
+    size_t bytes = 65536, work = 16;
+    peak_mpi_causal_service_tick_budget(late.service, NULL, NULL, now,
+                                        &bytes, &work);
+    assert(work <= 16 && !late.service->hard_fault);
+  }
+  assert(!late.service->gc_stage && late_turn < 2000);
+  peak_mpi_causal_service_tick(late.service, NULL, NULL, now, 65536, 16384);
+  for (unsigned rank = 0; rank < 2; ++rank)
+    assert(late.service->ranks[rank].last_verify_generation ==
+           late.raw[rank].generation);
+  assert(late.service->parsed_records == parsed && !late.service->hard_fault);
+  peak_mpi_causal_service_destroy(late.service);
   /* An atomic cohort commit may exceed a configured tiny quota. Failed
    * admission must not report work and cause immediate zero-progress retries. */
   RecoveryGroups tiny;
