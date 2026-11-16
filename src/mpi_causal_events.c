@@ -1487,7 +1487,7 @@ static unsigned complete_request(Context *c, const Request *old,
       submit_event(&r, actual);
     if (error != MPI_SUCCESS)
       fail(PEAK_MPI_OBSERVER_REASON_CAPABILITY);
-  } else if (c && old->observed && reclaim && old->start_uid &&
+  } else if (c && old->active && old->observed && reclaim && old->start_uid &&
              old->graph_epoch == c->capture_epoch) {
     PeakMpiObserverRecord r = {0};
     r.kind = PEAK_MPI_OBSERVER_EVENT_LOCAL_COST;

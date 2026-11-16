@@ -577,6 +577,11 @@ int main(int argc, char **argv) {
         flag && completed == 1 && requests[0].occupied && requests[0].observed);
     no_reservations();
     assert(wrap_Wait(fake_wait, &r, &st) == MPI_SUCCESS && completed == 1);
+    PeakMpiObserverRecord rec;
+    unsigned retired = 0;
+    while (peak_mpi_observer_consume(observer, 0, &rec))
+      retired += rec.phase == PEAK_MPI_CAUSAL_REQUEST_RETIRED;
+    assert(retired == 1);
     no_live_requests();
   } else if (!strcmp(argv[1], "partial")) {
     MPI_Request r[2];
@@ -654,6 +659,57 @@ int main(int argc, char **argv) {
     assert(snapshot_request_at(r, &r, &old));
     forget_request(&old);
     no_live_requests();
+    {
+      unsigned original_completed = completed;
+      int sent = 100 + world_rank, received = -1;
+      MPI_Request r[2];
+      assert(MPI_Send_init(&sent, 1, MPI_INT, 1 - world_rank, 93,
+                           MPI_COMM_WORLD, &r[0]) == MPI_SUCCESS);
+      assert(MPI_Recv_init(&received, 1, MPI_INT, 1 - world_rank, 93,
+                           MPI_COMM_WORLD, &r[1]) == MPI_SUCCESS);
+      assert(MPI_Startall(2, r) == MPI_SUCCESS);
+      assert(MPI_Waitall(2, r, MPI_STATUSES_IGNORE) == MPI_SUCCESS);
+      assert(received == 100 + (1 - world_rank) && completed == original_completed + 2);
+      uint64_t closed[2] = {completed_start[original_completed],
+                            completed_start[original_completed + 1]};
+      for (unsigned i = 0; i < 2; ++i) {
+        Request old;
+        assert(snapshot_request_at(r[i], &r[i], &old) &&
+               old.persistent && !old.active && old.observed);
+      }
+      assert(MPI_Barrier(MPI_COMM_WORLD) == MPI_SUCCESS);
+      PeakMpiObserverRecord rec;
+      /* A consumed completed prefix may already have retired these activation
+       * identities in the backend. Repeated inactive waits have no such input. */
+      while (peak_mpi_observer_consume(observer, 0, &rec)) {}
+      unsigned retired_again[2] = {0}, completed_again = 0, wait_ends = 0;
+      for (unsigned step = 0; step < 2; ++step) {
+        if (!step)
+          assert(MPI_Wait(&r[0], MPI_STATUS_IGNORE) == MPI_SUCCESS);
+        else
+          assert(MPI_Waitall(2, r, MPI_STATUSES_IGNORE) == MPI_SUCCESS);
+        while (peak_mpi_observer_consume(observer, 0, &rec)) {
+          if (rec.phase == PEAK_MPI_CAUSAL_REQUEST_RETIRED) {
+            assert(rec.op_uid == closed[0] || rec.op_uid == closed[1]);
+            ++retired_again[step];
+          }
+          completed_again += rec.phase == PEAK_MPI_CAUSAL_REQUEST_COMPLETE;
+          if (rec.phase == PEAK_MPI_CAUSAL_CALL_END &&
+              rec.operation == PEAK_MPI_CAUSAL_WAIT) {
+            assert(!rec.completion_count);
+            ++wait_ends;
+          }
+        }
+      }
+      fprintf(stderr, "inactive persistent rank=%d retired_Wait=%u retired_Waitall=%u "
+              "extra_complete=%u original_complete=%u PMPI_waits_success=1\n",
+              world_rank, retired_again[0], retired_again[1], completed_again, completed);
+      assert(!retired_again[0] && !retired_again[1] && !completed_again &&
+             completed == original_completed + 2 && wait_ends == 2 && !failures);
+      for (unsigned i = 0; i < 2; ++i)
+        assert(MPI_Request_free(&r[i]) == MPI_SUCCESS);
+      no_live_requests();
+    }
   } else if (!strcmp(argv[1], "null")) {
     MPI_Request r;
     int v = 1;
