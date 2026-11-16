@@ -618,7 +618,7 @@ static void frontier_ref(PeakMpiCostModel *m, PeakMpiCostRef ref)
     else if (n->delay > m->frontier) m->frontier = n->delay;
 }
 
-static void run_step(PeakMpiCostModel *m)
+static inline __attribute__((always_inline)) void run_step(PeakMpiCostModel *m)
 {
     uint32_t i;
     switch (m->phase) {
