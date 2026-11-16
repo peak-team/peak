@@ -1084,10 +1084,21 @@ static int queue_cut(PeakMpiCausalService *s, unsigned rank, PeakMpiCostRef ref,
   else
     r->cut_head = at;
   r->cut_tail = at;
-  /* An idle RAW cut can widen the required frontier without adding a graph
-   * edge. Ask for a new rooted solve before moving outside the old scope. */
-  if (s->root_cut_active && s->cuts[at].index > r->root_index)
-    s->graph_pending = 1;
+  /* An unchanged idle continuation can extend an already settled root after
+   * the prior parse cycle closed. Otherwise rebuild the rooted frontier before
+   * moving outside its old scope. Never discard pending graph work. */
+  if (s->root_cut_active && s->cuts[at].index > r->root_index) {
+    double delay;
+    if (!s->graph_pending && !s->model_running && !s->root_plan_stage &&
+        s->parsed_records == s->cycle_records && r->root_valid &&
+        ref.slot == r->root_ref.slot &&
+        ref.generation == r->root_ref.generation &&
+        peak_mpi_cost_model_delay(s->model, r->root_ref, &delay) ==
+            PEAK_MPI_COST_OK)
+      r->root_index = s->cuts[at].index;
+    else
+      s->graph_pending = 1;
+  }
   return 1;
 }
 static size_t advance_covered(PeakMpiCausalService *s, size_t allowance) {

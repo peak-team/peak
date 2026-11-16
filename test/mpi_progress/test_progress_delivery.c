@@ -1338,6 +1338,90 @@ static void recovery_drain(RecoveryGroups *c, unsigned turns, int fresh,
     assert(c->service->last_tick_work <= budget);
   }
 }
+static void test_unchanged_idle_root(void) {
+  RecoveryGroups c;
+  recovery_groups_init(&c);
+  PeakMpiObserverRecord records[4];
+  uint64_t uid = recovery_group(&c, 1, 0, 2, 1, 0, records);
+  for (unsigned i = 0; i < 4; ++i) {
+    if (i == 1 || i == 2) {
+      records[i].operation = PEAK_MPI_CAUSAL_SEND;
+      records[i].flags &= ~(PEAK_MPI_CAUSAL_COLLECTIVE |
+                            PEAK_MPI_OBSERVER_PROGRESS_SEALED);
+      records[i].flags |= PEAK_MPI_CAUSAL_NONBLOCKING;
+      records[i].progress_scope = PEAK_MPI_OBSERVER_SCOPE_INTERVAL;
+      records[i].peer = 0;
+      records[i].tag = records[i].actual_tag = 7;
+      records[i].collective_ordinal = 0;
+    }
+    assert(peak_mpi_causal_service_ingest_record(c.service, 1, &records[i]));
+  }
+  recovery_drain(&c, 10, 0, 100000);
+  for (unsigned cycle = 0; cycle < 5; ++cycle) {
+    double now = c.service->now + .1;
+    for (unsigned r = 0; r < 2; ++r) {
+      c.raw[r].idle_cut = 1;
+      c.raw[r].idle_group_uid = c.previous_group[r];
+      recovery_raw(&c, r, now);
+    }
+    if (cycle) {
+      assert(!c.service->graph_pending && !c.service->model_running &&
+             !c.service->root_plan_stage);
+      verify_prefixes(c.service, 100000);
+      assert(!c.service->graph_pending);
+    }
+    recovery_drain(&c, 10, 0, 100000);
+    Operation *send = find_op(c.service, 1, uid);
+    assert(send && !send->completed && branch_live_at_root(c.service, send));
+    assert(!c.service->hard_fault);
+    for (unsigned r = 0; r < 2; ++r)
+      assert(c.service->ranks[r].covered.elapsed == c.raw[r].elapsed);
+  }
+  for (unsigned r = 0; r < 2; ++r) {
+    c.A[r] += 10000000;
+    c.raw[r].P += .002;
+    recovery_raw(&c, r, c.service->now + .1);
+  }
+  verify_prefixes(c.service, 100000);
+  assert(!c.service->graph_pending);
+  recovery_drain(&c, 10, 0, 100000);
+  for (unsigned r = 0; r < 2; ++r) {
+    assert(fabs(c.service->ranks[r].covered.L - .11) < 1e-12);
+    assert(fabs(c.service->ranks[r].covered.P - .022) < 1e-12);
+    assert(fabs(c.service->ranks[r].covered.D - .21) < 1e-12);
+    assert(fabs(c.service->ranks[r].covered_tail - .01) < 1e-12);
+  }
+  assert(c.service->feedback_cache[0].coverage_complete &&
+         c.service->feedback_cache[0].risk_known &&
+         fabs(c.service->feedback_cache[0].F - .21) < 1e-12 &&
+         fabs(c.service->feedback_cache[0].U_tail) < 1e-12);
+  for (unsigned r = 0; r < 2; ++r) {
+    recovery_group(&c, r, 0, 3, 1, 0, records);
+    for (unsigned i = 0; i < 4; ++i) {
+      records[i].P_cut = 22000000;
+      assert(peak_mpi_causal_service_ingest_record(c.service, r, &records[i]));
+    }
+  }
+  parse_batches(c.service, 100000);
+  assert(c.service->graph_pending);
+  recovery_drain(&c, 10, 0, 100000);
+  assert(!c.service->hard_fault);
+  for (unsigned r = 0; r < 2; ++r) {
+    assert(c.service->ranks[r].last_A_cut == 110000000 &&
+           c.service->ranks[r].last_P_cut == 22000000);
+    recovery_group(&c, r, 0, 4, 1, 0, records);
+    for (unsigned i = 0; i < 4; ++i) {
+      records[i].P_cut = 22000000;
+      assert(peak_mpi_causal_service_ingest_record(c.service, r, &records[i]));
+    }
+  }
+  parse_batches(c.service, 100000);
+  assert(c.service->graph_pending);
+  recovery_drain(&c, 10, 0, 100000);
+  assert(!c.service->hard_fault);
+  peak_mpi_causal_service_destroy(c.service);
+  puts("unchanged idle cuts preserve live branches and fresh costs without dirtying settled roots PASS");
+}
 static uint64_t local_observation(RecoveryGroups *c, unsigned slot,
     unsigned ordinal, unsigned operation) {
   PeakMpiObserverRecord records[4];
@@ -2153,6 +2237,7 @@ int main(void) {
   test_model_cpu_continuation();
   test_immediate_ordered_send();
   test_stale_recovery_scale();
+  test_unchanged_idle_root();
   test_observation_metadata_retirement();
   test_retained_send_inputs();
   test_reserved_message_metadata();
