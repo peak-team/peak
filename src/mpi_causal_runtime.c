@@ -816,6 +816,18 @@ void peak_mpi_causal_runtime_report(void) {
   if (!peak_mpi_causal_runtime_enabled())
     return;
   const PeakMpiProgressContract *contract = peak_mpi_causal_events_contract();
+  PeakMpiObserverFault fault;
+  if (peak_mpi_observer_fault(capture, &fault))
+    fprintf(stderr,
+            "[peak mpi causal producer_fault] rank=%d valid=1 reason=%u "
+            "slot=%zu generation=%llu sequence=%llu\n",
+            rank_id, (unsigned)fault.reason, fault.slot,
+            (unsigned long long)fault.generation,
+            (unsigned long long)fault.sequence);
+  else
+    fprintf(stderr,
+            "[peak mpi causal producer_fault] rank=%d valid=0 reason=unknown "
+            "slot=unknown generation=unknown sequence=unknown\n", rank_id);
   fprintf(stderr,
           "[peak mpi causal recovery] rank=%d epoch=%llu quality=%s "
           "lost_history=%llu state=%llu\n",
