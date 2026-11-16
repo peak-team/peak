@@ -222,6 +222,91 @@ static PeakMpiPolicyCut stale_cut(PeakMpiPolicySample *s, unsigned gen,
                             .01,       age, 0,   PEAK_MPI_POLICY_COMPLETE_CUT,
                             1,         s,   2};
 }
+static PeakMpiPolicyFeedback receiver_pressure_feedback(PeakMpiPolicy *p,
+    unsigned generation, double g) {
+  PeakMpiPolicySample samples[2];
+  double A = .01 * generation;
+  stale_samples(samples, generation, A, A, generation);
+  for (unsigned i = 0; i < 2; ++i)
+    samples[i].event_cut = generation;
+  PeakMpiPolicyCut cut = stale_cut(samples, generation, 0);
+  cut.F = A;
+  assert(peak_mpi_policy_submit_cut(p, &cut, generation) == PEAK_MPI_POLICY_OK);
+  PeakMpiPolicyFeedback f;
+  assert(peak_mpi_policy_feedback(p, stale_ids[0], generation, &f) == PEAK_MPI_POLICY_OK);
+  f.g = g;
+  return f;
+}
+static void test_receiver_pressure_decline(void) {
+  PeakMpiPolicyReceiver r;
+  PeakMpiPolicyDecision d;
+  assert(peak_mpi_policy_receiver_init(&r, &stale_cfg, stale_key, stale_ids[0], 0) == PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_receiver_rebind(&r, stale_key, 2, 1, 0) == PEAK_MPI_POLICY_OK);
+  PeakMpiPolicy *p = peak_mpi_policy_create(&stale_cfg, stale_key, stale_ids, 2, 1, 1, 0);
+  assert(p);
+  PeakMpiPolicyFeedback f = receiver_pressure_feedback(p, 1, 2);
+  assert(peak_mpi_policy_receiver_accept(&r, &f, 1) == PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_receiver_snapshot_cut(&r, 1, 1, f.cut, 1, &d) == PEAK_MPI_POLICY_OK && d.g == 2);
+  PeakMpiPolicyFeedback high = f;
+  f = receiver_pressure_feedback(p, 2, 1.5);
+  PeakMpiPolicyFeedback low = f;
+  assert(peak_mpi_policy_receiver_accept(&r, &f, 2) == PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_receiver_snapshot_cut(&r, 2, 2, f.cut, 1, &d) == PEAK_MPI_POLICY_OK && d.mode == PEAK_MPI_POLICY_COMPLETE && d.g == 1.5);
+  assert(r.conservative_g == 1.5);
+  assert(peak_mpi_policy_receiver_snapshot_cut(&r, 2.4, 2.4, f.cut, 1, &d) == PEAK_MPI_POLICY_OK && d.mode == PEAK_MPI_POLICY_STALE && d.g == 1.5);
+  assert(!d.global_available && !d.headroom_known && !d.reattach_relaxation && d.q_eff == stale_cfg.q / 1.5);
+
+  /* An already aged lower COMPLETE tuple cannot lower learned pressure. */
+  f = receiver_pressure_feedback(p, 3, 1.25);
+  f.age_seconds = 1;
+  assert(peak_mpi_policy_receiver_accept(&r, &f, 3) == PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_receiver_snapshot_cut(&r, 3, 3, f.cut, 1, &d) == PEAK_MPI_POLICY_OK && d.mode == PEAK_MPI_POLICY_STALE && d.g == 1.5 && r.conservative_g == 1.5);
+  assert(!d.headroom_known && !d.reattach_relaxation);
+  f = receiver_pressure_feedback(p, 4, 1.5);
+  assert(peak_mpi_policy_receiver_accept(&r, &f, 4) == PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_receiver_snapshot_cut(&r, 4, 4, f.cut, 1, &d) == PEAK_MPI_POLICY_OK && d.g == 1.5);
+  PeakMpiCostCut backward = f.cut;
+  backward.A_ns--;
+  backward.P_ns--;
+  assert(peak_mpi_policy_receiver_snapshot_cut(&r, 4, 4, backward, 1, &d) == PEAK_MPI_POLICY_OK && d.mode == PEAK_MPI_POLICY_STALE && d.g == 2 && !d.reattach_relaxation);
+  assert(peak_mpi_policy_receiver_snapshot_cut(&r, 4, 3.5, f.cut, 1, &d) == PEAK_MPI_POLICY_OK && d.mode == PEAK_MPI_POLICY_STALE && d.g == 2 && !d.reattach_relaxation);
+  PeakMpiPolicyFeedback invalid = f;
+  invalid.generation++;
+  invalid.g = NAN;
+  assert(peak_mpi_policy_receiver_accept(&r, &invalid, 4.5) == PEAK_MPI_POLICY_INVALID);
+  assert(peak_mpi_policy_receiver_snapshot_cut(&r, 4.5, 4.5, f.cut, 1, &d) == PEAK_MPI_POLICY_OK && d.mode == PEAK_MPI_POLICY_STALE && d.g == 2 && !d.reattach_relaxation);
+
+  assert(peak_mpi_policy_receiver_mark_coarse(&r, PEAK_MPI_POLICY_EVENT_LOSS, 4.6) == PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_receiver_recover(&r, 4.7));
+  assert(peak_mpi_policy_receiver_snapshot_cut(&r, 4.7, 4.7, f.cut, 1, &d) == PEAK_MPI_POLICY_OK && d.g == 2 && !d.headroom_known && !d.reattach_relaxation);
+  f = receiver_pressure_feedback(p, 5, 1.5);
+  f.mode = PEAK_MPI_POLICY_APPROX;
+  f.approximate = 1;
+  f.reason = PEAK_MPI_POLICY_PROGRESS_UNPROVEN;
+  f.coverage_complete = f.risk_known = f.tails_complete = 0;
+  assert(peak_mpi_policy_receiver_accept(&r, &f, 5) == PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_receiver_snapshot_cut(&r, 5, 5, f.cut, 1, &d) == PEAK_MPI_POLICY_OK && d.mode == PEAK_MPI_POLICY_APPROX && d.g == 1.5 && r.conservative_g == 1.5);
+  assert(peak_mpi_policy_receiver_snapshot_cut(&r, 5.4, 5.4, f.cut, 1, &d) == PEAK_MPI_POLICY_OK && d.mode == PEAK_MPI_POLICY_STALE && d.g == 1.5 && !d.headroom_known && !d.reattach_relaxation);
+
+  assert(peak_mpi_policy_receiver_mark_coarse(&r, PEAK_MPI_POLICY_BAD_IDENTITY, 5.5) == PEAK_MPI_POLICY_OK);
+  assert(!peak_mpi_policy_receiver_recover(&r, 5.6));
+  f = receiver_pressure_feedback(p, 6, 1.25);
+  assert(peak_mpi_policy_receiver_accept(&r, &f, 6) == PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_receiver_snapshot_cut(&r, 6, 6, f.cut, 1, &d) == PEAK_MPI_POLICY_OK && d.mode == PEAK_MPI_POLICY_COARSE && d.g == 2 && !d.headroom_known && !d.reattach_relaxation);
+  /* A new membership hint makes even a young lower tuple ineligible. */
+  PeakMpiPolicyReceiver unknown;
+  assert(peak_mpi_policy_receiver_init(&unknown, &stale_cfg, stale_key, stale_ids[0], 0) == PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_receiver_rebind(&unknown, stale_key, 2, 1, 0) == PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_receiver_accept(&unknown, &high, 1) == PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_receiver_snapshot_cut(&unknown, 1, 1, high.cut, 1, &d) == PEAK_MPI_POLICY_OK && d.g == 2);
+  assert(peak_mpi_policy_receiver_accept(&unknown, &low, 2) == PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_receiver_note_membership_hint(&unknown, 3, 2) == PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_receiver_snapshot_cut(&unknown, 2, 2, low.cut, 1, &d) == PEAK_MPI_POLICY_OK && unknown.conservative_g == 2 && !d.headroom_known && !d.reattach_relaxation);
+  assert(peak_mpi_policy_receiver_snapshot_cut(&unknown, 2.4, 2.4, low.cut, 1, &d) == PEAK_MPI_POLICY_OK && d.mode == PEAK_MPI_POLICY_STALE && d.g == 2 && !d.global_available && !d.headroom_known && !d.reattach_relaxation);
+  peak_mpi_policy_free(p);
+  puts("receiver fresh pressure decline survives age; aged/invalid/backward/coarse safety PASS");
+}
+
 static void test_delayed_receiver_pressure(void) {
   PeakMpiPolicyReceiver r;
   PeakMpiPolicyDecision d;
@@ -1001,8 +1086,14 @@ static void test_cache_publish_cursor(void) {
 }
 static void test_cache_recovery_cursor(void) {
   PeakMpiCausalService *s = fault_make_partial();
+  uint64_t generation;
+  PeakMpiPolicyFeedback f;
+  assert(!sink_feedback_generation(s, 0, &generation));
+  assert(!sink_feedback_generation(s, s->config.world_size, &generation));
   fault_seed(s, 0);
   assert(prepare_feedback_cache(s, 100000));
+  assert(sink_feedback_generation(s, 0, &generation) &&
+         sink_feedback(s, 0, 1, &f) && generation == f.generation);
   s->cache_dirty = 1;
   size_t need = peak_mpi_policy_feedback_batch_work(s->ranks[0].policy) + 4;
   assert(prepare_feedback_cache(s, need) > 0 && s->cache_root == 1);
@@ -1017,17 +1108,24 @@ static void test_cache_recovery_cursor(void) {
   s->recovery_needed = 1;
   s->recovery.state = PEAK_MPI_RECOVERY_QUERY;
   s->recovery.epoch = 2;
+  assert(sink_feedback_generation(s, 0, &generation) &&
+         sink_feedback(s, 0, 1.1, &f) && generation == f.generation &&
+         generation == s->feedback_cache[0].generation + 8 + PEAK_MPI_RECOVERY_QUERY);
   s->recovery_reset = 7;
   s->recovery_rank = s->config.world_size;
   size_t used;
   assert(!recovery_work(s, 1, &used));
   assert(s->recovery.state == PEAK_MPI_RECOVERY_ACK);
+  assert(sink_feedback_generation(s, 0, &generation) &&
+         sink_feedback(s, 0, 1.1, &f) && generation == f.generation &&
+         f.recovery.state == PEAK_MPI_RECOVERY_QUERY &&
+         generation == s->feedback_cache[0].generation + 8 + PEAK_MPI_RECOVERY_ACK);
   assert(prepare_feedback_cache(s, 100000) > 0);
   printf("recovery partialroot0 feedbackepoch%llu expected2\n",
          (unsigned long long)s->ranks[0].feedback_epoch);
   assert(s->ranks[0].feedback_epoch == 2);
-  PeakMpiPolicyFeedback f;
-  assert(sink_feedback(s, 0, 1.1, &f) &&
+  assert(sink_feedback_generation(s, 0, &generation) &&
+         sink_feedback(s, 0, 1.1, &f) && generation == f.generation &&
          f.recovery.state == PEAK_MPI_RECOVERY_ACK);
   peak_mpi_causal_service_destroy(s);
 }
@@ -2311,6 +2409,7 @@ int main(void) {
   test_compact_batches();
   test_compact_backend();
   test_delayed_receiver_pressure();
+  test_receiver_pressure_decline();
   test_stale_feedback();
   test_feedback_cache_guard();
   test_profile = PEAK_MPI_PROGRESS_INTEL_2021_11_ASYNC;

@@ -168,7 +168,8 @@ int main(void) {
   PeakMpiCausalTransport transport = {.cap = sizeof packed};
   assert(write(sockets[0], h, HDR) == HDR);
   size_t budget = HDR;
-  assert(read_frame(&transport, &peer, &budget) == -1);
+  FrameHeader parsed;
+  assert(read_frame(&transport, &peer, &budget, &parsed) == -1);
   close(sockets[0]);
   close(sockets[1]);
   unsigned char bad[10];

@@ -13,6 +13,9 @@ typedef struct {
   void *context;
   /* Monotonic parser request for a subsequent producer-prefix snapshot. */
   uint64_t (*request_nonce)(void *, unsigned);
+  /* Optional single-owner query of the exact full-feedback generation.
+   * Return 1 when available; generation zero is valid. */
+  int (*feedback_generation)(void *, unsigned, uint64_t *);
 } PeakMpiCausalTransportSink;
 
 PeakMpiCausalTransport *

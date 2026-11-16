@@ -818,7 +818,11 @@ static PeakMpiPolicyResult receiver_snapshot(PeakMpiPolicyReceiver *r,
                 maximum(r->conservative_g, (double)(r->known_member_count ? r->known_member_count : 1));
         }
         d->g = maximum(1, d->g);
-        if (d->mode != PEAK_MPI_POLICY_STALE)
+        /* Only a fresh ordered observation can supersede learned pressure. */
+        if (fresh && r->membership_complete && !r->permanent_coarse &&
+            (d->mode == PEAK_MPI_POLICY_COMPLETE || d->mode == PEAK_MPI_POLICY_APPROX))
+            r->conservative_g = d->g;
+        else if (d->mode != PEAK_MPI_POLICY_STALE)
             r->conservative_g = maximum(r->conservative_g, d->g);
         int matching_mode = !r->permanent_coarse || f->mode == PEAK_MPI_POLICY_COARSE;
         d->global_available = fresh && matching_mode &&

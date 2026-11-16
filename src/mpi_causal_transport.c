@@ -733,11 +733,11 @@ static int write_queued(PeakMpiCausalTransport *t, int fd, size_t *budget) {
     return 0;
   return -1;
 }
-static int read_frame(PeakMpiCausalTransport *t, Peer *p, size_t *budget) {
-  FrameHeader h;
-  int rc = frame_header(t, p->in, p->have, &h);
+static int read_frame(PeakMpiCausalTransport *t, Peer *p, size_t *budget,
+                      FrameHeader *h) {
+  int rc = frame_header(t, p->in, p->have, h);
   if (rc < 0) return -1;
-  if (rc) { p->need = h.bytes + h.length; if (p->have >= p->need) return 1; }
+  if (rc) { p->need = h->bytes + h->length; if (p->have >= p->need) return 1; }
   if (!*budget) return 0;
   size_t k = t->cap - p->have;
   if (k > *budget) k = *budget;
@@ -745,9 +745,9 @@ static int read_frame(PeakMpiCausalTransport *t, Peer *p, size_t *budget) {
   if (z > 0) {
     p->have += (size_t)z; *budget -= (size_t)z;
     t->stats.received_bytes += (uint64_t)z;
-    rc = frame_header(t, p->in, p->have, &h);
+    rc = frame_header(t, p->in, p->have, h);
     if (rc < 0) return -1;
-    if (rc) { p->need = h.bytes + h.length; return p->have >= p->need; }
+    if (rc) { p->need = h->bytes + h->length; return p->have >= p->need; }
     return 0;
   }
   if (z < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
@@ -998,6 +998,11 @@ static void prepare_control(PeakMpiCausalTransport *t, Peer *p, double now) {
     }
   }
   if (!p->out_n && p->ready && t->sink.feedback) {
+    uint64_t generation;
+    if (t->sink.feedback_generation &&
+        (!t->sink.feedback_generation(t->sink.context, p->rank, &generation) ||
+         (p->feedback_sent && p->feedback_generation == generation)))
+      return;
     PeakMpiPolicyFeedback f;
     if (t->sink.feedback(t->sink.context, p->rank, now, &f) &&
         (!p->feedback_sent || p->feedback_generation != f.generation)) {
@@ -1108,7 +1113,8 @@ static void owner_tick(PeakMpiCausalTransport *t, double now, size_t *budget) {
     /* A zero result can also mean a header/partial-frame read made progress.
      * Only a turn that consumed no bytes is idle. */
     size_t before_read = *budget;
-    rc = read_frame(t, p, budget);
+    FrameHeader h;
+    rc = read_frame(t, p, budget, &h);
     read_idle = !rc && before_read == *budget;
     if (read_idle) p->quiet = 1;
     if (rc < 0) {
@@ -1116,8 +1122,6 @@ static void owner_tick(PeakMpiCausalTransport *t, double now, size_t *budget) {
       continue;
     }
     if (rc) {
-      FrameHeader h;
-      if (frame_header(t, p->in, p->have, &h) != 1) { close_peer(p); continue; }
       type = h.type; n = h.length; rank = h.rank; job = h.job;
       inc = h.incarnation; seq = h.sequence; q = p->in + h.bytes;
       if (rank >= t->c.world_size || rank == t->c.owner_rank ||
@@ -1264,7 +1268,8 @@ static void client_tick(PeakMpiCausalTransport *t, double now, size_t *budget) {
        frames < SEND_BATCH_FRAMES && reads < 2 * SEND_BATCH_FRAMES && *budget;
        ++reads) {
     size_t before = *budget;
-    rc = read_frame(t, p, budget);
+    FrameHeader h;
+    rc = read_frame(t, p, budget, &h);
     if (rc < 0) {
       close_peer(p);
       return;
@@ -1274,8 +1279,6 @@ static void client_tick(PeakMpiCausalTransport *t, double now, size_t *budget) {
         break;
       continue;
     }
-    FrameHeader h;
-    if (frame_header(t, p->in, p->have, &h) != 1) { close_peer(p); return; }
     q = p->in + h.bytes;
     type = h.type; n = h.length; inc = h.incarnation; seq = h.sequence;
     rank = h.rank;

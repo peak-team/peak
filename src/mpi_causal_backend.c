@@ -3476,20 +3476,30 @@ static int sink_raw(void *s, unsigned r, const PeakMpiCausalRaw *raw,
                     double now) {
   return peak_mpi_causal_service_ingest_raw(s, r, raw, now);
 }
-static int sink_feedback(void *v, unsigned rank, double now,
-                         PeakMpiPolicyFeedback *out) {
+static int sink_feedback_generation(void *v, unsigned rank, uint64_t *out) {
   PeakMpiCausalService *s = v;
   if (rank >= s->config.world_size || !s->feedback_valid ||
       !s->feedback_valid[rank])
     return 0;
+  *out = s->feedback_cache[rank].generation;
+  if (s->recovery.state)
+    *out += s->recovery.epoch * 4 + s->recovery.state;
+  return 1;
+}
+static int sink_feedback(void *v, unsigned rank, double now,
+                         PeakMpiPolicyFeedback *out) {
+  PeakMpiCausalService *s = v;
+  uint64_t generation;
+  if (!sink_feedback_generation(v, rank, &generation))
+    return 0;
   *out = s->feedback_cache[rank];
+  out->generation = generation;
   if (s->recovery.state) {
     out->recovery = s->recovery;
     if (out->recovery.state == PEAK_MPI_RECOVERY_ACK &&
         s->ranks[rank].feedback_epoch != s->recovery.epoch)
       out->recovery.state = PEAK_MPI_RECOVERY_QUERY;
     out->recovery.comm = recovery_local_comm(s, rank);
-    out->generation += s->recovery.epoch * 4 + s->recovery.state;
   }
   out->recovery.loss = s->recovery_loss_total;
   out->recovery.fault_mask =
@@ -3636,7 +3646,8 @@ peak_mpi_causal_service_create(const PeakMpiCausalServiceConfig *c) {
                                      .feedback = sink_feedback,
                                      .fault = sink_fault,
                                      .context = s,
-                                     .request_nonce = sink_nonce};
+                                     .request_nonce = sink_nonce,
+                                     .feedback_generation = sink_feedback_generation};
   s->transport = peak_mpi_causal_transport_create(c, &sink);
   if (!s->transport)
     goto fail;

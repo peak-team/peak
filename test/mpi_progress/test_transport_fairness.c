@@ -393,7 +393,140 @@ static void test_owner_round_batches(void) {
   fresh_client = NULL;
 }
 
+static struct {
+  uint64_t generation;
+  unsigned remote_copies, local_copies, records;
+  int available, change_on_raw;
+} feedback_probe;
+static int probe_feedback(void *p, unsigned rank, double now,
+                          PeakMpiPolicyFeedback *f) {
+  (void)p;
+  if (!feedback_probe.available) return 0;
+  if (rank) ++feedback_probe.remote_copies;
+  else ++feedback_probe.local_copies;
+  memset(f, 0, sizeof *f);
+  f->generation = feedback_probe.generation;
+  f->member.process = rank;
+  f->member.incarnation = 100 + rank;
+  f->cohort = (PeakMpiPolicyCohortKey){124, 0, 1};
+  f->mode = PEAK_MPI_POLICY_COARSE;
+  f->member_count = 2;
+  f->g = 2;
+  f->q = .1;
+  f->age_seconds = now;
+  f->recovery.epoch = feedback_probe.generation;
+  f->recovery.state = PEAK_MPI_RECOVERY_QUERY;
+  return 1;
+}
+static int probe_feedback_generation(void *p, unsigned rank, uint64_t *out) {
+  (void)p; (void)rank;
+  if (!feedback_probe.available) return 0;
+  *out = feedback_probe.generation;
+  return 1;
+}
+static int probe_raw(void *p, unsigned rank, const PeakMpiCausalRaw *r,
+                     double now) {
+  (void)p; (void)rank; (void)r; (void)now;
+  if (feedback_probe.change_on_raw) {
+    ++feedback_probe.generation;
+    feedback_probe.change_on_raw = 0;
+  }
+  return 1;
+}
+static int probe_record(void *p, unsigned rank, const PeakMpiObserverRecord *r) {
+  (void)p; (void)r;
+  assert(rank == 1);
+  ++feedback_probe.records;
+  return 1;
+}
+static uint64_t probe_nonce(void *p, unsigned rank) {
+  (void)p; (void)rank;
+  return 9;
+}
+static void test_feedback_materialization(int use_peek) {
+  memset(&feedback_probe, 0, sizeof feedback_probe);
+  PeakMpiCausalServiceConfig c = {0};
+  c.world_size = 2; c.owner_rank = 0; c.job_context = 124;
+  c.address = "127.0.0.1"; c.port = 23673; c.slots = 1; c.queue_frames = 64;
+  PeakMpiCausalTransportSink sink = {.feedback = probe_feedback,
+      .raw = probe_raw, .record = probe_record, .request_nonce = probe_nonce,
+      .feedback_generation = use_peek ? probe_feedback_generation : NULL};
+  PeakMpiCausalTransport *t[2];
+  for (unsigned rank = 0; rank < 2; ++rank) {
+    c.rank = rank; c.incarnation = 100 + rank;
+    t[rank] = peak_mpi_causal_transport_create(&c, &sink);
+    assert(t[rank]);
+  }
+  unsigned char members[2] = {1, 1};
+  uint64_t prefixes[2] = {0};
+  PeakMpiCausalRaw raw[2] = {0};
+  for (unsigned rank = 0; rank < 2; ++rank) {
+    raw[rank].active = raw[rank].generation = 1;
+    raw[rank].incarnation = 100 + rank;
+    raw[rank].known_peers = members; raw[rank].peer_count = 2;
+    raw[rank].slot_prefixes = &prefixes[rank]; raw[rank].slot_count = 1;
+  }
+  for (unsigned tries = 0; tries < 1000; ++tries) {
+    peak_mpi_causal_transport_tick(t[0], NULL, &raw[0], 1, 65536);
+    peak_mpi_causal_transport_tick(t[1], NULL, &raw[1], 1, 65536);
+    if ((t[0]->peers[0].ready || t[0]->peers[1].ready) && t[1]->peers[0].ready) break;
+    const struct timespec pause = {0, 1000000};
+    nanosleep(&pause, NULL);
+  }
+  assert((t[0]->peers[0].ready || t[0]->peers[1].ready) && t[1]->peers[0].ready);
+  Peer *peer = t[0]->peers[0].ready ? &t[0]->peers[0] : &t[0]->peers[1];
+  assert(!peer->feedback_sent && !t[1]->have_feedback &&
+         !feedback_probe.remote_copies);
+  feedback_probe.available = 1;
+  for (unsigned i = 0; i < 32; ++i) {
+    PeakMpiObserverRecord r = {0};
+    r.incarnation = 101; r.thread_uid = r.thread_generation = 1;
+    r.sequence = r.op_uid = i + 1; r.kind = PEAK_MPI_OBSERVER_EVENT_START;
+    r.operation = PEAK_MPI_CAUSAL_SEND; r.phase = PEAK_MPI_CAUSAL_CALL_BEGIN;
+    assert(enqueue(t[1], RECORD, &r));
+  }
+  peak_mpi_causal_transport_tick(t[1], NULL, NULL, 2, 65536);
+  peak_mpi_causal_transport_tick(t[0], NULL, NULL, 2, 65536);
+  peak_mpi_causal_transport_tick(t[1], NULL, NULL, 2, 65536);
+  PeakMpiPolicyFeedback f;
+  assert(feedback_probe.records == 32 && !t[1]->count);
+  assert(t[1]->requested_nonce == 9 &&
+         peak_mpi_causal_transport_feedback(t[1], &f) && f.generation == 0);
+  for (unsigned tick = 0; tick < 3; ++tick)
+    peak_mpi_causal_transport_tick(t[0], NULL, NULL, 3 + tick, 65536);
+  fprintf(stderr, "stable feedback peek=%d generation0 records=%u remote_copies=%u "
+          "owner_local_copies=%u\n", use_peek, feedback_probe.records,
+          feedback_probe.remote_copies, feedback_probe.local_copies);
+  assert(feedback_probe.local_copies == 4);
+  assert(use_peek ? feedback_probe.remote_copies == 1
+                  : feedback_probe.remote_copies > 1);
+  feedback_probe.change_on_raw = 1;
+  ++raw[1].generation;
+  peak_mpi_causal_transport_tick(t[1], NULL, &raw[1], 6, 65536);
+  peak_mpi_causal_transport_tick(t[0], NULL, NULL, 6, 65536);
+  peak_mpi_causal_transport_tick(t[1], NULL, NULL, 6, 65536);
+  assert(peak_mpi_causal_transport_feedback(t[1], &f) && f.generation == 1 &&
+         f.recovery.epoch == 1 && !feedback_probe.change_on_raw);
+  assert(!use_peek || feedback_probe.remote_copies == 2);
+  unsigned copies = feedback_probe.remote_copies;
+  feedback_probe.available = 0;
+  feedback_probe.generation = 2;
+  peak_mpi_causal_transport_tick(t[0], NULL, NULL, 7, 65536);
+  assert(peer->feedback_sent && peer->feedback_generation == 1 &&
+         feedback_probe.remote_copies == copies);
+  feedback_probe.available = 1;
+  peak_mpi_causal_transport_tick(t[0], NULL, NULL, 8, 65536);
+  peak_mpi_causal_transport_tick(t[1], NULL, NULL, 8, 65536);
+  assert(peak_mpi_causal_transport_feedback(t[1], &f) && f.generation == 2 &&
+         f.recovery.epoch == 2);
+  assert(!use_peek || feedback_probe.remote_copies == 3);
+  for (unsigned rank = 0; rank < 2; ++rank)
+    peak_mpi_causal_transport_destroy(t[rank]);
+}
+
 int main(int argc, char **argv) {
+  test_feedback_materialization(0);
+  test_feedback_materialization(1);
   size_t budget = argc > 1 ? (size_t)strtoul(argv[1], NULL, 10) : 256;
   PeakMpiCausalServiceConfig c = {0};
   c.world_size = 2;
