@@ -1591,14 +1591,14 @@ static int ordered_caller(PeakMpiCausalService *s, const Operation *o) {
   const Rank *r = &s->ranks[o->rank];
   return !s->approximate && !r->coarse && o->ended && o->completed &&
          (o->begin.flags & PEAK_MPI_CAUSAL_ORDERED_CALLER) &&
-         (!(o->begin.flags & PEAK_MPI_CAUSAL_NONBLOCKING) ||
+         (!(o->begin.flags & PEAK_MPI_CAUSAL_NONBLOCKING) || o->immediate ||
           o->ordered_completion_sequence) &&
          !(o->end.flags & PEAK_MPI_OBSERVER_CANCELLED) && !o->end.mpi_error &&
          r->mpi_thread == o->begin.thread_uid &&
          r->mpi_thread_generation == o->begin.thread_generation &&
          o->begin.thread_uid && o->begin.thread_uid <= s->config.slots &&
          r->processed[o->begin.thread_uid - 1] >=
-             ((o->begin.flags & PEAK_MPI_CAUSAL_NONBLOCKING)
+             ((o->begin.flags & PEAK_MPI_CAUSAL_NONBLOCKING) && !o->immediate
                   ? o->ordered_completion_sequence
                   : o->end.sequence);
 }

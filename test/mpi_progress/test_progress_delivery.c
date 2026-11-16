@@ -1985,6 +1985,84 @@ static void test_recovery_interrupted_operation_gc(void) {
   puts("recovery safely takes over yielded operation GC with freed and duplicate retained slots PASS");
 }
 
+static void test_immediate_ordered_send(void) {
+  for (unsigned immediate = 0; immediate < 2; ++immediate) {
+    RecoveryGroups c = {0};
+    c.service = make();
+    c.next_uid = 1000;
+    c.peers[0] = c.peers[1] = 1;
+    for (unsigned rank = 0; rank < 2; ++rank) {
+      c.A[rank] = 100000000 * (rank + 1);
+      c.raw[rank].incarnation = 100 + rank;
+      c.raw[rank].P = .02;
+      c.raw[rank].active = 1;
+      c.raw[rank].contract_profile = PEAK_MPI_PROGRESS_INTEL_2021_11_OPX_ASYNC0_APPROX;
+      c.raw[rank].slot_prefixes = c.prefix[rank];
+      c.raw[rank].slot_count = 2;
+      c.raw[rank].known_peers = c.peers;
+      c.raw[rank].peer_count = 2;
+      recovery_raw(&c, rank, 1);
+    }
+    uint64_t uids[2];
+    for (unsigned rank = 0; rank < 2; ++rank) {
+      PeakMpiObserverRecord records[4];
+      uids[rank] = recovery_group(&c, rank, 0, 0, 1,
+          rank ? 0 : PEAK_MPI_CAUSAL_NONBLOCKING, records);
+      for (unsigned i = 0; i < 4; ++i) {
+        records[i].capability_uid = PEAK_MPI_PROGRESS_INTEL_2021_11_OPX_ASYNC0_APPROX;
+        records[i].progress_scope = PEAK_MPI_OBSERVER_SCOPE_INTERVAL;
+        records[i].flags |= PEAK_MPI_OBSERVER_PROGRESS_ESTIMATED;
+        records[i].flags &= ~PEAK_MPI_OBSERVER_PROGRESS_SEALED;
+        if (i == 1 || i == 2) {
+          records[i].flags &= ~PEAK_MPI_CAUSAL_COLLECTIVE;
+          records[i].operation = rank ? PEAK_MPI_CAUSAL_RECV : PEAK_MPI_CAUSAL_SEND;
+          records[i].peer = records[i].actual_source = 1 - rank;
+          records[i].tag = records[i].actual_tag = 13;
+        }
+        if (!rank && immediate && i == 2)
+          records[i].flags |= PEAK_MPI_CAUSAL_INACTIVE_REQUEST;
+        assert(peak_mpi_causal_service_ingest_record(c.service, rank, &records[i]));
+      }
+    }
+    /* No new RAW/nonce replies: an immediate request needs only its return
+     * sequence as completion evidence, without closing its progress interval. */
+    recovery_drain(&c, 8, 0, 16384);
+    Operation *send = find_op(c.service, 0, uids[0]);
+    Operation *recv = find_op(c.service, 1, uids[1]);
+    assert(send && recv && !c.service->hard_fault && !c.service->approximate);
+    assert(!send->ordered_completion_sequence &&
+           !c.service->ranks[0].verified_nonce && !c.service->ranks[1].verified_nonce);
+    if (immediate) {
+      double A, P, D;
+      assert(send->immediate && send->completed && send->retired &&
+             send->send_matched && recv->matched && send->sealed && recv->sealed);
+      assert(!c.service->ranks[0].requested_nonce && !c.service->ranks[1].requested_nonce);
+      /* Preserve the standard-send reverse dependency: the later peer's
+       * entry affects the send output even though initiation completed. */
+      assert(peak_mpi_cost_model_delay(c.service->model, send->exit, &D) ==
+             PEAK_MPI_COST_OK && fabs(D - .2) < 1e-12);
+      assert(peak_mpi_cost_model_delay(c.service->model, recv->exit, &D) ==
+             PEAK_MPI_COST_OK && fabs(D - .2) < 1e-12);
+      for (unsigned rank = 0; rank < 2; ++rank)
+        assert(peak_mpi_cost_model_accounted(c.service->model, rank, &A, &P) ==
+               PEAK_MPI_COST_OK && fabs(A - .1 * (rank + 1)) < 1e-12 &&
+               fabs(P - .02) < 1e-12);
+      for (unsigned rank = 0; rank < 2; ++rank)
+        recovery_group(&c, rank, 0, 1, 1, 0, NULL);
+      recovery_drain(&c, 8, 0, 16384);
+      assert(!find_op(c.service, 0, uids[0]) &&
+             !find_op(c.service, 1, uids[1]) && c.service->operation_count == 2 &&
+             !c.service->hard_fault);
+    } else {
+      assert(!send->immediate && !send->completed && !recv->matched &&
+             c.service->ranks[0].requested_nonce && c.service->ranks[1].requested_nonce);
+    }
+    peak_mpi_causal_service_destroy(c.service);
+  }
+  puts("immediate ordered send uses return completion; open request still waits; "
+       "reverse dependency, lifetime and original costs preserved PASS");
+}
+
 static void test_model_cpu_continuation(void) {
   const unsigned budgets[] = {16, 64, 66, 256};
   int saw_model_only = 0, saw_root_only = 0;
@@ -2073,6 +2151,7 @@ static void test_model_cpu_continuation(void) {
 int main(void) {
   test_recovery_interrupted_operation_gc();
   test_model_cpu_continuation();
+  test_immediate_ordered_send();
   test_stale_recovery_scale();
   test_observation_metadata_retirement();
   test_retained_send_inputs();
