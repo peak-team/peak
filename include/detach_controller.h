@@ -103,6 +103,9 @@ gboolean peak_detach_controller_current_mutation_uses_physical_patch(void);
 
 double peak_detach_controller_last_stop_window_us(void);
 
+/* Independently monotone cost component; no whole accounting tuple is implied. */
+unsigned long long peak_detach_controller_stop_window_wall_ns(void);
+
 gboolean peak_detach_controller_accounting_snapshot(
     PeakDetachAccountingSnapshot* out);
 

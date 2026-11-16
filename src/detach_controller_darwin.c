@@ -831,6 +831,13 @@ peak_detach_controller_last_stop_window_us(void)
     return value;
 }
 
+unsigned long long
+peak_detach_controller_stop_window_wall_ns(void)
+{
+    return atomic_load_explicit(&peak_darwin_window_wall_ns,
+                                memory_order_seq_cst);
+}
+
 gboolean
 peak_detach_controller_accounting_snapshot(PeakDetachAccountingSnapshot* out)
 {

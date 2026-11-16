@@ -2,6 +2,8 @@
 #include "detach_controller.h"
 #include "internal/general_listener_internal.h"
 #include "pthread_listener.h"
+#include "internal/mpi_causal_runtime.h"
+#include <math.h>
 
 #include <errno.h>
 #include <limits.h>
@@ -660,6 +662,64 @@ run_final_freeze_after_controller_stop(void)
 }
 
 static int
+run_mpi_control_cost_publication(void)
+{
+#ifndef HAVE_MPI
+    return 77;
+#else
+    char log_template[] = "/tmp/peak_public_listener_shutdown_log_XXXXXX";
+    PeakMpiCausalCostSnapshot before, current;
+    PeakDetachAccountingSnapshot accounting;
+    if (setup_public_listener_fixture(log_template, sizeof(log_template),
+                                      "success-zero") != 0)
+        return EXIT_FAILURE;
+    peak_mpi_causal_runtime_cost_now(&current);
+    check_true("MPI calibration before runtime has zero control",
+               current.control == 0 && current.control_generation == 0);
+    peak_general_listener_note_runtime_start(peak_second());
+    peak_detach_controller_test_accounting_begin_publish();
+    peak_detach_controller_test_accounting_update_tuple(7000000, TRUE);
+    peak_detach_controller_test_accounting_end_publish();
+    peak_mpi_causal_runtime_cost_now(&before);
+    check_true("MPI cost reads completed control", fabs(before.control - .007) < 1e-12);
+    peak_detach_controller_test_accounting_begin_publish();
+    check_true("tuple snapshot unavailable while publisher is active",
+               !peak_detach_controller_accounting_snapshot(&accounting));
+    peak_mpi_causal_runtime_cost_now(&current);
+    check_true("MPI control never falls back to old heartbeat cache",
+               current.control == before.control);
+    peak_detach_controller_test_accounting_update_tuple(3000000, FALSE);
+    peak_mpi_causal_runtime_cost_now(&current);
+    check_true("MPI sees cumulative cost independently of tuple publication",
+               fabs(current.control - .010) < 1e-12 && current.control_generation == 10000000);
+    peak_detach_controller_test_accounting_end_publish();
+    peak_mpi_causal_runtime_cost_now(&before);
+    peak_detach_controller_test_accounting_begin_publish();
+    peak_detach_controller_test_accounting_update_tuple(0, TRUE);
+    peak_detach_controller_test_accounting_end_publish();
+    peak_mpi_causal_runtime_cost_now(&current);
+    check_true("zero ns action preserves cost change tag",
+               current.control == before.control && current.control_generation == before.control_generation);
+    /* A new lifecycle initializes its baseline while tuple publication is odd;
+     * this does not model restarting an active profiling epoch. */
+    peak_detach_controller_test_accounting_begin_publish();
+    peak_general_listener_note_runtime_start(peak_second());
+    peak_mpi_causal_runtime_cost_now(&current);
+    check_true("MPI baseline valid despite concurrent tuple publication",
+               current.control == 0 && current.control_generation == 0);
+    peak_detach_controller_test_accounting_update_tuple(5000000, TRUE);
+    peak_mpi_causal_runtime_cost_now(&current);
+    check_true("MPI baseline excludes pre-runtime cumulative cost",
+               fabs(current.control - .005) < 1e-12 && current.control_generation == 5000000);
+    peak_detach_controller_test_accounting_end_publish();
+    if (finish_public_listener_fixture(log_template) != 0)
+        return EXIT_FAILURE;
+    fprintf(stderr, "general-listener-mpi-control-cost-publication-ok\n");
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+#endif
+}
+
+static int
 run_invalid_accounting_baseline_report(void)
 {
     char log_template[] = "/tmp/peak_public_listener_baseline_log_XXXXXX";
@@ -1046,6 +1106,8 @@ main(int argc, char** argv)
     if (strcmp(argv[1], "general-listener-final-freeze-after-controller-stop") == 0) {
         return run_final_freeze_after_controller_stop();
     }
+    if (strcmp(argv[1], "general-listener-mpi-control-cost-publication") == 0)
+        return run_mpi_control_cost_publication();
     if (strcmp(argv[1], "general-listener-invalid-accounting-baseline-report") == 0) {
         return run_invalid_accounting_baseline_report();
     }

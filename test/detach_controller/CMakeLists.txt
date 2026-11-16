@@ -565,6 +565,14 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
       PASS_REGULAR_EXPRESSION "general-listener-final-freeze-after-controller-stop-ok"
       SKIP_RETURN_CODE 77)
 
+  add_test(NAME test_detach_controller_mpi_control_cost_publication
+    COMMAND test_detach_listener_shutdown general-listener-mpi-control-cost-publication)
+  set_tests_properties(test_detach_controller_mpi_control_cost_publication
+    PROPERTIES
+      ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>"
+      PASS_REGULAR_EXPRESSION "general-listener-mpi-control-cost-publication-ok"
+      SKIP_RETURN_CODE 77)
+
   add_test(NAME test_detach_controller_general_listener_invalid_accounting_baseline_report
     COMMAND test_detach_listener_shutdown general-listener-invalid-accounting-baseline-report)
   set_tests_properties(test_detach_controller_general_listener_invalid_accounting_baseline_report

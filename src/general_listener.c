@@ -346,6 +346,10 @@ peak_general_listener_try_hook_sample_cache_unlocked(
     gulong* calls_out,
     double* profile_seconds_out);
 static _Atomic unsigned long long peak_general_listener_runtime_start_ns = 0;
+#ifdef HAVE_MPI
+static _Atomic unsigned long long peak_mpi_control_baseline_ns = 0;
+static _Atomic gboolean peak_mpi_control_baseline_ready = FALSE;
+#endif
 static _Atomic unsigned long long
     peak_general_listener_heartbeat_control_baseline_ns = 0;
 static _Atomic unsigned long long
@@ -1055,6 +1059,12 @@ peak_general_listener_note_runtime_start(double start_time)
 
     peak_general_listener_reset_final_report_snapshot();
     (void)peak_hook_coverage_start(peak_hook_coverage_metrics, start_time);
+#ifdef HAVE_MPI
+    atomic_store_explicit(&peak_mpi_control_baseline_ready, FALSE,
+                          memory_order_release);
+    unsigned long long mpi_baseline =
+        peak_detach_controller_stop_window_wall_ns();
+#endif
     baseline_valid =
         peak_general_listener_accounting_snapshot(&accounting_baseline);
     atomic_store_explicit(&peak_general_listener_runtime_start_ns,
@@ -1080,6 +1090,12 @@ peak_general_listener_note_runtime_start(double start_time)
         &peak_general_listener_heartbeat_management_cpu_ns,
         0,
         memory_order_relaxed);
+#ifdef HAVE_MPI
+    atomic_store_explicit(&peak_mpi_control_baseline_ns, mpi_baseline,
+                          memory_order_relaxed);
+    atomic_store_explicit(&peak_mpi_control_baseline_ready, TRUE,
+                          memory_order_release);
+#endif
 }
 
 static void
@@ -9582,14 +9598,16 @@ void
 peak_mpi_causal_listener_actual_costs(double* control, double* management,
                                      uint64_t* generation)
 {
-    PeakDetachAccountingSnapshot accounting;
-    if (peak_general_listener_runtime_accounting_snapshot(&accounting)) {
-        *control = (double)
-            peak_general_listener_control_wall_ns_since_heartbeat(&accounting) /
-            1e9;
-        *generation = accounting.completed_stop_window_count +
-                      accounting.failed_stop_window_count;
+    unsigned long long cost_ns = 0;
+    if (atomic_load_explicit(&peak_mpi_control_baseline_ready,
+                             memory_order_acquire)) {
+        unsigned long long baseline = atomic_load_explicit(
+            &peak_mpi_control_baseline_ns, memory_order_relaxed);
+        cost_ns = peak_detach_controller_stop_window_wall_ns() - baseline;
     }
+    *control = (double)cost_ns / 1e9;
+    /* MPI tags cost changes; controller action counts retain their own API. */
+    *generation = cost_ns;
     *management = peak_general_listener_management_cpu_seconds();
 }
 #endif
