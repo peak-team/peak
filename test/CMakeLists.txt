@@ -1311,11 +1311,9 @@ if(BUILD_TESTING)
                 FAIL_REGULAR_EXPRESSION "not proven safe|leaving listener state alive|fatal|tracked thread snapshot exceeded|thread id .* exceeds|detach helper shutdown failed|timed out draining pending target hook detach/reattach requests|Gum [^\\r\\n]* failed"
                 TIMEOUT 45)
 
-        # This is a physical-transition coverage test. With the lock-free
-        # callback, issue a lock-free futex wake at the first threshold
-        # crossing so transient-thread churn cannot turn scheduling delay into
-        # millions of extra pre-detach samples. The callback benchmark below
-        # independently enforces steady-state overhead and scaling.
+        # Force detach-count=1 to exercise physical handoff under thread churn.
+        # Keep budget headroom for the required reattach after calibrated
+        # profiling cost; callback benchmarks check overhead separately.
         add_test(NAME test_detach_hotloop_signal_wait_stress_strict
             COMMAND ${Python3_EXECUTABLE}
                     ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_detach_hotloop_trace_check.py
@@ -1325,8 +1323,9 @@ if(BUILD_TESTING)
                     --seconds 6
                     --samples 2
                     --timeout 90
-                    --overhead-ratio 0.10
-                    --global-overhead-ratio 0.10
+                    --overhead-ratio 0.50
+                    --global-overhead-ratio 0.50
+                    --global-reattach-factor 0.85
                     --detach-count 1
                     --trace-prefix ${PROJECT_BINARY_DIR}/test/detach_runtime/signal-wait-stress-trace
                     --require-reattach
