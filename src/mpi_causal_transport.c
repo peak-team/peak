@@ -903,11 +903,10 @@ void peak_mpi_causal_transport_destroy(PeakMpiCausalTransport *t) {
   free(t->incarnations);
   free(t);
 }
-static void capture(PeakMpiCausalTransport *t, PeakMpiObserver *o,
-                    size_t *budget, int local) {
-  size_t i, empty = 0;
+static size_t freeze_capture(PeakMpiCausalTransport *t, PeakMpiObserver *o) {
+  size_t i;
   if (!o || !t->c.slots)
-    return;
+    return 0;
   /* Freeze the published queue prefixes once. Producers may keep publishing,
    * but this heartbeat never follows beyond these bounded observations. */
   for (i = 0; i < t->c.slots; ++i) {
@@ -921,7 +920,13 @@ static void capture(PeakMpiCausalTransport *t, PeakMpiObserver *o,
    * creation does not consume a producer-ring record. Freeze producer heads
    * first: every definition referenced by this batch was published before
    * those heads, so it can be delivered before any dependent event. */
-  size_t object_limit = peak_mpi_observer_object_count(o);
+  return peak_mpi_observer_object_count(o);
+}
+static void capture(PeakMpiCausalTransport *t, PeakMpiObserver *o,
+                    size_t *budget, int local, size_t object_limit) {
+  size_t empty = 0;
+  if (!o || !t->c.slots)
+    return;
   if (!t->next_object_uid)
     t->next_object_uid = 1;
   while (t->next_object_uid <= object_limit) {
@@ -1433,9 +1438,9 @@ size_t peak_mpi_causal_transport_tick(PeakMpiCausalTransport *t,
            t->sink.raw(t->sink.context, t->c.rank, &t->raw, now)))
         t->raw_pending = 0;
   }
-  /* Keep a local-record quantum available without starving readable peers or
-   * control. Unused IO allowance is lent to the single frozen capture, then
-   * unused capture allowance returns to IO. The total allowance never grows. */
+  /* Make local room before incoming records can produce more local events.
+   * IO retains its reserved quantum; unused allowance is lent in either
+   * direction without extending the single frozen capture or total budget. */
   size_t local_budget = 0;
   if (raw->active && o) {
     if (budget >= 512)
@@ -1446,12 +1451,17 @@ size_t peak_mpi_causal_transport_tick(PeakMpiCausalTransport *t,
     }
   }
   size_t io_budget = budget - local_budget;
-  transport_io(t, raw, now, &io_budget);
-  local_budget += io_budget;
+  size_t object_limit = 0;
   if (raw->active && o) {
-    capture(t, o, &local_budget, owner);
-    if (local_budget)
-      transport_io(t, raw, now, &local_budget);
+    object_limit = freeze_capture(t, o);
+    capture(t, o, &local_budget, owner, object_limit);
+  }
+  io_budget += local_budget;
+  transport_io(t, raw, now, &io_budget);
+  if (raw->active && o) {
+    capture(t, o, &io_budget, owner, object_limit);
+    if (io_budget)
+      transport_io(t, raw, now, &io_budget);
   }
   if (owner) {
     if (raw->active && t->sink.feedback &&
@@ -1463,7 +1473,7 @@ size_t peak_mpi_causal_transport_tick(PeakMpiCausalTransport *t,
   t->stats.pending_records = t->count + (size_t)t->held;
   t->stats.listening = t->listener >= 0;
   t->stats.connected = owner ? t->stats.listening : t->peers[0].ready;
-  return local_budget;
+  return io_budget;
 }
 const PeakMpiCausalRaw *peak_mpi_causal_transport_observation(const PeakMpiCausalTransport *t) {
   return t && t->raw_seen ? &t->raw : NULL;

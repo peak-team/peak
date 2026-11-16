@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include <sys/socket.h>
+#include <poll.h>
 static ssize_t counted_recv(int, void *, size_t, int);
 #define recv counted_recv
 #include "../../src/mpi_causal_transport.c"
@@ -524,7 +525,124 @@ static void test_feedback_materialization(int use_peek) {
     peak_mpi_causal_transport_destroy(t[rank]);
 }
 
+static PeakMpiObserver *pressure_source;
+static PeakMpiObserverProducer pressure_writer;
+static unsigned pressure_remote, pressure_local, pressure_lost_at, pressure_objects;
+static PeakMpiObserverSlotState pressure_at_loss;
+static int pressure_object(void *context, unsigned rank, uint64_t incarnation,
+                            const PeakMpiObserverObject *object) {
+  (void)context;
+  (void)incarnation;
+  (void)object;
+  assert(rank == 0);
+  ++pressure_objects;
+  return 1;
+}
+static int pressure_record(void *context, unsigned rank,
+                            const PeakMpiObserverRecord *record) {
+  (void)context;
+  (void)record;
+  if (!rank) {
+    ++pressure_local;
+    return 1;
+  }
+  assert(rank == 1);
+  if (++pressure_remote == 2) {
+    PeakMpiObserverObject object = {.kind = PEAK_MPI_CAUSAL_OBJECT_COMM, .generation = 1};
+    uint64_t uid;
+    assert(!peak_mpi_observer_object_add(pressure_source, &object, &uid) && uid == 1);
+  }
+  if (pressure_remote % 2 == 0) {
+    PeakMpiObserverRecord event = {.kind = PEAK_MPI_OBSERVER_EVENT_START, .op_uid = 1};
+    int rc = peak_mpi_observer_emit(pressure_source, &pressure_writer, &event);
+    if (rc == PEAK_MPI_OBSERVER_OVERFLOW && !pressure_lost_at) {
+      pressure_lost_at = pressure_remote;
+      assert(peak_mpi_observer_slot_state(pressure_source, 0, &pressure_at_loss));
+    }
+  }
+  return 1;
+}
+static void test_local_capture_before_receive(void) {
+  PeakMpiCausalServiceConfig c = {0};
+  c.world_size = 2;
+  c.incarnation = 100;
+  c.job_context = 90;
+  c.address = "127.0.0.1";
+  c.port = 39889;
+  c.queue_frames = 256;
+  c.slots = 1;
+  PeakMpiCausalTransportSink sink = {.record = pressure_record, .object = pressure_object};
+  PeakMpiCausalTransport *owner = peak_mpi_causal_transport_create(&c, &sink);
+  c.rank = 1;
+  c.incarnation = 101;
+  PeakMpiCausalTransport *client = peak_mpi_causal_transport_create(&c, &sink);
+  assert(owner && client);
+  unsigned char members[2] = {1, 1};
+  uint64_t prefix = 0;
+  PeakMpiCausalRaw raw = {.incarnation = 100, .generation = 1, .active = 1,
+      .elapsed = 1, .known_peers = members, .peer_count = 2,
+      .slot_prefixes = &prefix, .slot_count = 1};
+  peak_mpi_causal_transport_tick(owner, NULL, &raw, 1, 65536);
+  raw.incarnation = 101;
+  for (unsigned i = 0; i < 32; ++i) {
+    peak_mpi_causal_transport_tick(client, NULL, &raw, 1, 65536);
+    peak_mpi_causal_transport_tick(owner, NULL, NULL, 1, 65536);
+  }
+  assert(client->peers[0].ready);
+  Peer *peer = NULL;
+  for (unsigned i = 0; i < owner->peer_n; ++i)
+    if (owner->peers[i].ready && owner->peers[i].rank == 1)
+      peer = &owner->peers[i];
+  assert(peer);
+  PeakMpiObserverConfig config = {1, 256, 1, 100};
+  pressure_source = peak_mpi_observer_create(&config);
+  assert(pressure_source);
+  peak_mpi_observer_activate(pressure_source);
+  assert(!peak_mpi_observer_claim(pressure_source, 0, 1, 1, &pressure_writer));
+  config.incarnation = 101;
+  PeakMpiObserver *remote = peak_mpi_observer_create(&config);
+  assert(remote);
+  peak_mpi_observer_activate(remote);
+  PeakMpiObserverProducer remote_writer;
+  assert(!peak_mpi_observer_claim(remote, 0, 1, 1, &remote_writer));
+  PeakMpiObserverRecord event = {.kind = PEAK_MPI_OBSERVER_EVENT_START, .op_uid = 1};
+  for (unsigned i = 0; i < 192; ++i)
+    assert(!peak_mpi_observer_emit(pressure_source, &pressure_writer, &event));
+  for (unsigned i = 0; i < 254; ++i)
+    assert(!peak_mpi_observer_emit(remote, &remote_writer, &event));
+  for (unsigned i = 0; i < 16 && client->send_index < 254; ++i)
+    peak_mpi_causal_transport_tick(client, remote, NULL, 1, 65536);
+  assert(client->count == 254 && client->send_index == 254);
+  struct pollfd readable = {peer->fd, POLLIN, 0};
+  assert(poll(&readable, 1, 1000) == 1 && (readable.revents & POLLIN));
+  /* Remote processing can overlap new producer records. Make local room first,
+   * then retain one frozen prefix even when IO publishes a new object/tail. */
+  size_t left = peak_mpi_causal_transport_tick(owner, pressure_source, NULL, 1, 65536);
+  PeakMpiObserverSlotState after;
+  assert(peak_mpi_observer_slot_state(pressure_source, 0, &after));
+  printf("local-first remote=%u local=%u first_loss_remote=%u loss_head=%llu "
+         "loss_tail=%llu after=%llu/%llu lost=%llu budget_left=%zu\n",
+      pressure_remote, pressure_local, pressure_lost_at,
+      (unsigned long long)pressure_at_loss.published,
+      (unsigned long long)pressure_at_loss.consumed,
+      (unsigned long long)after.published, (unsigned long long)after.consumed,
+      (unsigned long long)after.lost, left);
+  fflush(stdout);
+  assert(pressure_remote == 254 && !pressure_lost_at);
+  assert(!after.lost && after.published == 319 && after.consumed == 192 && left <= 65536);
+  assert(!pressure_objects);
+  peak_mpi_causal_transport_tick(owner, pressure_source, NULL, 1, 65536);
+  assert(peak_mpi_observer_slot_state(pressure_source, 0, &after));
+  assert(pressure_objects == 1 && pressure_local == 319 && after.consumed == 319);
+  peak_mpi_causal_transport_destroy(client);
+  peak_mpi_causal_transport_destroy(owner);
+  peak_mpi_observer_destroy(remote);
+  peak_mpi_observer_destroy(pressure_source);
+  puts("single frozen object prefix and callback-produced tail deferred to next turn PASS");
+}
+
 int main(int argc, char **argv) {
+  test_local_capture_before_receive();
   test_feedback_materialization(0);
   test_feedback_materialization(1);
   size_t budget = argc > 1 ? (size_t)strtoul(argv[1], NULL, 10) : 256;
