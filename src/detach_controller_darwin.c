@@ -991,6 +991,33 @@ peak_detach_controller_shutdown_helper(PeakDetachStatus* status_out)
     return idle;
 }
 
+static size_t
+peak_darwin_fatal_text(char* buffer, size_t used, size_t capacity,
+                       const char* text, size_t limit)
+{
+    if (text == NULL) text = "unknown";
+    for (size_t i = 0; used < capacity && i < limit && text[i] != '\0'; ++i)
+        buffer[used++] = text[i];
+    return used;
+}
+
+static size_t
+peak_darwin_fatal_hex(char* buffer, size_t used, size_t capacity,
+                      uintmax_t value)
+{
+    static const char hex[] = "0123456789abcdef";
+    char digits[2 * sizeof(value)];
+    size_t count = 0;
+    do {
+        digits[count++] = hex[value & 15u];
+        value >>= 4;
+    } while (value != 0);
+    used = peak_darwin_fatal_text(buffer, used, capacity, "0x", 2);
+    while (count != 0 && used < capacity)
+        buffer[used++] = digits[--count];
+    return used;
+}
+
 void
 peak_detach_controller_abort_after_failed_finish(const char* context,
                                                  PeakDetachStatus status)
@@ -998,9 +1025,33 @@ peak_detach_controller_abort_after_failed_finish(const char* context,
     static const char message[] =
         "[peak] fatal Darwin detach finish failure; terminating to avoid running with suspended threads\n";
 
-    (void)context;
-    (void)status;
     (void)write(STDERR_FILENO, message, sizeof(message) - 1);
+    /* The failure may leave threads suspended: only bounded stack formatting
+     * and write are safe here; do not enter logging or allocator machinery. */
+    char detail[384];
+    size_t used = 0;
+#define APPEND_TEXT(text, limit) \
+    used = peak_darwin_fatal_text(detail, used, sizeof(detail), text, limit)
+#define APPEND_HEX(value) \
+    used = peak_darwin_fatal_hex(detail, used, sizeof(detail), value)
+    APPEND_TEXT("[peak] Darwin detach finish detail context=", 48);
+    APPEND_TEXT(context, 96);
+    APPEND_TEXT(" status=", 8);
+    APPEND_TEXT(peak_detach_controller_status_string(status), 32);
+    APPEND_TEXT(" status_value=", 14);
+    APPEND_HEX((uintmax_t)(unsigned int)status);
+    APPEND_TEXT(" reason=", 8);
+    APPEND_TEXT(peak_darwin_failure.reason, 64);
+    APPEND_TEXT(" tid=", 5);
+    APPEND_HEX((uintmax_t)(unsigned long)peak_darwin_failure.tid);
+    APPEND_TEXT(" pc=", 4);
+    APPEND_HEX((uintmax_t)peak_darwin_failure.pc);
+    APPEND_TEXT(" aux=", 5);
+    APPEND_HEX((uintmax_t)peak_darwin_failure.aux);
+    APPEND_TEXT("\n", 1);
+#undef APPEND_HEX
+#undef APPEND_TEXT
+    (void)write(STDERR_FILENO, detail, used);
     _exit(128);
 }
 
