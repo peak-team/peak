@@ -2602,8 +2602,11 @@ static int publish_work(PeakMpiCausalService *s, size_t budget) {
         /* Policy atomically commits one coherent cohort tuple. Admit its O(n)
          * arithmetic only when this round has the matching work allowance. */
         size_t cut_work = 1 + 4 * s->pub_count;
-        if (cut_work > budget)
+        if (cut_work > budget) {
+          /* An unsuccessful admission does not advance the drain. */
+          --s->last_work_used;
           return 0;
+        }
         budget -= cut_work;
         s->last_work_used += cut_work;
         Rank *leader = &s->ranks[s->pub_root];
@@ -3870,7 +3873,8 @@ int peak_mpi_causal_service_runnable(const PeakMpiCausalService *s) {
            (s->recovery.state == PEAK_MPI_RECOVERY_NONE ||
             s->recovery.state == PEAK_MPI_RECOVERY_ACK) &&
            (peak_mpi_causal_batches_runnable(s->batches) ||
-            s->model_running || s->root_plan_stage)));
+            s->model_running || s->root_plan_stage || s->pub_stage ||
+            s->gc_stage)));
 }
 int peak_mpi_causal_service_feedback(const PeakMpiCausalService *s,
                                      PeakMpiPolicyFeedback *f) {

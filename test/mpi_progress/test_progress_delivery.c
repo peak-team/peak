@@ -1986,41 +1986,74 @@ static void test_recovery_interrupted_operation_gc(void) {
 }
 
 static void test_model_cpu_continuation(void) {
-  const unsigned budgets[] = {64, 66, 256};
+  const unsigned budgets[] = {16, 64, 66, 256};
   int saw_model_only = 0, saw_root_only = 0;
+  int saw_publish_any = 0, saw_gc_any = 0;
   for (size_t b = 0; b < sizeof budgets / sizeof budgets[0]; ++b) {
     RecoveryGroups c;
     recovery_groups_init(&c);
     for (unsigned k = 0; k < 6; ++k)
       for (unsigned rank = 0; rank < 2; ++rank)
         recovery_group(&c, rank, 0, k + 2, 1, 0, NULL);
-    int witnessed = 0;
+    int witnessed = 0, saw_publish = 0, saw_gc = 0, continuing = 0;
     unsigned turns = 0;
     for (; turns < 2000; ++turns) {
       size_t bytes = 65536, work = budgets[b];
       peak_mpi_causal_service_tick_budget(c.service, NULL, NULL, 2, &bytes, &work);
       assert(work <= budgets[b] && !c.service->hard_fault);
+      assert(!continuing || work < budgets[b]);
       if (!peak_mpi_causal_batches_runnable(c.service->batches) &&
-          (c.service->model_running || c.service->root_plan_stage)) {
+          (c.service->model_running || c.service->root_plan_stage ||
+           c.service->pub_stage || c.service->gc_stage)) {
         saw_model_only |= c.service->model_running && !c.service->root_plan_stage;
         saw_root_only |= !c.service->model_running && c.service->root_plan_stage;
+        saw_publish |= c.service->pub_stage != 0;
+        saw_gc |= c.service->gc_stage != 0;
         assert(peak_mpi_causal_service_runnable(c.service));
         witnessed = 1;
-        do {
-          bytes = 65536;
-          work = budgets[b];
-          peak_mpi_causal_service_tick_budget(c.service, NULL, NULL, 2,
-                                              &bytes, &work);
-          assert(work < budgets[b] && ++turns < 2000);
-        } while (c.service->model_running || c.service->root_plan_stage);
-        assert(!peak_mpi_causal_service_runnable(c.service));
-        break;
       }
+      continuing = peak_mpi_causal_service_runnable(c.service);
+      if (witnessed && !continuing)
+        break;
     }
-    assert(witnessed);
+    saw_publish_any |= saw_publish;
+    saw_gc_any |= saw_gc;
+    if (budgets[b] == 16) {
+      PeakMpiPolicyFeedback feedback;
+      assert(peak_mpi_causal_service_feedback(c.service, &feedback));
+      assert(feedback.event_cut == c.prefix[0][0]);
+    }
+    assert(witnessed && turns < 2000);
     peak_mpi_causal_service_destroy(c.service);
   }
-  assert(saw_model_only && saw_root_only);
+  assert(saw_model_only && saw_root_only && saw_publish_any && saw_gc_any);
+  /* An atomic cohort commit may exceed a configured tiny quota. Failed
+   * admission must not report work and cause immediate zero-progress retries. */
+  RecoveryGroups tiny;
+  recovery_groups_init(&tiny);
+  for (unsigned rank = 0; rank < 2; ++rank)
+    recovery_group(&tiny, rank, 0, 2, 1, 0, NULL);
+  unsigned tiny_turn;
+  for (tiny_turn = 0; tiny_turn < 2000; ++tiny_turn) {
+    size_t bytes = 65536, work = 8;
+    peak_mpi_causal_service_tick_budget(tiny.service, NULL, NULL, 2, &bytes, &work);
+    assert(work <= 8 && !tiny.service->hard_fault);
+    if (tiny.service->pub_stage == 4 && tiny.service->pub_complete &&
+        tiny.service->pub_count == 2)
+      break;
+  }
+  assert(tiny_turn < 2000);
+  PeakMpiPolicyFeedback before, after;
+  assert(peak_mpi_causal_service_feedback(tiny.service, &before));
+  for (unsigned retry = 0; retry < 3; ++retry) {
+    size_t bytes = 65536, work = 8;
+    peak_mpi_causal_service_tick_budget(tiny.service, NULL, NULL, 2, &bytes, &work);
+    assert(work == 8 && !tiny.service->last_tick_work &&
+           tiny.service->pub_stage == 4 && !tiny.service->hard_fault);
+    assert(peak_mpi_causal_service_feedback(tiny.service, &after));
+    assert(after.event_cut == before.event_cut);
+  }
+  peak_mpi_causal_service_destroy(tiny.service);
   /* An incomplete remote collective needs input, not repeated CPU service. */
   RecoveryGroups c;
   recovery_groups_init(&c);
@@ -2034,7 +2067,7 @@ static void test_model_cpu_continuation(void) {
          !c.service->root_plan_stage &&
          !peak_mpi_causal_service_runnable(c.service));
   peak_mpi_causal_service_destroy(c.service);
-  puts("YIELDED model and root-only CPU work resume within quota, clear readiness; remote dependency waits without spin PASS");
+  puts("YIELDED model, root, publish and GC work resume within quota; remote dependency waits without spin PASS");
 }
 
 int main(void) {
