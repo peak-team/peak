@@ -174,7 +174,6 @@ struct PeakMpiCausalService {
   Context *contexts;
   size_t context_count;
   PeakMpiPolicySample *samples;
-  unsigned char *peers;
   uint64_t epoch, generation, order, gc_generation;
   uint64_t recovery_loss_total;
   double now;
@@ -875,12 +874,11 @@ int peak_mpi_causal_service_ingest_raw(PeakMpiCausalService *s, unsigned r,
   }
   a->active |= raw->active;
   a->unknown |= raw->unknown_members;
-  if (raw->known_peers)
+  if (raw->known_peers &&
+      s->ranks[root(s, r)].cohort_size != s->config.world_size)
     for (size_t j = 0; j < raw->peer_count && j < s->config.world_size; j++)
-      if (raw->known_peers[j] && j != r) {
-        s->peers[(size_t)r * s->config.world_size + j] = 1;
+      if (raw->known_peers[j] && j != r)
         merge(s, r, (unsigned)j);
-      }
   raw_to_policy(s, r);
   if (raw->unknown_members)
     peak_mpi_policy_set_membership_known(s->ranks[root(s, r)].policy, 0, now);
@@ -3623,7 +3621,6 @@ peak_mpi_causal_service_create(const PeakMpiCausalServiceConfig *c) {
   s->feedback_captured = calloc(c->world_size, sizeof *s->feedback_captured);
   s->feedback_valid = calloc(c->world_size, sizeof *s->feedback_valid);
   s->cache_dirty = 1;
-  s->peers = calloc((size_t)c->world_size * c->world_size, 1);
   s->model = peak_mpi_cost_model_create(&c->model);
   s->matching = peak_mpi_causal_match_index_create(c->max_operations);
   s->batches = peak_mpi_causal_batches_create_with_slots(
@@ -3636,7 +3633,7 @@ peak_mpi_causal_service_create(const PeakMpiCausalServiceConfig *c) {
       !s->free_deps || !s->buffers || !s->buffer_index || !s->comms ||
       !s->comm_ranks || !s->members || !s->contexts || !s->samples ||
       !s->feedback_staging || !s->feedback_cache || !s->feedback_captured ||
-      !s->feedback_valid || !s->peers || !s->model || !s->batches ||
+      !s->feedback_valid || !s->model || !s->batches ||
       !s->matching)
     goto fail;
   for (unsigned r = 0; r < c->world_size; r++) {
@@ -3719,7 +3716,6 @@ void peak_mpi_causal_service_destroy(PeakMpiCausalService *s) {
   free(s->feedback_cache);
   free(s->feedback_captured);
   free(s->feedback_valid);
-  free(s->peers);
   free(s);
 }
 void peak_mpi_causal_service_tick_budget(PeakMpiCausalService *s,

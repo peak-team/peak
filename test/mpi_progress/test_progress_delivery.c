@@ -972,6 +972,41 @@ static PeakMpiCausalService *fault_make_partial(void) {
   assert(s);
   return s;
 }
+static void test_raw_cohort_membership(void) {
+  PeakMpiCausalService *s = fault_make_partial();
+  unsigned char peers[4] = {0, 1, 0, 0};
+  PeakMpiCausalRaw raw = {0};
+  raw.incarnation = 100; raw.generation = 1; raw.L = .1;
+  raw.P = .01; raw.elapsed = 1; raw.active = 1;
+  raw.known_peers = peers; raw.peer_count = 4;
+  assert(peak_mpi_causal_service_ingest_raw(s, 0, &raw, 1));
+  assert(root(s, 0) == root(s, 1) && root(s, 0) != root(s, 2) &&
+         s->ranks[root(s, 0)].cohort_size == 2);
+  uint64_t epoch = s->epoch;
+  raw.generation++;
+  assert(peak_mpi_causal_service_ingest_raw(s, 0, &raw, 1) && s->epoch == epoch);
+  peers[1] = 0; peers[3] = 1;
+  raw.incarnation = 102; raw.generation = 1;
+  assert(peak_mpi_causal_service_ingest_raw(s, 2, &raw, 1));
+  assert(root(s, 2) == root(s, 3) && root(s, 0) != root(s, 2));
+  peers[3] = 0; peers[2] = 1;
+  raw.incarnation = 101;
+  assert(peak_mpi_causal_service_ingest_raw(s, 1, &raw, 1));
+  unsigned cohort = root(s, 0);
+  assert(s->ranks[cohort].cohort_size == 4 && root(s, 3) == cohort);
+  epoch = s->epoch;
+  memset(peers, 1, sizeof peers);
+  raw.incarnation = 103; raw.L = .2; raw.P = .02; raw.elapsed = 2;
+  raw.unknown_members = 1;
+  raw.contract_profile = PEAK_MPI_PROGRESS_INTEL_2021_11_OPX_ASYNC0_APPROX;
+  assert(peak_mpi_causal_service_ingest_raw(s, 3, &raw, 2));
+  assert(s->epoch == epoch && s->ranks[cohort].cohort_size == 4 &&
+         s->ranks[3].L == .2 && s->ranks[3].P == .02 &&
+         s->ranks[3].elapsed == 2 && s->ranks[3].unknown &&
+         s->ranks[cohort].progress_estimate && !s->hard_fault);
+  peak_mpi_causal_service_destroy(s);
+  puts("RAW membership joins partial cohorts; full cohort preserves costs and uncertainty PASS");
+}
 static void fault_seed(PeakMpiCausalService *s, int joined) {
   assert(merge(s, 0, 1));
   if (!joined)
@@ -2562,6 +2597,7 @@ int main(void) {
   test_recovery_reset_runnable();
   test_fault_cache();
   test_input_backpressure();
+  test_raw_cohort_membership();
   test_compact_batches();
   test_compact_backend();
   test_delayed_receiver_pressure();
