@@ -10,7 +10,7 @@
 static PeakMpiObserver *observer;
 static PeakMpiObserverProducer writer;
 static uint64_t uid, cost;
-static _Atomic uint64_t lookup_work;
+static _Atomic uint64_t lookup_work, boundary_snapshots;
 static _Thread_local size_t test_slot;
 static pthread_mutex_t collected = PTHREAD_MUTEX_INITIALIZER;
 static pthread_barrier_t in_flight;
@@ -40,6 +40,7 @@ void peak_mpi_causal_runtime_observer_work(PeakMpiCausalWorkKind k, size_t n) {
     atomic_fetch_add(&lookup_work, n);
 }
 void peak_mpi_causal_runtime_boundary(PeakMpiObserverRecord *r) {
+  atomic_fetch_add_explicit(&boundary_snapshots, 1, memory_order_relaxed);
   r->P_cut = r->A_cut = r->L_cut = cost;
   r->flags |= PEAK_MPI_CAUSAL_APP_COST_KNOWN;
 }
@@ -730,6 +731,7 @@ int main(int argc, char **argv) {
       cost++;
       assert(MPI_Barrier(local) == MPI_SUCCESS);
     }
+    uint64_t before_local_boundaries = atomic_load(&boundary_snapshots);
     self_loop = 1;
     for (int i = 0; i < 600; ++i) {
       int sent = i + world_rank, received = -1;
@@ -807,6 +809,7 @@ int main(int argc, char **argv) {
            peak_mpi_observer_coarse_reason(observer) ==
                PEAK_MPI_OBSERVER_REASON_NONE &&
            !remote_active && !failures);
+    assert(atomic_load(&boundary_snapshots) == before_local_boundaries);
     if (!strcmp(argv[1], "singleton")) {
       MPI_Request persistent[4];
       int send = world_rank + 91, self_received = -1, remote_received = -1;

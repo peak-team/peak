@@ -612,14 +612,14 @@ static Context *begin_call(PeakMpiCausalOperation op, const Comm *comm,
     ++observed_open_buffered;
   c->detach_open_snapshot =
       op == PEAK_MPI_CAUSAL_BUFFER_DETACH ? observed_open_buffered : 0;
-  /* Only bounded local atomic reads under this short metadata lock. This
-   * orders cost-group cuts without claiming MPI order between threads. */
-  peak_mpi_causal_runtime_boundary(r);
-  r->flags |= PEAK_MPI_CAUSAL_CUT_PRECAPTURED;
   if (!c->capture_epoch) {
     pthread_mutex_unlock(&metadata);
     return c;
   }
+  /* Only bounded local atomic reads under this short metadata lock. This
+   * orders cost-group cuts without claiming MPI order between threads. */
+  peak_mpi_causal_runtime_boundary(r);
+  r->flags |= PEAK_MPI_CAUSAL_CUT_PRECAPTURED;
   if (group_capture_epoch != c->capture_epoch) {
     group_capture_epoch = c->capture_epoch;
     group_active = group_emitted = group_published = 0;
