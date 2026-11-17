@@ -5,7 +5,23 @@
 #ifndef PEAK_TEST_BACKEND_SOURCE
 #define PEAK_TEST_BACKEND_SOURCE "../../src/mpi_causal_backend.c"
 #endif
+#include "internal/mpi_causal_transport.h"
+static size_t test_transport_tick(PeakMpiCausalTransport *, PeakMpiObserver *,
+    const PeakMpiCausalRaw *, double, size_t);
+#define peak_mpi_causal_transport_tick test_transport_tick
 #include PEAK_TEST_BACKEND_SOURCE
+#undef peak_mpi_causal_transport_tick
+static void (*after_transport_capture)(PeakMpiObserver *);
+static size_t test_transport_tick(PeakMpiCausalTransport *t, PeakMpiObserver *o,
+    const PeakMpiCausalRaw *raw, double now, size_t bytes) {
+  size_t left = peak_mpi_causal_transport_tick(t, o, raw, now, bytes);
+  if (after_transport_capture) {
+    void (*publish)(PeakMpiObserver *) = after_transport_capture;
+    after_transport_capture = NULL;
+    publish(o);
+  }
+  return left;
+}
 static unsigned test_profile;
 static size_t test_work = 100000;
 static int test_buffered_request;
@@ -537,6 +553,48 @@ static PeakMpiCausalBatchView compact_ready(PeakMpiCausalBatches *b) {
   assert(peak_mpi_causal_batches_prepare_next(b, 100, &v) == 1);
   return v;
 }
+static void test_capture_waits_for_metadata_retirement(void) {
+  PeakMpiCausalBatches *b = peak_mpi_causal_batches_create_with_slots(9, 2, 8);
+  assert(b);
+  for (unsigned end = 0; end < 2; ++end) {
+    PeakMpiObserverRecord r = compact_rec(end ? PEAK_MPI_CAUSAL_CALL_END :
+        PEAK_MPI_CAUSAL_CALL_BEGIN, end + 1, 10, end ? 4 : 2);
+    r.flags |= PEAK_MPI_CAUSAL_COMPACT_GROUP;
+    r.group_L_cut = r.group_A_cut = r.L_cut;
+    r.group_P_cut = r.P_cut;
+    assert(peak_mpi_causal_batches_ingest(b, 0, &r));
+  }
+  for (unsigned rank = 1; rank <= 6; ++rank) {
+    PeakMpiObserverRecord r = compact_rec(PEAK_MPI_CAUSAL_CALL_BEGIN, 1,
+                                         20 + rank, 2);
+    r.batch_uid = 200 + rank;
+    r.flags |= PEAK_MPI_CAUSAL_COMPACT_GROUP;
+    assert(peak_mpi_causal_batches_ingest(b, rank, &r));
+  }
+  compact_ready(b);
+  peak_mpi_causal_batches_commit(b);
+  PeakMpiCausalBatchView view;
+  for (unsigned turn = 0; peak_mpi_causal_batches_pending(b) > 6; ++turn) {
+    assert(turn < 16);
+    assert(!peak_mpi_causal_batches_prepare_next(b, 1, &view));
+  }
+  /* The two record entries are free before the closed operation is retired. */
+  assert(!peak_mpi_causal_batches_has_capacity(b));
+  for (unsigned turn = 0; !peak_mpi_causal_batches_has_capacity(b); ++turn) {
+    assert(turn < 16);
+    assert(!peak_mpi_causal_batches_prepare_next(b, 1, &view));
+  }
+  for (unsigned rank = 7; rank <= 8; ++rank) {
+    PeakMpiObserverRecord r = compact_rec(PEAK_MPI_CAUSAL_CALL_BEGIN, 1,
+                                         20 + rank, 2);
+    r.batch_uid = 200 + rank;
+    r.flags |= PEAK_MPI_CAUSAL_COMPACT_GROUP;
+    assert(peak_mpi_causal_batches_ingest(b, rank, &r));
+  }
+  peak_mpi_causal_batches_destroy(b);
+  puts("capture waits for record/operation/group retirement alignment PASS");
+}
+
 static void test_compact_batches(void) {
   PeakMpiObserverRecord full[4] = {
       compact_rec(PEAK_MPI_CAUSAL_GROUP_BEGIN, 1, 100, 2),
@@ -1437,6 +1495,87 @@ static void recovery_drain(RecoveryGroups *c, unsigned turns, int fresh,
     assert(c->service->last_tick_work <= budget);
   }
 }
+static RecoveryGroups *pressure_groups;
+static PeakMpiObserverProducer pressure_producer;
+static void publish_after_capture(PeakMpiObserver *observer) {
+  for (unsigned group = 0; group < 48; ++group) {
+    PeakMpiObserverRecord records[4];
+    recovery_group(pressure_groups, 0, 0, group + 1, 2, 0, records);
+    for (unsigned i = 0; i < 4; ++i)
+      assert(peak_mpi_observer_emit(observer, &pressure_producer, &records[i]) ==
+             PEAK_MPI_OBSERVER_OK);
+  }
+}
+static void test_capture_pressure_preserves_parse_window(void) {
+  RecoveryGroups c;
+  recovery_groups_init(&c);
+  PeakMpiObserverObject object = {0};
+  object.kind = PEAK_MPI_CAUSAL_OBJECT_COMM;
+  object.part_count = 1;
+  PeakMpiCausalCommPart part = {0};
+  part.local_uid = 2;
+  part.creation_kind = PEAK_MPI_CAUSAL_COMM_SELF;
+  part.world_size = 2;
+  part.local_size = part.member_count = 1;
+  memcpy(object.payload, &part, sizeof part);
+  assert(peak_mpi_causal_service_ingest_object(c.service, 0, 100, &object));
+  for (unsigned group = 0; group < 8; ++group)
+    for (unsigned rank = 0; rank < 2; ++rank)
+      recovery_group(&c, rank, 0, group + 2, 1, 0, NULL);
+  PeakMpiObserverConfig config = {2, 256, 1, 100};
+  PeakMpiObserver *observer = peak_mpi_observer_create(&config);
+  assert(observer && !peak_mpi_observer_claim(observer, 0, 1, 1,
+                                              &pressure_producer));
+  peak_mpi_observer_activate(observer);
+  PeakMpiObserverRecord record = {.kind = PEAK_MPI_OBSERVER_EVENT_LOCAL_COST};
+  uint64_t before = c.prefix[0][0];
+  for (uint64_t i = 0; i < before; ++i) {
+    assert(!peak_mpi_observer_emit(observer, &pressure_producer, &record));
+    assert(peak_mpi_observer_consume(observer, 0, &record));
+  }
+  for (unsigned rank = 0; rank < 2; ++rank)
+    recovery_raw(&c, rank, 3);
+  pressure_groups = &c;
+  after_transport_capture = publish_after_capture;
+  size_t bytes = 65536, work = 16384;
+  peak_mpi_causal_service_tick_budget(c.service, observer, &c.raw[0], 3,
+                                     &bytes, &work);
+  assert(!after_transport_capture && !c.service->hard_fault);
+  assert(work && work < 16384 && c.service->parsed_records &&
+         c.service->parse_window_open && c.service->parse_window_left);
+  PeakMpiObserverSlotState state;
+  assert(peak_mpi_observer_slot_state(observer, 0, &state));
+  assert(state.published - state.consumed == 192 && state.consumed == before);
+  for (unsigned turn = 0; turn < 1000; ++turn) {
+    double now = 4 + turn * .001;
+    for (unsigned rank = 0; rank < 2; ++rank)
+      recovery_raw(&c, rank, now);
+    bytes = 65536;
+    work = 16384;
+    peak_mpi_causal_service_tick_budget(c.service, observer, &c.raw[0], now,
+                                       &bytes, &work);
+    assert(!c.service->hard_fault && work <= 16384 && bytes <= 65536);
+    assert(peak_mpi_observer_slot_state(observer, 0, &state));
+    if (!turn)
+      assert(state.consumed > before);
+    if (state.consumed == state.published &&
+        !peak_mpi_causal_batches_pending(c.service->batches) &&
+        !peak_mpi_causal_service_runnable(c.service))
+      break;
+    assert(turn + 1 < 1000);
+  }
+  for (unsigned rank = 0; rank < 2; ++rank) {
+    const PeakMpiPolicySample *covered = &c.service->ranks[rank].covered;
+    assert(covered->event_cut == c.prefix[rank][0]);
+    assert(fabs(covered->D - .2) < 1e-12 && fabs(covered->A - .1) < 1e-12 &&
+           fabs(covered->P - .02) < 1e-12);
+  }
+  pressure_groups = NULL;
+  peak_mpi_causal_service_destroy(c.service);
+  peak_mpi_observer_destroy(observer);
+  puts("post-capture pressure retries real capture without shrinking parse window PASS");
+}
+
 static void test_unchanged_idle_root(void) {
   RecoveryGroups c;
   recovery_groups_init(&c);
@@ -2396,6 +2535,7 @@ int main(void) {
   test_model_cpu_continuation();
   test_immediate_ordered_send();
   test_stale_recovery_scale();
+  test_capture_pressure_preserves_parse_window();
   test_unchanged_idle_root();
   test_observation_metadata_retirement();
   test_retained_send_inputs();
@@ -2406,6 +2546,7 @@ int main(void) {
   test_recovery_reset_runnable();
   test_fault_cache();
   test_input_backpressure();
+  test_capture_waits_for_metadata_retirement();
   test_compact_batches();
   test_compact_backend();
   test_delayed_receiver_pressure();
