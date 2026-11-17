@@ -1082,18 +1082,39 @@ static int queue_cut(PeakMpiCausalService *s, unsigned rank, PeakMpiCostRef ref,
     coarse(s, rank, PEAK_MPI_POLICY_BAD_CUT, 0);
     return 0;
   }
-  if (!s->free_cut_count) {
-    coarse(s, rank, PEAK_MPI_POLICY_RESOURCE_LIMIT, 0);
-    return 0;
+  double tail = sample.app_cost_known
+      ? sec(sample.cut.A_ns - r->last_A_cut) : sample.L - r->last_A;
+  size_t at = r->cut_tail;
+  SettledCut *old = at != SIZE_MAX ? &s->cuts[at] : NULL;
+  /* Fresh idle observations of the same unresolved event need one queued cut.
+   * Keep actual costs/timing fresh without replacing any published prefix. */
+  int reuse = old && old->ref.slot == ref.slot &&
+      old->ref.generation == ref.generation &&
+      old->sample.member.process == sample.member.process &&
+      old->sample.member.incarnation == sample.member.incarnation &&
+      old->sample.event_cut == sample.event_cut &&
+      old->sample.control_generation == sample.control_generation &&
+      old->sample.app_cost_known == sample.app_cost_known &&
+      old->sample.P == sample.P && old->sample.A == sample.A &&
+      old->sample.cut.P_ns == sample.cut.P_ns &&
+      old->sample.cut.A_ns == sample.cut.A_ns && old->tail == tail &&
+      sample.L >= old->sample.L && sample.cut.L_ns >= old->sample.cut.L_ns &&
+      (sample.app_cost_known || sample.L == old->sample.L) &&
+      sample.elapsed >= old->sample.elapsed && received >= old->received;
+  if (!reuse) {
+    if (!s->free_cut_count) {
+      coarse(s, rank, PEAK_MPI_POLICY_RESOURCE_LIMIT, 0);
+      return 0;
+    }
+    at = s->free_cuts[--s->free_cut_count];
+    if (r->cut_tail != SIZE_MAX)
+      s->cuts[r->cut_tail].next = at;
+    else
+      r->cut_head = at;
+    r->cut_tail = at;
   }
-  size_t at = s->free_cuts[--s->free_cut_count];
-  s->cuts[at] = (SettledCut){
-      ref, sample, received, sample.app_cost_known ? sec(sample.cut.A_ns-r->last_A_cut) : sample.L-r->last_A, r->parsed_index, SIZE_MAX};
-  if (r->cut_tail != SIZE_MAX)
-    s->cuts[r->cut_tail].next = at;
-  else
-    r->cut_head = at;
-  r->cut_tail = at;
+  s->cuts[at] = (SettledCut){ref, sample, received, tail,
+                              r->parsed_index, SIZE_MAX};
   /* An unchanged idle continuation can extend an already settled root after
    * the prior parse cycle closed. Otherwise rebuild the rooted frontier before
    * moving outside its old scope. Never discard pending graph work. */

@@ -1437,6 +1437,90 @@ static void recovery_drain(RecoveryGroups *c, unsigned turns, int fresh,
     assert(c->service->last_tick_work <= budget);
   }
 }
+static void test_pending_idle_cut_reuse(void) {
+  RecoveryGroups c = {0};
+  c.service = make(); c.next_uid = 1000;
+  c.peers[0] = c.peers[1] = 1;
+  for (unsigned rank = 0; rank < 2; ++rank) {
+    c.A[rank] = 100000000;
+    PeakMpiCausalRaw *raw = &c.raw[rank];
+    raw->incarnation = 100 + rank; raw->P = .02; raw->active = 1;
+    raw->contract_profile = PEAK_MPI_PROGRESS_INTEL_2021_11_ASYNC;
+    raw->slot_prefixes = c.prefix[rank]; raw->slot_count = 2;
+    raw->known_peers = c.peers; raw->peer_count = 2;
+    raw->app_cost_known = 1; raw->A = .1;
+    raw->cut = (PeakMpiCostCut){20000000, 100000000, 100000000};
+    recovery_raw(&c, rank, 1);
+  }
+  recovery_group(&c, 0, 0, 1, 1, 0, NULL);
+  c.raw[0].idle_cut = 1;
+  c.raw[0].idle_group_uid = c.previous_group[0];
+  PeakMpiCostRef ref = {0};
+  for (unsigned cycle = 0; cycle < c.service->config.model.max_nodes + 2; ++cycle) {
+    PeakMpiCausalRaw *raw = &c.raw[0];
+    raw->generation++; raw->elapsed = 3 + cycle * .01;
+    raw->L = .1 + cycle * 1e-6;
+    raw->cut.L_ns = 100000000 + (uint64_t)cycle * 1000;
+    raw->watermark_nonce = c.service->ranks[0].requested_nonce;
+    assert(peak_mpi_causal_service_ingest_raw(c.service, 0, raw, raw->elapsed));
+    peak_mpi_causal_service_tick(c.service, NULL, NULL, raw->elapsed, 65536, 16384);
+    assert(!c.service->hard_fault && c.service->stats.records == 4 &&
+           c.service->free_cut_count == c.service->config.model.max_nodes - 1);
+    SettledCut *tail = &c.service->cuts[c.service->ranks[0].cut_tail];
+    if (!cycle) ref = tail->ref;
+    assert(tail->ref.slot == ref.slot && tail->ref.generation == ref.generation &&
+           tail->sample.cut.L_ns == raw->cut.L_ns &&
+           fabs(tail->sample.L - raw->L) < 1e-12 && tail->sample.P == .02 &&
+           tail->sample.A == .1 && tail->sample.elapsed == raw->elapsed &&
+           tail->received == raw->elapsed && !c.service->ranks[0].covered.generation);
+  }
+  recovery_group(&c, 1, 0, 1, 1, 0, NULL);
+  recovery_drain(&c, 20, 0, 16384);
+  double D;
+  assert(!c.service->hard_fault &&
+         !peak_mpi_cost_model_delay(c.service->model, ref, &D) && fabs(D - .1) < 1e-12 &&
+         c.service->free_cut_count == c.service->config.model.max_nodes);
+  assert(c.service->ranks[0].covered_ref.slot == ref.slot &&
+         c.service->ranks[0].covered_ref.generation == ref.generation &&
+         c.service->ranks[0].covered.cut.L_ns == c.raw[0].cut.L_ns &&
+         fabs(c.service->ranks[0].covered.L - c.raw[0].L) < 1e-12 &&
+         c.service->ranks[0].covered.P == .02 && c.service->ranks[0].covered.A == .1 &&
+         c.service->ranks[0].covered.elapsed == c.raw[0].elapsed);
+  peak_mpi_causal_service_destroy(c.service);
+  /* Eligibility is deliberately narrower than arbitrary monotonic costs. */
+  for (unsigned change = 0; change < 12; ++change) {
+    PeakMpiCausalService *service = make();
+    PeakMpiCostRef first;
+    assert(node(service, 0, .1, .02, NULL, &first));
+    PeakMpiPolicySample sample = {0};
+    sample.member = (PeakMpiPolicyMemberId){0, 99};
+    sample.L = sample.A = .1; sample.P = .02; sample.elapsed = 1;
+    sample.app_cost_known = 1;
+    sample.cut = (PeakMpiCostCut){20000000, 100000000, 100000000};
+    if (change == 11) sample.app_cost_known = 0;
+    assert(queue_cut(service, 0, first, sample, 1));
+    size_t free_before = service->free_cut_count;
+    if (change == 0) ++first.generation;
+    if (change == 1) ++sample.event_cut;
+    if (change == 2) ++sample.control_generation;
+    if (change == 3) sample.app_cost_known = 0;
+    if (change == 4) { sample.P += 1e-6; sample.cut.P_ns += 1000; }
+    if (change == 5) { sample.A += 1e-6; sample.cut.A_ns += 1000; }
+    if (change == 6) ++sample.member.incarnation;
+    if (change == 7) sample.elapsed = .5;
+    if (change == 8) { ++service->ranks[0].last_A_cut; }
+    if (change == 9) sample.member.process = 1;
+    if (change == 11) { sample.L += 1e-6; sample.cut.L_ns += 1000; }
+    assert(queue_cut(service, 0, first, sample, change == 10 ? .5 : 1));
+    assert(service->free_cut_count == free_before - 1 && !service->hard_fault);
+    sample.cut.A_ns = 0; service->ranks[0].last_A_cut = 1;
+    sample.app_cost_known = 1;
+    assert(!queue_cut(service, 0, first, sample, 2) &&
+           service->ranks[0].reason == PEAK_MPI_POLICY_BAD_CUT);
+    peak_mpi_causal_service_destroy(service);
+  }
+  puts("pending identical idle cuts reuse unpublished storage; late peer and changed costs retain semantics PASS");
+}
 static void test_unchanged_idle_root(void) {
   RecoveryGroups c;
   recovery_groups_init(&c);
@@ -2396,6 +2480,7 @@ int main(void) {
   test_model_cpu_continuation();
   test_immediate_ordered_send();
   test_stale_recovery_scale();
+  test_pending_idle_cut_reuse();
   test_unchanged_idle_root();
   test_observation_metadata_retirement();
   test_retained_send_inputs();
