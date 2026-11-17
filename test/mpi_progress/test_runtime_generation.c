@@ -342,6 +342,67 @@ static void test_nonempty_retry_notification(int ack_available) {
       ack_available, progress, (unsigned long long)after.consumed);
 }
 
+static void test_known_loss_pauses_capture(void) {
+  PeakMpiCausalServiceConfig c = {0};
+  c.world_size = 2; c.job_context = 99; c.incarnation = 100;
+  c.address = "127.0.0.1"; c.port = 39879; c.slots = 1; c.queue_frames = 16;
+  c.max_operations = 64; c.max_context_parts = 32; c.max_pending_records = 64;
+  c.model = (PeakMpiCostConfig){1024,4096,1024,128,2,64};
+  c.policy = (PeakMpiPolicyConfig){2,.1,1,.5,0,0,1};
+  service = peak_mpi_causal_service_create(&c);
+  assert(service); policy = c.policy;
+  unsigned char members[2] = {1,1};
+  uint64_t prefixes[2] = {0}, frozen = 0;
+  PeakMpiCausalRaw raw[2] = {0};
+  PeakMpiObserverObject object = {.kind=PEAK_MPI_CAUSAL_OBJECT_COMM,.generation=1,.part_count=1};
+  PeakMpiCausalCommPart part = {.local_uid=1,.creation_kind=PEAK_MPI_CAUSAL_COMM_WORLD,
+      .world_size=2,.local_size=2,.member_count=2};
+  part.members[1] = 1; memcpy(object.payload, &part, sizeof part);
+  for (unsigned rank=0; rank<2; ++rank) {
+    assert(peak_mpi_causal_service_ingest_object(service,rank,100+rank,&object));
+    raw[rank] = (PeakMpiCausalRaw){.incarnation=100+rank,.generation=1,.active=1,
+      .L=1e-7,.P=5e-8,.A=7.5e-8,.app_cost_known=1,.cut={50,75,100},.elapsed=1,
+      .known_peers=members,.peer_count=2,.slot_prefixes=&prefixes[rank],.slot_count=1};
+  }
+  raw[1].lost_events = raw[1].recovery.loss = 1;
+  raw[1].coarse_reason = PEAK_MPI_OBSERVER_REASON_RING_OVERFLOW;
+  raw[1].recovery.fault_mask = UINT64_C(1) << PEAK_MPI_OBSERVER_REASON_RING_OVERFLOW;
+  for (unsigned rank=0; rank<2; ++rank)
+    assert(peak_mpi_causal_service_ingest_raw(service,rank,&raw[rank],1));
+  peak_mpi_causal_service_tick(service,NULL,NULL,1,65536,16384);
+  PeakMpiPolicyFeedback f;
+  assert(peak_mpi_causal_service_feedback(service,&f) && f.member_count==2 &&
+         f.mode==PEAK_MPI_POLICY_COARSE && f.reason==PEAK_MPI_POLICY_EVENT_LOSS &&
+         f.recovery.state==PEAK_MPI_RECOVERY_NONE);
+  PeakMpiObserverConfig oc = {1,16,4,100};
+  capture = peak_mpi_observer_create(&oc); assert(capture);
+  slots=1; heartbeat_enabled=1; producer_valid=0; sample_no=0;
+  origin=clock_seconds()-1; recovery_prefixes=&frozen;
+  memset(&local_recovery,0,sizeof local_recovery);
+  atomic_store(&ready,1); atomic_store(&active,1); atomic_store(&fine_paused,0);
+  atomic_store(&capture_epoch,1); atomic_store(&next_operation,1000);
+  assert(!peak_mpi_policy_receiver_init(&receiver,&policy,f.cohort,f.member,1));
+  assert(peak_mpi_causal_runtime_capture_enabled());
+  accept_service_feedback(1);
+  assert(receiver.permanent_coarse && receiver.coarse_reason==PEAK_MPI_POLICY_EVENT_LOSS);
+  peak_mpi_causal_runtime_define(&object);
+  PeakMpiObserverRecord event = {.kind=PEAK_MPI_OBSERVER_EVENT_START,
+      .phase=PEAK_MPI_CAUSAL_CALL_BEGIN,.operation=PEAK_MPI_CAUSAL_SEND,.op_uid=1000,.peer=1};
+  peak_mpi_causal_runtime_submit(&event,1);
+  PeakMpiObserverSlotState state;
+  assert(peak_mpi_observer_slot_state(capture,0,&state));
+  assert(!state.published && !state.lost &&
+         peak_mpi_causal_runtime_metadata_enabled() && peak_mpi_observer_object_count(capture)==1);
+  /* Without a new witness, repeated feedback must not resume fine capture. */
+  accept_service_feedback(1.1);
+  assert(atomic_load(&fine_paused) && local_recovery.state==PEAK_MPI_RECOVERY_NONE);
+  peak_mpi_observer_destroy(capture); capture=NULL;
+  peak_mpi_causal_service_destroy(service); service=NULL; recovery_prefixes=NULL;
+  producer_valid=0;
+  atomic_store(&active,0); atomic_store(&backend_ready,0);
+  puts("validated remote loss pauses fine records before QUERY; metadata remains enabled PASS");
+}
+
 int main(void) {
   PeakMpiObserverConfig cfg = {1, 8, 1, 1};
   capture = peak_mpi_observer_create(&cfg);
@@ -445,6 +506,7 @@ int main(void) {
   test_transport_continuation(1);
   test_nonempty_retry_notification(1);
   test_nonempty_retry_notification(0);
+  test_known_loss_pauses_capture();
   puts("coherent event/RAW control generation survives stale heartbeat store "
        "PASS");
 }

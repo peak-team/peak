@@ -657,6 +657,10 @@ static void accept_service_feedback(double now) {
                                       f.membership_complete, now);
     peak_mpi_policy_receiver_accept(&receiver, &f, now);
     last_feedback = f;
+    /* The owner discards fine records while a known loss awaits recovery. */
+    if (receiver.permanent_coarse &&
+        receiver.coarse_reason == PEAK_MPI_POLICY_EVENT_LOSS)
+      atomic_store_explicit(&fine_paused, 1, memory_order_release);
   }
 }
 int peak_mpi_causal_runtime_tick(double now, double elapsed, double C,
