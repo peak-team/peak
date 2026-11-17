@@ -192,7 +192,7 @@ typedef struct {
     PeakMpiPolicyCohortKey cohort;
     PeakMpiPolicyMemberId member;
     PeakMpiPolicyFeedback feedback;
-    double created_at, received_at, last_now, conservative_g;
+    double created_at, received_at, last_now, conservative_g, observed_g;
     size_t known_member_count;
     uint64_t last_generation;
     int active, have_feedback, membership_complete, permanent_coarse;

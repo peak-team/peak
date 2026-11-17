@@ -237,6 +237,46 @@ static PeakMpiPolicyFeedback receiver_pressure_feedback(PeakMpiPolicy *p,
   f.g = g;
   return f;
 }
+static void test_resource_failure_advisory_pressure(void) {
+  PeakMpiPolicyReceiver r;
+  PeakMpiPolicyDecision d;
+  assert(peak_mpi_policy_receiver_init(&r, &stale_cfg, stale_key, stale_ids[0], 0) == PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_receiver_rebind(&r, stale_key, 64, 1, 0) == PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_receiver_mark_coarse(&r, PEAK_MPI_POLICY_EVENT_LOSS, 0) == PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_receiver_snapshot(&r, 0, 0, 0, 1, &d) == PEAK_MPI_POLICY_OK);
+  assert(d.g == 64);
+  assert(peak_mpi_policy_receiver_mark_coarse(&r, PEAK_MPI_POLICY_RESOURCE_LIMIT, 0) == PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_receiver_snapshot(&r, 0, 0, 0, 1, &d) == PEAK_MPI_POLICY_OK);
+  assert(d.mode == PEAK_MPI_POLICY_COARSE && d.g == 1 && d.q_eff == stale_cfg.q);
+  assert(!d.global_available && !d.headroom_known && !d.reattach_relaxation && isnan(d.global_headroom));
+
+  assert(peak_mpi_policy_receiver_init(&r, &stale_cfg, stale_key, stale_ids[0], 0) == PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_receiver_rebind(&r, stale_key, 2, 1, 0) == PEAK_MPI_POLICY_OK);
+  PeakMpiPolicy *p = peak_mpi_policy_create(&stale_cfg, stale_key, stale_ids, 2, 1, 1, 0);
+  assert(p);
+  PeakMpiPolicyFeedback f = receiver_pressure_feedback(p, 1, 1.5);
+  assert(peak_mpi_policy_receiver_accept(&r, &f, 1) == PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_receiver_snapshot_cut(&r, 1, 1, f.cut, 1, &d) == PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_receiver_mark_coarse(&r, PEAK_MPI_POLICY_RESOURCE_LIMIT, 1) == PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_receiver_snapshot_cut(&r, 1, 1, f.cut, 1, &d) == PEAK_MPI_POLICY_OK);
+  assert(d.g == 1.5 && !d.reattach_relaxation);
+  PeakMpiCostCut backward = f.cut;
+  backward.A_ns--; backward.P_ns--;
+  assert(peak_mpi_policy_receiver_snapshot_cut(&r, 1, 1, backward, 1, &d) == PEAK_MPI_POLICY_OK);
+  assert(d.g == 2 && !d.headroom_known && !d.reattach_relaxation);
+  assert(peak_mpi_policy_receiver_snapshot_cut(&r, 1, .5, f.cut, 1, &d) == PEAK_MPI_POLICY_OK);
+  assert(d.g == 2 && !d.headroom_known && !d.reattach_relaxation);
+
+  f.generation++; f.mode = PEAK_MPI_POLICY_COARSE;
+  f.reason = PEAK_MPI_POLICY_RESOURCE_LIMIT; f.g = 2; f.risk = .02;
+  assert(peak_mpi_policy_receiver_accept(&r, &f, 1) == PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_receiver_snapshot_cut(&r, 1, 1, f.cut, 1, &d) == PEAK_MPI_POLICY_OK);
+  assert(d.global_available && d.g == 2 && d.headroom_known);
+  assert(peak_mpi_policy_receiver_snapshot_cut(&r, 2, 2, f.cut, 1, &d) == PEAK_MPI_POLICY_OK);
+  assert(!d.global_available && d.g == 1.5 && !d.reattach_relaxation);
+  peak_mpi_policy_free(p);
+  puts("observer resource failure retains observed pressure without unknown headroom PASS");
+}
 static void test_receiver_pressure_decline(void) {
   PeakMpiPolicyReceiver r;
   PeakMpiPolicyDecision d;
@@ -2654,6 +2694,7 @@ int main(void) {
   test_compact_batches();
   test_compact_backend();
   test_delayed_receiver_pressure();
+  test_resource_failure_advisory_pressure();
   test_receiver_pressure_decline();
   test_stale_feedback();
   test_feedback_cache_guard();

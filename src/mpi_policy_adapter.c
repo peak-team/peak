@@ -662,7 +662,7 @@ PeakMpiPolicyResult peak_mpi_policy_receiver_init(PeakMpiPolicyReceiver *r,
     PeakMpiPolicyMemberId member, double now) {
     if (!r || !config_valid(c) || !nonnegative(now)) return PEAK_MPI_POLICY_INVALID;
     memset(r, 0, sizeof(*r)); r->config = *c; r->cohort = cohort; r->member = member;
-    r->created_at = r->last_now = now; r->conservative_g = 1;
+    r->created_at = r->last_now = now; r->conservative_g = r->observed_g = 1;
     return PEAK_MPI_POLICY_OK;
 }
 PeakMpiPolicyResult peak_mpi_policy_receiver_rebind(PeakMpiPolicyReceiver *r,
@@ -821,7 +821,7 @@ static PeakMpiPolicyResult receiver_snapshot(PeakMpiPolicyReceiver *r,
         /* Only a fresh ordered observation can supersede learned pressure. */
         if (fresh && r->membership_complete && !r->permanent_coarse &&
             (d->mode == PEAK_MPI_POLICY_COMPLETE || d->mode == PEAK_MPI_POLICY_APPROX))
-            r->conservative_g = d->g;
+            r->conservative_g = r->observed_g = d->g;
         else if (d->mode != PEAK_MPI_POLICY_STALE)
             r->conservative_g = maximum(r->conservative_g, d->g);
         int matching_mode = !r->permanent_coarse || f->mode == PEAK_MPI_POLICY_COARSE;
@@ -841,6 +841,14 @@ static PeakMpiPolicyResult receiver_snapshot(PeakMpiPolicyReceiver *r,
             d->headroom_known = 1;
             d->reattach_relaxation = local_headroom > 0;
         }
+        /* Exhausting observer storage is not measured amplification. Invalid
+         * local cuts still require the existing conservative treatment. */
+        if (d->mode == PEAK_MPI_POLICY_COARSE &&
+            d->reason == PEAK_MPI_POLICY_RESOURCE_LIMIT &&
+            !r->feedback_invalid && !d->global_available &&
+            (!r->have_feedback || (cut_ordered && latest_ordered &&
+                elapsed >= f->local_elapsed_at_cut)))
+            d->g = r->observed_g;
         /* A finer tuple received after permanent coarse cannot establish a
          * coarse raw-sum risk; wait for another explicitly coarse tuple. */
         if (d->global_available && matching_mode && f->risk_known && f->tails_complete &&
