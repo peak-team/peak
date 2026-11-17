@@ -1527,10 +1527,10 @@ static int parse_record(PeakMpiCausalService *s, unsigned r,
   o->ended = 1;
   if (o->begin.flags & PEAK_MPI_CAUSAL_NONBLOCKING) {
     o->immediate = (rec->flags & PEAK_MPI_CAUSAL_INACTIVE_REQUEST) != 0;
-    if (!o->immediate && !o->result.generation)
-      reserve(s, r, &o->result);
-    else
+    if (o->immediate)
       o->retired = 1;
+    else if (!o->result.generation)
+      reserve(s, r, &o->result);
   }
   a->anchor[rec->thread_uid - 1] = rec->op_uid;
   o->completed |=

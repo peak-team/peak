@@ -1742,6 +1742,58 @@ static void retained_request_observation(RecoveryGroups *c, uint64_t send,
   c->A[0] += 30000;
   c->raw[0].P = .02 + (double)(c->A[0] - 100000000) / 3e9;
 }
+/* A second thread keeps the group open across initiation and status-only
+ * completion. The batch plan observes subrecords before initiation CALL_END. */
+static void test_concurrent_status_only_retirement(void) {
+  RecoveryGroups c = {0};
+  c.service = make(); c.next_uid = 1000; c.A[0] = 100000000;
+  const unsigned phases[] = {PEAK_MPI_CAUSAL_GROUP_BEGIN,
+      PEAK_MPI_CAUSAL_CALL_BEGIN, PEAK_MPI_CAUSAL_CALL_BEGIN,
+      PEAK_MPI_CAUSAL_CALL_END, PEAK_MPI_CAUSAL_CALL_BEGIN,
+      PEAK_MPI_CAUSAL_REQUEST_COMPLETE, PEAK_MPI_CAUSAL_CALL_END,
+      PEAK_MPI_CAUSAL_CALL_END, PEAK_MPI_CAUSAL_GROUP_END};
+  const unsigned slots[] = {1,1,0,0,0,0,0,1,1};
+  const uint64_t uids[] = {100,101,102,102,103,102,103,101,100};
+  for (unsigned i = 0; i < 9; ++i) {
+    PeakMpiObserverRecord r = {0};
+    r.incarnation = 100; r.thread_uid = slots[i] + 1;
+    r.thread_generation = 1; r.sequence = ++c.prefix[0][slots[i]];
+    r.phase = phases[i]; r.op_uid = uids[i]; r.batch_uid = i == 5 ? 103 : 100;
+    r.kind = PEAK_MPI_OBSERVER_EVENT_START;
+    r.flags = PEAK_MPI_CAUSAL_APP_COST_KNOWN;
+    r.L_cut = r.A_cut = c.A[0]; r.P_cut = 20000000;
+    r.capability_uid = PEAK_MPI_PROGRESS_INTEL_2021_11_ASYNC;
+    r.progress_scope = PEAK_MPI_OBSERVER_SCOPE_AUTONOMOUS;
+    if (i == 2 || i == 3 || i == 5) {
+      r.operation = PEAK_MPI_CAUSAL_SEND;
+      r.flags |= PEAK_MPI_CAUSAL_NONBLOCKING;
+      r.communicator_uid = 1; r.peer = 1; r.tag = 7;
+    } else if (i == 4 || i == 6) r.operation = PEAK_MPI_CAUSAL_TEST;
+    else if (i == 1 || i == 7) r.operation = PEAK_MPI_CAUSAL_WAIT;
+    if (i == 3 || i == 5 || i == 6 || i == 7)
+      r.flags |= PEAK_MPI_CAUSAL_SUCCESS | PEAK_MPI_OBSERVER_PROGRESS_SEALED;
+    if (i == 4) r.input_ref = 102;
+    if (i == 5) r.flags |= PEAK_MPI_CAUSAL_STATUS_ONLY | PEAK_MPI_CAUSAL_STATUS_OBSERVED;
+    if (i == 6) r.completion_count = 1;
+    if (i == 8) {
+      r.flags |= PEAK_MPI_CAUSAL_CONCURRENT;
+      r.completion_count = 3;
+    }
+    assert(peak_mpi_causal_service_ingest_record(c.service, 0, &r));
+  }
+  parse_batches(c.service, 100000);
+  Operation *send = find_op(c.service, 0, 102);
+  assert(!c.service->hard_fault && send && send->ended && send->completed &&
+         !send->retired && operation_metadata_pinned(c.service, send));
+  /* A later Wait reaps the same retained identity, without another completion. */
+  c.previous_group[0] = 100; c.previous_call[0][0] = 103;
+  retained_request_observation(&c, 102, 1);
+  parse_batches(c.service, 100000);
+  send = find_op(c.service, 0, 102);
+  assert(!c.service->hard_fault && send && send->retired);
+  peak_mpi_causal_service_destroy(c.service);
+  puts("concurrent status-only completion retains request metadata until reap PASS");
+}
 static void test_idle_cut_dependency_index(void) {
   RecoveryGroups c = {0};
   c.service = make(); c.next_uid = 1000;
@@ -2587,6 +2639,7 @@ int main(void) {
   test_stale_recovery_scale();
   test_pending_idle_cut_reuse();
   test_unchanged_idle_root();
+  test_concurrent_status_only_retirement();
   test_idle_cut_dependency_index();
   test_observation_metadata_retirement();
   test_retained_send_inputs();
