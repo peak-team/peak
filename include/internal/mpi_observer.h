@@ -135,7 +135,6 @@ void peak_mpi_observer_destroy(PeakMpiObserver *observer);
 /* Install before producers start; notification never runs a consumer. */
 void peak_mpi_observer_set_notify(PeakMpiObserver *, void (*notify)(void));
 int peak_mpi_observer_has_pending(const PeakMpiObserver *);
-int peak_mpi_observer_has_pressure(const PeakMpiObserver *);
 
 /* Activation enables local recording, including state that precedes the first
  * remote exchange. It neither proves remote communication/contract completeness

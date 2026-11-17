@@ -50,7 +50,6 @@ size_t peak_mpi_causal_batches_pending(const PeakMpiCausalBatches *);
 /* Full record storage with a closed plan that the parser can retire without
  * accepting another event. Purely unclosed-state exhaustion is not transient. */
 int peak_mpi_causal_batches_backpressured(const PeakMpiCausalBatches *);
-int peak_mpi_causal_batches_has_capacity(const PeakMpiCausalBatches *);
 /* Closed input that can build/retire without another remote event. */
 int peak_mpi_causal_batches_runnable(const PeakMpiCausalBatches *);
 uint64_t peak_mpi_causal_batches_last_group(const PeakMpiCausalBatches *,

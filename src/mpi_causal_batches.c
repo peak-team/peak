@@ -298,13 +298,6 @@ void peak_mpi_causal_batches_destroy(PeakMpiCausalBatches *b) {
 int peak_mpi_causal_batches_runnable(const PeakMpiCausalBatches *b) {
   return b && b->state != ERROR && (b->state != IDLE || b->ready_head != NONE);
 }
-int peak_mpi_causal_batches_has_capacity(const PeakMpiCausalBatches *b) {
-  /* Record entries are freed before their operation/group metadata. Finish
-   * that retirement before offering another capture opportunity. */
-  return b && b->state != ERROR && b->state != RETIRE_RECORDS &&
-         b->state != RETIRE_OPERATIONS && b->state != RETIRE_GROUP &&
-         b->free_entry != NONE;
-}
 int peak_mpi_causal_batches_backpressured(const PeakMpiCausalBatches *b) {
   return b && b->free_entry == NONE && peak_mpi_causal_batches_runnable(b);
 }

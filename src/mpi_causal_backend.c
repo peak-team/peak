@@ -3757,30 +3757,11 @@ void peak_mpi_causal_service_tick_budget(PeakMpiCausalService *s,
             s->parse_finish_only
                 ? left
                 : (left < s->parse_window_left ? left : s->parse_window_left);
-        size_t checkpoint = s->config.slots + 1;
-        if (checkpoint < 64)
-          checkpoint = 64;
-        int checkpoint_limited = capture && allowance > checkpoint;
-        if (checkpoint_limited)
-          allowance = checkpoint;
-        uint64_t parsed_before = s->parsed_records;
-        size_t pending_before = capture ? peak_mpi_causal_batches_pending(s->batches) : 0;
         parse_batches(s, allowance);
         used = s->last_work_used;
         left -= used;
         s->parse_window_left =
             used < s->parse_window_left ? s->parse_window_left - used : 0;
-        if (capture && used && s->parse_window_left &&
-            (s->parsed_records != parsed_before ||
-             peak_mpi_causal_batches_pending(s->batches) < pending_before) &&
-            peak_mpi_causal_batches_has_capacity(s->batches) &&
-            peak_mpi_observer_has_pressure(capture)) {
-          s->last_tick_work = work - left;
-          goto accounting;
-        }
-        if (checkpoint_limited && !s->plan_active && used == allowance && used &&
-            s->parse_window_left)
-          continue; /* A checkpoint is not the end of the logical parse window. */
         if (s->plan_active) {
           if (!used) {
             s->parse_window_left = 0;

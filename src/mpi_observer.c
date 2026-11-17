@@ -61,18 +61,6 @@ int peak_mpi_observer_has_pending(const PeakMpiObserver *o) {
     return 0;
 }
 
-/* Background-only observation; producer and consumer samples are independent. */
-int peak_mpi_observer_has_pressure(const PeakMpiObserver *o) {
-    if (!o) return 0;
-    for (size_t i = 0; i < o->config.slots; ++i) {
-        uint64_t tail = atomic_load_explicit(&o->slots[i].tail, memory_order_acquire);
-        uint64_t head = atomic_load_explicit(&o->slots[i].head, memory_order_acquire);
-        if (head >= tail && head - tail >= (o->config.records_per_slot + 1) / 2)
-            return 1;
-    }
-    return 0;
-}
-
 static bool product_fits(size_t a, size_t b) {
     return b == 0 || a <= SIZE_MAX / b;
 }
