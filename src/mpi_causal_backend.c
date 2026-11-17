@@ -1118,7 +1118,7 @@ static int queue_cut(PeakMpiCausalService *s, unsigned rank, PeakMpiCostRef ref,
   /* An unchanged idle continuation can extend an already settled root after
    * the prior parse cycle closed. Otherwise rebuild the rooted frontier before
    * moving outside its old scope. Never discard pending graph work. */
-  if (s->root_cut_active && s->cuts[at].index > r->root_index) {
+  if (!reuse && s->root_cut_active && s->cuts[at].index > r->root_index) {
     double delay;
     if (!s->graph_pending && !s->model_running && !s->root_plan_stage &&
         s->parsed_records == s->cycle_records && r->root_valid &&

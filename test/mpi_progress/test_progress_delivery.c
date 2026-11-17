@@ -1471,8 +1471,8 @@ static void test_pending_idle_cut_reuse(void) {
     if (!cycle) ref = tail->ref;
     PeakMpiCostStats pending_stats;
     peak_mpi_cost_model_stats(c.service->model, &pending_stats);
-    assert(tail->index > c.service->ranks[0].root_index &&
-           pending_stats.generation > prior_model_generation);
+    assert(tail->index > c.service->ranks[0].root_index);
+    if (cycle) assert(pending_stats.generation == prior_model_generation);
     prior_model_generation = pending_stats.generation;
     assert(tail->ref.slot == ref.slot && tail->ref.generation == ref.generation &&
            tail->sample.cut.L_ns == raw->cut.L_ns &&
@@ -1481,6 +1481,13 @@ static void test_pending_idle_cut_reuse(void) {
            tail->received == raw->elapsed && !c.service->ranks[0].covered.generation);
   }
   recovery_group(&c, 1, 0, 1, 1, 0, NULL);
+  parse_batches(c.service, 16384);
+  assert(c.service->graph_pending); /* The actual late peer changed the graph. */
+  c.raw[0].generation++; c.raw[0].elapsed = c.service->now + .1;
+  c.raw[0].watermark_nonce = c.service->ranks[0].requested_nonce;
+  assert(peak_mpi_causal_service_ingest_raw(c.service, 0, &c.raw[0], c.raw[0].elapsed));
+  verify_prefixes(c.service, 16384);
+  assert(c.service->graph_pending); /* Reuse must never clear existing work. */
   recovery_drain(&c, 20, 0, 16384);
   double D;
   assert(!c.service->hard_fault &&
@@ -1505,6 +1512,9 @@ static void test_pending_idle_cut_reuse(void) {
     sample.cut = (PeakMpiCostCut){20000000, 100000000, 100000000};
     if (change == 11) sample.app_cost_known = 0;
     assert(queue_cut(service, 0, first, sample, 1));
+    peak_mpi_causal_service_tick(service, NULL, NULL, 1, 65536, 16384);
+    assert(service->root_cut_active && !service->graph_pending);
+    service->ranks[0].parsed_index = 1; /* Component seam: next cut position. */
     size_t free_before = service->free_cut_count;
     if (change == 0) ++first.generation;
     if (change == 1) ++sample.event_cut;
@@ -1518,7 +1528,8 @@ static void test_pending_idle_cut_reuse(void) {
     if (change == 9) sample.member.process = 1;
     if (change == 11) { sample.L += 1e-6; sample.cut.L_ns += 1000; }
     assert(queue_cut(service, 0, first, sample, change == 10 ? .5 : 1));
-    assert(service->free_cut_count == free_before - 1 && !service->hard_fault);
+    assert(service->free_cut_count == free_before - 1 && !service->hard_fault &&
+           service->cuts[service->ranks[0].cut_tail].index == 1 && service->graph_pending);
     sample.cut.A_ns = 0; service->ranks[0].last_A_cut = 1;
     sample.app_cost_known = 1;
     assert(!queue_cut(service, 0, first, sample, 2) &&
