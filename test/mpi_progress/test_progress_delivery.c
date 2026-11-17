@@ -1456,6 +1456,7 @@ static void test_pending_idle_cut_reuse(void) {
   c.raw[0].idle_cut = 1;
   c.raw[0].idle_group_uid = c.previous_group[0];
   PeakMpiCostRef ref = {0};
+  uint64_t prior_model_generation = 0;
   for (unsigned cycle = 0; cycle < c.service->config.model.max_nodes + 2; ++cycle) {
     PeakMpiCausalRaw *raw = &c.raw[0];
     raw->generation++; raw->elapsed = 3 + cycle * .01;
@@ -1468,6 +1469,11 @@ static void test_pending_idle_cut_reuse(void) {
            c.service->free_cut_count == c.service->config.model.max_nodes - 1);
     SettledCut *tail = &c.service->cuts[c.service->ranks[0].cut_tail];
     if (!cycle) ref = tail->ref;
+    PeakMpiCostStats pending_stats;
+    peak_mpi_cost_model_stats(c.service->model, &pending_stats);
+    assert(tail->index > c.service->ranks[0].root_index &&
+           pending_stats.generation > prior_model_generation);
+    prior_model_generation = pending_stats.generation;
     assert(tail->ref.slot == ref.slot && tail->ref.generation == ref.generation &&
            tail->sample.cut.L_ns == raw->cut.L_ns &&
            fabs(tail->sample.L - raw->L) < 1e-12 && tail->sample.P == .02 &&
@@ -1689,6 +1695,59 @@ static void retained_request_observation(RecoveryGroups *c, uint64_t send,
   assert(peak_mpi_causal_service_ingest_record(c->service, 0, &records[3]));
   c->A[0] += 30000;
   c->raw[0].P = .02 + (double)(c->A[0] - 100000000) / 3e9;
+}
+static void test_idle_cut_dependency_index(void) {
+  RecoveryGroups c = {0};
+  c.service = make(); c.next_uid = 1000;
+  c.peers[0] = c.peers[1] = 1;
+  for (unsigned rank = 0; rank < 2; ++rank) {
+    c.A[rank] = 100000000;
+    PeakMpiCausalRaw *raw = &c.raw[rank];
+    raw->incarnation = 100 + rank; raw->P = .02; raw->active = 1;
+    raw->contract_profile = PEAK_MPI_PROGRESS_INTEL_2021_11_ASYNC;
+    raw->slot_prefixes = c.prefix[rank]; raw->slot_count = 2;
+    raw->known_peers = c.peers; raw->peer_count = 2;
+    recovery_raw(&c, rank, 1);
+  }
+  uint64_t send = retained_call(&c, 0, 0, PEAK_MPI_CAUSAL_SEND,
+                                 PEAK_MPI_CAUSAL_NONBLOCKING, 0);
+  retained_request_observation(&c, send, 0);
+  retained_request_observation(&c, send, 1);
+  c.raw[0].idle_cut = 1;
+  c.raw[0].idle_group_uid = c.previous_group[0];
+  uint64_t index = 0, generation = 0;
+  PeakMpiCostRef ref = {0};
+  for (unsigned cycle = 0; cycle < 6; ++cycle) {
+    recovery_raw(&c, 0, 3 + cycle * .01);
+    peak_mpi_causal_service_tick(c.service, NULL, NULL, c.raw[0].elapsed,
+                                  65536, 16384);
+    SettledCut *tail = &c.service->cuts[c.service->ranks[0].cut_tail];
+    PeakMpiCostStats stats;
+    peak_mpi_cost_model_stats(c.service->model, &stats);
+    if (!cycle) { index = tail->index; ref = tail->ref; generation = stats.generation; }
+    double D;
+    assert(!c.service->hard_fault && c.service->stats.records == 14 &&
+           tail->index == index && c.service->ranks[0].root_index == index &&
+           stats.generation == generation && stats.active_nodes == 7 &&
+           stats.active_edges == 8 &&
+           peak_mpi_cost_model_delay(c.service->model, ref, &D) == PEAK_MPI_COST_PENDING &&
+           tail->sample.elapsed == c.raw[0].elapsed && tail->received == c.raw[0].elapsed);
+  }
+  retained_call(&c, 1, 0, PEAK_MPI_CAUSAL_RECV, 0, 0);
+  recovery_drain(&c, 20, 0, 16384);
+  double D;
+  PeakMpiCostStats stats;
+  peak_mpi_cost_model_stats(c.service->model, &stats);
+  assert(!c.service->hard_fault && stats.generation > generation &&
+         !peak_mpi_cost_model_delay(c.service->model, ref, &D) && fabs(D - .10008) < 1e-12 &&
+         c.service->ranks[0].covered_ref.slot == ref.slot &&
+         c.service->ranks[0].covered_ref.generation == ref.generation &&
+         c.service->ranks[0].covered.L == c.raw[0].L &&
+         c.service->ranks[0].covered.P == c.raw[0].P &&
+         c.service->ranks[0].covered.A == c.raw[0].L &&
+         c.service->free_cut_count == c.service->config.model.max_nodes);
+  peak_mpi_causal_service_destroy(c.service);
+  puts("reused idle cut keeps dependency index; pending roots avoid redundant solves and late peer still settles PASS");
 }
 static void retained_actual_cost(RecoveryGroups *c, unsigned rank, unsigned calls) {
   double A, P;
@@ -2482,6 +2541,7 @@ int main(void) {
   test_stale_recovery_scale();
   test_pending_idle_cut_reuse();
   test_unchanged_idle_root();
+  test_idle_cut_dependency_index();
   test_observation_metadata_retirement();
   test_retained_send_inputs();
   test_reserved_message_metadata();

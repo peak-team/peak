@@ -1114,7 +1114,7 @@ static int queue_cut(PeakMpiCausalService *s, unsigned rank, PeakMpiCostRef ref,
     r->cut_tail = at;
   }
   s->cuts[at] = (SettledCut){ref, sample, received, tail,
-                              r->parsed_index, SIZE_MAX};
+                              reuse ? old->index : r->parsed_index, SIZE_MAX};
   /* An unchanged idle continuation can extend an already settled root after
    * the prior parse cycle closed. Otherwise rebuild the rooted frontier before
    * moving outside its old scope. Never discard pending graph work. */
