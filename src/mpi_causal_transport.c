@@ -17,7 +17,7 @@
 enum { SEND_BATCH_FRAMES = 16 };
 enum { HELLO = 1, RECORD, OBJECT, RAW, ACK, FEEDBACK, WMRQ, PACKED_RECORD, PACKED_RAW, PACKED_FEEDBACK };
 typedef struct {
-  /* Owner input hint; each IO pass revisits quiet peers. */
+  /* Owner input hint; each bounded read batch revisits quiet peers. */
   int fd, ready, feedback_sent, quiet;
   uint64_t feedback_generation, nonce_sent, pending_ack;
   unsigned ack_count;
@@ -1356,11 +1356,11 @@ static void transport_io(PeakMpiCausalTransport *t,
   int owner = t->c.rank == t->c.owner_rank;
   size_t rounds, before;
   if (owner) {
-    /* Revisit quiet input once per IO pass. Data arriving after an idle read
-     * gets its next bounded opportunity in the following pass. */
-    for (size_t i = 0; i < t->peer_n; ++i)
-      t->peers[i].quiet = 0;
     for (rounds = 0; rounds < t->c.queue_frames + 2; ++rounds) {
+      /* New data can arrive during another peer's burst. Revisit all peers
+       * using the existing batch quantum, including each new IO pass. */
+      if (rounds % SEND_BATCH_FRAMES == 0)
+        for (size_t i = 0; i < t->peer_n; ++i) t->peers[i].quiet = 0;
       before = *budget;
       t->receive_progress = 0;
       owner_tick(t, now, budget);
