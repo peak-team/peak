@@ -337,6 +337,7 @@ peak_hook_request_source_string(PeakHookRequestSource source);
 static gboolean
 peak_general_listener_refresh_hook_sample_cache_unlocked(
     size_t hook_id,
+    size_t slot_limit,
     gulong* calls_out,
     double* profile_seconds_out);
 static gboolean
@@ -2443,7 +2444,7 @@ peak_general_listener_note_detach_profile_seconds_unlocked(size_t hook_id)
 
     have_detached_sample =
         peak_general_listener_refresh_hook_sample_cache_unlocked(
-            hook_id,
+            hook_id, SIZE_MAX,
             NULL,
             &detached_profile_seconds);
     if (have_detached_sample) {
@@ -2879,7 +2880,7 @@ peak_general_listener_request_reattach_unlocked(size_t hook_id)
         peak_hook_states != NULL &&
         peak_hook_states[hook_id] == PEAK_HOOK_DETACHED &&
         !peak_general_listener_refresh_hook_sample_cache_unlocked(
-            hook_id,
+            hook_id, SIZE_MAX,
             &calls,
             NULL) &&
         !peak_general_listener_try_hook_sample_cache_unlocked(
@@ -5041,19 +5042,27 @@ peak_general_listener_retire_current_thread_slot(size_t slot)
 }
 
 static gulong
-peak_general_listener_total_calls(PeakGeneralListener* listener)
+peak_general_listener_total_calls_prefix(PeakGeneralListener* listener,
+                                         size_t slot_limit)
 {
     gulong calls = 0;
     if (listener != NULL) {
         g_mutex_lock(&listener->retired_mutex);
         calls = listener->retired_num_calls;
-        for (size_t index = 0; index < listener->fast_stats_capacity; index++) {
+        size_t limit = MIN(slot_limit, listener->fast_stats_capacity);
+        for (size_t index = 0; index < limit; index++) {
             calls += peak_general_listener_num_calls_load(
                 peak_general_listener_num_calls_slot(listener, index));
         }
         g_mutex_unlock(&listener->retired_mutex);
     }
     return calls;
+}
+
+static gulong
+peak_general_listener_total_calls(PeakGeneralListener* listener)
+{
+    return peak_general_listener_total_calls_prefix(listener, SIZE_MAX);
 }
 
 #ifdef PEAK_ENABLE_TEST_HOOKS
@@ -5208,6 +5217,7 @@ peak_general_listener_try_hook_sample_cache_unlocked(
 static gboolean
 peak_general_listener_refresh_hook_sample_cache_unlocked(
     size_t hook_id,
+    size_t slot_limit,
     gulong* calls_out,
     double* profile_seconds_out)
 {
@@ -5221,7 +5231,8 @@ peak_general_listener_refresh_hook_sample_cache_unlocked(
 
     PeakGeneralListener* pg_listener =
         PEAKGENERAL_LISTENER(array_listener[hook_id]);
-    gulong total_num_calls = peak_general_listener_total_calls(pg_listener);
+    gulong total_num_calls =
+        peak_general_listener_total_calls_prefix(pg_listener, slot_limit);
 
     double profile_seconds =
         peak_general_listener_profile_seconds_for_calls_unlocked(
@@ -5416,6 +5427,7 @@ void* peak_heartbeat_monitor(void* arg) {
         uint64_t control_pause_wall_ns = 0;
         PeakDetachAccountingSnapshot detach_accounting;
 
+        size_t slot_limit = pthread_listener_reserved_slot_limit();
         pthread_mutex_lock(&lock);
         for (size_t i = 0; i < heartbeat_capacity; i++) {
             if (!(hook_address[i] && array_listener[i])) {
@@ -5448,7 +5460,7 @@ void* peak_heartbeat_monitor(void* arg) {
             if (!have_sample) {
                 have_sample =
                     peak_general_listener_refresh_hook_sample_cache_unlocked(
-                        i,
+                        i, slot_limit,
                         &total_num_calls,
                         &hook_profile_spent_seconds);
             }

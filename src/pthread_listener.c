@@ -92,6 +92,23 @@ pthread_listener_slot_key_create(void)
         pthread_key_create(&pthread_slot_key, peak_pthread_slot_destructor) == 0;
 }
 
+size_t
+pthread_listener_reserved_slot_limit(void)
+{
+    /* Avoid waiting for thread lifecycle work. A full scan is safe if the
+     * registry snapshot is unavailable. */
+    if (!tid_mapping_initialized ||
+        pthread_mutex_trylock(&pthread_slot_registry.mutex) != 0) {
+        return SIZE_MAX;
+    }
+
+    /* Every usable slot is reserved before its TLS identity is published.
+     * next_slot remains an upper bound after retirement and reuse. */
+    size_t limit = pthread_slot_registry.next_slot;
+    (void)pthread_mutex_unlock(&pthread_slot_registry.mutex);
+    return limit;
+}
+
 static gboolean
 pthread_listener_publish_current_slot(size_t slot, uint64_t generation)
 {
