@@ -5361,6 +5361,11 @@ void* peak_heartbeat_monitor(void* arg) {
         gboolean wake_controller = FALSE;
         heartbeat_counter++;
         double now = peak_second();
+#ifdef HAVE_MPI
+        /* Read at the wall cut, before a hook scan can outlive an MPI call. */
+        double blocked = enable_global_heartbeat
+            ? peak_mpi_active_clock_blocked_seconds(peak_main_time, now) : -1.0;
+#endif
 
         pthread_mutex_lock(&lock);
         size_t current_hook_count = peak_hook_address_count;
@@ -5510,7 +5515,6 @@ void* peak_heartbeat_monitor(void* arg) {
         double recent_target = global_target_ratio;
 #ifdef HAVE_MPI
         if (enable_global_heartbeat) {
-            double blocked = peak_mpi_active_clock_blocked_seconds(peak_main_time, now);
             if (blocked >= 0.0) {
                 double cost = profile_spent_seconds + control_spent_seconds;
                 PeakMpiActiveClockPolicy lifetime = peak_mpi_active_clock_policy(
