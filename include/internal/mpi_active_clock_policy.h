@@ -2,6 +2,7 @@
 #define PEAK_MPI_ACTIVE_CLOCK_POLICY_H
 
 #include <math.h>
+#include <stddef.h>
 
 typedef struct {
     double ratio;
@@ -30,6 +31,21 @@ static inline PeakMpiActiveClockPolicy peak_mpi_active_clock_policy(
     decision.budget = q * eligible;
     decision.active = 1;
     return decision;
+}
+
+/* Charge the rank's actual or forecast control windows at raw cost. The
+ * caller separately admits the original wall-clock and local-rank risk. */
+static inline int peak_mpi_active_clock_reattach_debit(
+    double* remaining, double profile, double raw_stop, size_t windows)
+{
+    double stop = raw_stop * (double)windows;
+    if (!isfinite(*remaining) || !isfinite(profile) ||
+        !isfinite(stop) || raw_stop < 0.0 || profile < 0.0 ||
+        profile > *remaining || stop > *remaining - profile)
+        return 0;
+    *remaining -= profile;
+    *remaining -= stop;
+    return 1;
 }
 
 #endif /* PEAK_MPI_ACTIVE_CLOCK_POLICY_H */

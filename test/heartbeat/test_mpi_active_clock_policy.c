@@ -18,6 +18,41 @@ static void expect(double elapsed, double blocking, double overlap,
     assert(decision.active == active);
 }
 
+static void test_reattach_raw_budget(void)
+{
+    /* Vista long-chain observation: raw cost fits the active budget while
+     * two local-rank-scaled STOP windows fit only the wall-clock budget. */
+    const double profile = 0.0009, stop = 0.002315, lease = 0.000003;
+    const double active_budget = 0.509, wall_budget = 20.4;
+    const size_t local_ranks = 128;
+    double active_remaining = active_budget;
+    double combined_remaining = active_budget;
+    double wall_remaining = wall_budget;
+    assert(peak_mpi_active_clock_reattach_debit(
+        &active_remaining, profile, stop, 1));
+    assert(peak_mpi_active_clock_reattach_debit(
+        &combined_remaining, profile, stop * local_ranks, 1));
+    assert(!peak_mpi_active_clock_reattach_debit(
+        &combined_remaining, lease, stop * local_ranks, 1));
+    assert(peak_mpi_active_clock_reattach_debit(
+        &wall_remaining, profile, stop * local_ranks, 1));
+    assert(peak_mpi_active_clock_reattach_debit(
+        &wall_remaining, lease, stop * local_ranks, 1));
+    assert(peak_mpi_active_clock_reattach_debit(
+        &active_remaining, lease, stop, 1));
+    /* Another hook in the same batch consumes its own lease only. */
+    assert(peak_mpi_active_clock_reattach_debit(
+        &active_remaining, lease, stop, 0));
+    assert(equal(active_remaining, active_budget - profile - 2 * stop - 2 * lease));
+
+    /* A refused forecast must not consume headroom. */
+    double shortfall = 0.001;
+    assert(!peak_mpi_active_clock_reattach_debit(&shortfall, lease, stop, 1));
+    assert(!peak_mpi_active_clock_reattach_debit(&shortfall, 0.0, -1.0, 0));
+    assert(!peak_mpi_active_clock_reattach_debit(&shortfall, NAN, stop, 1));
+    assert(equal(shortfall, 0.001));
+}
+
 int main(void)
 {
     expect(20.0, 0.0, 0.0, 0.1, 2.0, 0);
@@ -41,4 +76,5 @@ int main(void)
     expect(20.0, 1.0, INFINITY, 0.1, 2.0, 0);
     expect(0.0, 0.0, 0.0, 0.1, 0.0, 0);
     expect(NAN, 0.0, 0.0, 0.1, 0.0, 0);
+    test_reattach_raw_budget();
 }

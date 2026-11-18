@@ -16,8 +16,8 @@
 #ifdef HAVE_MPI
 #include "internal/general_listener/mpi_report_transport.h"
 #include "internal/mpi_active_clock.h"
-#include "internal/mpi_active_clock_policy.h"
 #endif
+#include "internal/mpi_active_clock_policy.h"
 #include "internal/jit_provider.h"
 #include "internal/gum_module_mutation.h"
 #include "internal/unsafe_gum_prologue.h"
@@ -5668,6 +5668,8 @@ void* peak_heartbeat_monitor(void* arg) {
             double reattach_spent_seconds = 0.0;
             double reattach_risk_spent_ratio = 0.0;
             double headroom_seconds = 0.0;
+            double active_headroom_seconds = 0.0;
+            gboolean bound_active_headroom = lifetime_target < global_target_ratio;
             PeakDetachAccountingSnapshot reattach_accounting_before;
             PeakDetachAccountingSnapshot reattach_accounting_after;
             gboolean reattach_accounting_before_valid =
@@ -5708,7 +5710,7 @@ void* peak_heartbeat_monitor(void* arg) {
                 reattach_accounting_coherent &&
                 (enable_per_target_heartbeat || enable_global_heartbeat) &&
                 peak_general_listener_positive_finite(total_execution_time) &&
-                peak_general_listener_nonnegative_finite(lifetime_target) &&
+                peak_general_listener_nonnegative_finite(global_target_ratio) &&
                 peak_general_listener_nonnegative_finite(
                     peak_global_reattach_factor) &&
                 peak_general_listener_nonnegative_finite(
@@ -5731,10 +5733,10 @@ void* peak_heartbeat_monitor(void* arg) {
                     &reattach_spent_seconds) &&
                 peak_general_listener_multiply_nonnegative_finite(
                     peak_global_reattach_factor,
-                    lifetime_target,
+                    global_target_ratio,
                     &reattach_gate_ratio) &&
                 peak_general_listener_multiply_nonnegative_finite(
-                    lifetime_target,
+                    global_target_ratio,
                     total_execution_time,
                     &headroom_seconds) &&
                 peak_general_listener_subtract_nonnegative_finite(
@@ -5750,6 +5752,18 @@ void* peak_heartbeat_monitor(void* arg) {
                     peak_general_listener_nonnegative_finite(
                         reattach_risk_spent_ratio) &&
                     reattach_risk_spent_ratio <= reattach_gate_ratio;
+            }
+
+            /* The wall-clock gate retains the original local-rank STOP
+             * risk. The active clock separately limits this rank's raw spend. */
+            if (reattach_budget_ok && bound_active_headroom) {
+                reattach_budget_ok =
+                    peak_general_listener_multiply_nonnegative_finite(
+                        lifetime_target, total_execution_time,
+                        &active_headroom_seconds) &&
+                    peak_mpi_active_clock_reattach_debit(
+                        &active_headroom_seconds, profile_spent_seconds,
+                        reattach_control_spent_seconds, 1);
             }
 
             if (reattach_budget_ok) {
@@ -5855,6 +5869,11 @@ void* peak_heartbeat_monitor(void* arg) {
                         &headroom_seconds,
                         pending_stop_seconds) &&
                     headroom_seconds > 0.0;
+                if (reattach_budget_ok && bound_active_headroom) {
+                    reattach_budget_ok = peak_mpi_active_clock_reattach_debit(
+                        &active_headroom_seconds, projected_pending_reattach_seconds,
+                        last_stop_seconds, pending_batch_windows);
+                }
 
                 if (reattach_budget_ok && detached_cnt > 1) {
                     qsort(entries,
@@ -5940,6 +5959,14 @@ void* peak_heartbeat_monitor(void* arg) {
                         continue;
                     }
 
+                    double remaining_active_headroom = active_headroom_seconds;
+                    if (bound_active_headroom &&
+                        !peak_mpi_active_clock_reattach_debit(
+                            &remaining_active_headroom, incremental_lease_seconds,
+                            last_stop_seconds, after_windows - before_windows)) {
+                        continue;
+                    }
+
                     gboolean accepted;
                     double request_ratio =
                         projected_seconds / total_execution_time;
@@ -5958,6 +5985,7 @@ void* peak_heartbeat_monitor(void* arg) {
 
                     wake_controller = TRUE;
                     headroom_seconds = remaining_headroom_seconds;
+                    active_headroom_seconds = remaining_active_headroom;
                     admitted_count++;
                 }
                 pthread_mutex_unlock(&lock);

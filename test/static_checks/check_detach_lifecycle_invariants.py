@@ -2007,15 +2007,32 @@ def check_stop_window_accounting_sidecar(repo_root):
     require("double reattach_gate_ratio = 0.0" in reattach_section and
             "peak_general_listener_nonnegative_finite(\n"
             "                    peak_global_reattach_factor)" in reattach_section and
-            "peak_general_listener_nonnegative_finite(lifetime_target)" in reattach_section and
+            "peak_general_listener_nonnegative_finite(global_target_ratio)" in reattach_section and
             "peak_general_listener_multiply_nonnegative_finite(\n"
             "                    peak_global_reattach_factor,\n"
-            "                    lifetime_target,\n"
+            "                    global_target_ratio,\n"
             "                    &reattach_gate_ratio)" in reattach_section,
             "reattach gate must be built with checked factor-times-target arithmetic")
+    active_debits = " ".join(reattach_section.split())
+    require(
+        "lifetime_target, total_execution_time, &active_headroom_seconds)"
+        in active_debits and
+        "peak_mpi_active_clock_reattach_debit( &active_headroom_seconds, "
+        "profile_spent_seconds, reattach_control_spent_seconds, 1)"
+        in active_debits and
+        "peak_mpi_active_clock_reattach_debit( &active_headroom_seconds, "
+        "projected_pending_reattach_seconds, last_stop_seconds, pending_batch_windows)"
+        in active_debits and
+        "peak_mpi_active_clock_reattach_debit( &remaining_active_headroom, "
+        "incremental_lease_seconds, last_stop_seconds, after_windows - before_windows)"
+        in active_debits and
+        active_debits.index("active_headroom_seconds = remaining_active_headroom") >
+        active_debits.index("if (!accepted)"),
+        "active-clock admission must charge raw STOP and the shared lease "
+        "once at each stage, then commit the debit only on request acceptance")
     require("double headroom_seconds = 0.0" in reattach_section and
             "peak_general_listener_multiply_nonnegative_finite(\n"
-            "                    lifetime_target,\n"
+            "                    global_target_ratio,\n"
             "                    total_execution_time,\n"
             "                    &headroom_seconds)" in reattach_section and
             "peak_general_listener_subtract_nonnegative_finite(\n"
