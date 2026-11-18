@@ -1921,20 +1921,33 @@ def check_stop_window_accounting_sidecar(repo_root):
             "local_mpi_ranks" not in per_target_detach and
             "spent_ratio" not in per_target_detach,
             "per-target detach must remain cumulative-only and independent of reattach risk")
-    require("double projected_global_overhead =\n                MAX(projected_attached_recent_sum,\n                    projected_attached_lifetime_sum)" in global_detach_for_budget and
-            "if (projected_global_overhead >\n                global_target_ratio * peak_global_detach_factor)" in global_detach_for_budget and
-            "double contribution =\n                        MAX(rate_snapshot[i], ratio_snapshot[i])" in global_detach_for_budget and
+    # Each threshold is specific to its own time window. Either pressure can
+    # trigger detachment, and both must fit before the reduction loop stops.
+    global_detach_tokens = " ".join(global_detach_for_budget.split())
+    require(
+            "if (projected_attached_recent_sum > recent_target * peak_global_detach_factor || "
+            "projected_attached_lifetime_sum > lifetime_target * peak_global_detach_factor)"
+            in global_detach_tokens and
+            "if (reduced_recent_sum <= recent_target && reduced_lifetime_sum <= lifetime_target)"
+            in global_detach_tokens,
+            "global detach must trigger on either window exceeding its own threshold "
+            "and reduce until both windows fit")
+    require("double recent_target = global_target_ratio" in heartbeat and
+            "double lifetime_target = global_target_ratio" in heartbeat and
+            "recent_target = recent.ratio" in heartbeat and
+            "lifetime_target = lifetime.ratio" in heartbeat,
+            "detach window targets must default to the configured ratio and use "
+            "their matching active-clock decisions")
+    require("double contribution = MAX(rate_snapshot[i], ratio_snapshot[i])"
+            in global_detach_tokens and
             "if (contribution <= 0.0) continue;" in global_detach_for_budget and
             "entries[n_attached].ratio = contribution" in global_detach_for_budget and
             "entries[n_attached].rate = rate_snapshot[i]" in global_detach_for_budget and
             "entries[n_attached].lifetime = ratio_snapshot[i]" in global_detach_for_budget and
             "double reduced_recent_sum = projected_attached_recent_sum" in global_detach_for_budget and
             "double reduced_lifetime_sum = projected_attached_lifetime_sum" in global_detach_for_budget and
-            "double reduced_global_overhead = projected_global_overhead" in global_detach_for_budget and
-            "if (reduced_global_overhead <= global_target_ratio)" in global_detach_for_budget and
             "reduced_recent_sum -= entries[k].rate" in global_detach_for_budget and
             "reduced_lifetime_sum -= entries[k].lifetime" in global_detach_for_budget and
-            "reduced_global_overhead =\n                            MAX(reduced_recent_sum, reduced_lifetime_sum)" in global_detach_for_budget and
             "projected_attached_recent_sum = reduced_recent_sum" in global_detach_for_budget and
             "projected_attached_lifetime_sum = reduced_lifetime_sum" in global_detach_for_budget and
             "spent_ratio" not in global_detach_for_budget and
@@ -1944,12 +1957,12 @@ def check_stop_window_accounting_sidecar(repo_root):
             "local_mpi_ranks" not in global_detach_for_budget,
             "global detach must carry both profile signals and exclude raw and risk control spend")
     require("profile_global_overhead - prev_global_overhead" in adaptive_sleep and
-            "profile_global_overhead / global_target_ratio" in adaptive_sleep and
+            "profile_global_overhead / lifetime_target" in adaptive_sleep and
             "recent_rate" not in adaptive_sleep and
             "rate_snapshot" not in adaptive_sleep and
             "risk" not in adaptive_sleep and
             "local_mpi_ranks" not in adaptive_sleep,
-            "adaptive heartbeat sleep must use only the immutable hybrid global overhead")
+            "adaptive heartbeat sleep must compare immutable hybrid pressure with the lifetime target")
     reattach_section = heartbeat[
         heartbeat.find("/* 3) Reattach. */"):]
     require("value >= 0.0" in nonnegative_finite and
@@ -1994,15 +2007,15 @@ def check_stop_window_accounting_sidecar(repo_root):
     require("double reattach_gate_ratio = 0.0" in reattach_section and
             "peak_general_listener_nonnegative_finite(\n"
             "                    peak_global_reattach_factor)" in reattach_section and
-            "peak_general_listener_nonnegative_finite(global_target_ratio)" in reattach_section and
+            "peak_general_listener_nonnegative_finite(lifetime_target)" in reattach_section and
             "peak_general_listener_multiply_nonnegative_finite(\n"
             "                    peak_global_reattach_factor,\n"
-            "                    global_target_ratio,\n"
+            "                    lifetime_target,\n"
             "                    &reattach_gate_ratio)" in reattach_section,
             "reattach gate must be built with checked factor-times-target arithmetic")
     require("double headroom_seconds = 0.0" in reattach_section and
             "peak_general_listener_multiply_nonnegative_finite(\n"
-            "                    global_target_ratio,\n"
+            "                    lifetime_target,\n"
             "                    total_execution_time,\n"
             "                    &headroom_seconds)" in reattach_section and
             "peak_general_listener_subtract_nonnegative_finite(\n"

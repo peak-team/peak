@@ -32,4 +32,4 @@ static inline PeakMpiActiveClockPolicy peak_mpi_active_clock_policy(
     return decision;
 }
 
-#endif
+#endif /* PEAK_MPI_ACTIVE_CLOCK_POLICY_H */

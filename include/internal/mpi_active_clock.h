@@ -9,4 +9,4 @@ void peak_mpi_active_clock_start(double runtime_start);
  * the snapshot raced a publication or the process has no eligible rank. */
 double peak_mpi_active_clock_blocked_seconds(double runtime_start, double now);
 
-#endif
+#endif /* PEAK_MPI_ACTIVE_CLOCK_H */
