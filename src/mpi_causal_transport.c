@@ -1350,11 +1350,11 @@ static void client_tick(PeakMpiCausalTransport *t, double now, size_t *budget) {
     }
   }
 }
-static void transport_io(PeakMpiCausalTransport *t,
-                         const PeakMpiCausalRaw *raw, double now,
-                         size_t *budget) {
+static int transport_io(PeakMpiCausalTransport *t,
+                        const PeakMpiCausalRaw *raw, double now,
+                        size_t *budget) {
   int owner = t->c.rank == t->c.owner_rank;
-  size_t rounds, before;
+  size_t rounds = 0, before;
   if (owner) {
     for (rounds = 0; rounds < t->c.queue_frames + 2; ++rounds) {
       /* New data can arrive during another peer's burst. Revisit all peers
@@ -1369,6 +1369,7 @@ static void transport_io(PeakMpiCausalTransport *t,
     }
     /* A bounded end-of-heartbeat tailflush. If the shared allowance is
      * exhausted, preserve the queued ACK or due flag for the next turn. */
+    before = *budget;
     for (size_t peer = 0; peer < t->peer_n; peer++) {
       Peer *p = &t->peers[peer];
       if (p->fd < 0 || !p->ready)
@@ -1385,6 +1386,8 @@ static void transport_io(PeakMpiCausalTransport *t,
           p->out_n = p->out_at = 0;
       }
     }
+    if (*budget < before)
+      return 1;
   } else if (raw->active) {
     for (rounds = 0; rounds < t->c.queue_frames + 2; ++rounds) {
       before = *budget;
@@ -1394,6 +1397,7 @@ static void transport_io(PeakMpiCausalTransport *t,
         break;
     }
   }
+  return rounds == t->c.queue_frames + 2;
 }
 size_t peak_mpi_causal_transport_tick(PeakMpiCausalTransport *t,
                                     PeakMpiObserver *o,
@@ -1457,10 +1461,13 @@ size_t peak_mpi_causal_transport_tick(PeakMpiCausalTransport *t,
     capture(t, o, &local_budget, owner, object_limit);
   }
   io_budget += local_budget;
-  transport_io(t, raw, now, &io_budget);
+  int more_io = transport_io(t, raw, now, &io_budget);
   if (raw->active && o) {
+    size_t before_capture = io_budget;
     capture(t, o, &io_budget, owner, object_limit);
-    if (io_budget)
+    /* Skip the duplicate idle poll. Continue after a capped pass, ACK
+     * progress, or when the late capture admitted records or objects. */
+    if (io_budget && (more_io || io_budget < before_capture))
       transport_io(t, raw, now, &io_budget);
   }
   if (owner) {

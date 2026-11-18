@@ -389,6 +389,36 @@ static void test_owner_round_batches(void) {
          measured_feedbacks, (unsigned long long)spent, left, blocked_accepted,
          fresh_after);
 
+  PeakMpiObserverConfig empty_config = {1, 256, 1, 100};
+  PeakMpiObserver *empty_capture = peak_mpi_observer_create(&empty_config);
+  assert(empty_capture);
+  raw.incarnation = t[0]->c.incarnation;
+  rx_eagain = 0;
+  watching = 1;
+  peak_mpi_causal_transport_tick(t[0], empty_capture, &raw, 4, 65536);
+  watching = 0;
+  assert(rx_eagain <= world - 1);
+  /* Input and ACKs still progress on the next turn with no local capture.
+   * Lower the owner's round cap to require the second pass. */
+  t[0]->c.queue_frames = 4;
+  PeakMpiObserverRecord next = {.incarnation = 101, .thread_uid = 1,
+      .thread_generation = 1, .sequence = 257, .op_uid = 266,
+      .kind = PEAK_MPI_OBSERVER_EVENT_START};
+  for (unsigned i = 0; i < 10; ++i) {
+    assert(enqueue(t[1], RECORD, &next));
+    ++next.sequence;
+    ++next.op_uid;
+  }
+  peak_mpi_causal_transport_tick(t[1], NULL, NULL, 5, 65536);
+  struct pollfd input = {busy_fd, POLLIN, 0};
+  assert(poll(&input, 1, 1000) == 1 && (input.revents & POLLIN));
+  peak_mpi_causal_transport_tick(t[0], empty_capture, &raw, 5, 65536);
+  struct pollfd ack = {t[1]->peers[0].fd, POLLIN, 0};
+  assert(poll(&ack, 1, 1000) == 1 && (ack.revents & POLLIN));
+  peak_mpi_causal_transport_tick(t[1], NULL, NULL, 5, 65536);
+  assert(t[0]->accepted[1] == 266 && !t[1]->count);
+  peak_mpi_observer_destroy(empty_capture);
+
   for (unsigned r = 0; r < world; ++r)
     peak_mpi_causal_transport_destroy(t[r]);
   fresh_client = NULL;
@@ -528,6 +558,7 @@ static void test_feedback_materialization(int use_peek) {
 static PeakMpiObserver *pressure_source;
 static PeakMpiObserverProducer pressure_writer;
 static unsigned pressure_remote, pressure_local, pressure_lost_at, pressure_objects;
+static int reject_local;
 static PeakMpiObserverSlotState pressure_at_loss;
 static int pressure_object(void *context, unsigned rank, uint64_t incarnation,
                             const PeakMpiObserverObject *object) {
@@ -543,6 +574,8 @@ static int pressure_record(void *context, unsigned rank,
   (void)context;
   (void)record;
   if (!rank) {
+    if (reject_local)
+      return 0;
     ++pressure_local;
     return 1;
   }
@@ -634,6 +667,25 @@ static void test_local_capture_before_receive(void) {
   peak_mpi_causal_transport_tick(owner, pressure_source, NULL, 1, 65536);
   assert(peak_mpi_observer_slot_state(pressure_source, 0, &after));
   assert(pressure_objects == 1 && pressure_local == 319 && after.consumed == 319);
+  /* A held local record can be admitted by the late capture too. */
+  assert(!peak_mpi_observer_emit(pressure_source, &pressure_writer, &event));
+  owner->capture_first = reject_local = 1;
+  peak_mpi_causal_transport_tick(owner, pressure_source, NULL, 1, 384);
+  assert(owner->held && pressure_local == 319);
+  owner->capture_first = 1;
+  reject_local = 0;
+  peak_mpi_causal_transport_tick(owner, pressure_source, NULL, 1, 384);
+  assert(!owner->held && pressure_local == 320);
+  /* A definition alone must trigger the second send after an idle first pass. */
+  peak_mpi_causal_transport_tick(client, NULL, NULL, 1, 65536);
+  PeakMpiObserverObject definition = {.kind = PEAK_MPI_CAUSAL_OBJECT_COMM,
+                                       .generation = 1};
+  uint64_t definition_uid;
+  assert(!peak_mpi_observer_object_add(remote, &definition, &definition_uid));
+  client->capture_first = 1;
+  peak_mpi_causal_transport_tick(client, remote, NULL, 1, 511);
+  assert(client->next_object_uid == definition_uid + 1 &&
+         client->count == 1 && client->send_index == 1);
   peak_mpi_causal_transport_destroy(client);
   peak_mpi_causal_transport_destroy(owner);
   peak_mpi_observer_destroy(remote);
