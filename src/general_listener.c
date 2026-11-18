@@ -15,6 +15,8 @@
 #include "internal/general_listener/socket_report_transport.h"
 #ifdef HAVE_MPI
 #include "internal/general_listener/mpi_report_transport.h"
+#include "internal/mpi_active_clock.h"
+#include "internal/mpi_active_clock_policy.h"
 #endif
 #include "internal/jit_provider.h"
 #include "internal/gum_module_mutation.h"
@@ -5328,6 +5330,14 @@ void* peak_heartbeat_monitor(void* arg) {
     double prev_global_overhead = 0.0;
     double prev_global_time     = now0;
     double ema_global_rate      = 0.0;
+#ifdef HAVE_MPI
+    double previous_active_elapsed = 0.0;
+    double previous_active_blocked = -1.0;
+    double previous_active_cost = 0.0;
+    double reported_active_elapsed = 0.0;
+    double reported_active_blocked = 0.0;
+    double reported_active_target = 0.0;
+#endif
     size_t heartbeat_capacity = peak_hook_address_count;
     double min_detach_observation_time =
         (double)MAX(MAX(heartbeat_time, hb_min_us),
@@ -5496,6 +5506,39 @@ void* peak_heartbeat_monitor(void* arg) {
         profile_global_overhead = attached_pressure;
         double projected_attached_recent_sum = attached_recent_sum;
         double projected_attached_lifetime_sum = attached_lifetime_sum;
+        double lifetime_target = global_target_ratio;
+        double recent_target = global_target_ratio;
+#ifdef HAVE_MPI
+        if (enable_global_heartbeat) {
+            double blocked = peak_mpi_active_clock_blocked_seconds(peak_main_time, now);
+            if (blocked >= 0.0) {
+                double cost = profile_spent_seconds + control_spent_seconds;
+                PeakMpiActiveClockPolicy lifetime = peak_mpi_active_clock_policy(
+                    global_target_ratio, total_execution_time, blocked, cost);
+                lifetime_target = lifetime.ratio;
+                if (previous_active_blocked >= 0.0 &&
+                    total_execution_time > previous_active_elapsed &&
+                    blocked >= previous_active_blocked && cost >= previous_active_cost) {
+                    PeakMpiActiveClockPolicy recent = peak_mpi_active_clock_policy(
+                        global_target_ratio, total_execution_time - previous_active_elapsed,
+                        blocked - previous_active_blocked, cost - previous_active_cost);
+                    recent_target = recent.ratio;
+                }
+                previous_active_elapsed = total_execution_time;
+                previous_active_blocked = blocked;
+                previous_active_cost = cost;
+                reported_active_elapsed = total_execution_time;
+                reported_active_blocked = blocked;
+                reported_active_target = lifetime_target;
+            } else {
+                /* A raced snapshot cannot grant fresh lifetime headroom.
+                 * Recent hook rates still cover just one heartbeat interval. */
+                if (reported_active_elapsed > 0.0)
+                    lifetime_target = reported_active_target;
+                previous_active_blocked = -1.0;
+            }
+        }
+#endif
 
         /* 1) Per-target detach. */
         if (detach_observation_ready && enable_per_target_heartbeat) {
@@ -5536,11 +5579,10 @@ void* peak_heartbeat_monitor(void* arg) {
 
         /* 2) Global detach. */
         if (detach_observation_ready && enable_global_heartbeat) {
-            double projected_global_overhead =
-                MAX(projected_attached_recent_sum,
-                    projected_attached_lifetime_sum);
-            if (projected_global_overhead >
-                global_target_ratio * peak_global_detach_factor) {
+            if (projected_attached_recent_sum >
+                    recent_target * peak_global_detach_factor ||
+                projected_attached_lifetime_sum >
+                    lifetime_target * peak_global_detach_factor) {
                 size_t n_attached = 0;
                 pthread_mutex_lock(&lock);
                 for (size_t i = 0; i < heartbeat_capacity; i++) {
@@ -5555,6 +5597,9 @@ void* peak_heartbeat_monitor(void* arg) {
                     double contribution =
                         MAX(rate_snapshot[i], ratio_snapshot[i]);
                     if (contribution <= 0.0) continue;
+                    if (recent_target != lifetime_target)
+                        contribution = MAX(rate_snapshot[i] / MAX(recent_target, 1e-15),
+                            ratio_snapshot[i] / MAX(lifetime_target, 1e-15));
                     entries[n_attached].index = i;
                     entries[n_attached].ratio = contribution;
                     entries[n_attached].rate = rate_snapshot[i];
@@ -5571,11 +5616,11 @@ void* peak_heartbeat_monitor(void* arg) {
 
                 double reduced_recent_sum = projected_attached_recent_sum;
                 double reduced_lifetime_sum = projected_attached_lifetime_sum;
-                double reduced_global_overhead = projected_global_overhead;
                 for (size_t k = 0; k < n_attached; k++) {
                     size_t idx = entries[k].index;
 
-                    if (reduced_global_overhead <= global_target_ratio) {
+                    if (reduced_recent_sum <= recent_target &&
+                        reduced_lifetime_sum <= lifetime_target) {
                         break;
                     }
                     if (entries[k].ratio <= 0.0) {
@@ -5606,8 +5651,6 @@ void* peak_heartbeat_monitor(void* arg) {
                         if (reduced_lifetime_sum < 0.0) {
                             reduced_lifetime_sum = 0.0;
                         }
-                        reduced_global_overhead =
-                            MAX(reduced_recent_sum, reduced_lifetime_sum);
                     }
                 }
                 projected_attached_recent_sum = reduced_recent_sum;
@@ -5665,7 +5708,7 @@ void* peak_heartbeat_monitor(void* arg) {
                 reattach_accounting_coherent &&
                 (enable_per_target_heartbeat || enable_global_heartbeat) &&
                 peak_general_listener_positive_finite(total_execution_time) &&
-                peak_general_listener_nonnegative_finite(global_target_ratio) &&
+                peak_general_listener_nonnegative_finite(lifetime_target) &&
                 peak_general_listener_nonnegative_finite(
                     peak_global_reattach_factor) &&
                 peak_general_listener_nonnegative_finite(
@@ -5688,10 +5731,10 @@ void* peak_heartbeat_monitor(void* arg) {
                     &reattach_spent_seconds) &&
                 peak_general_listener_multiply_nonnegative_finite(
                     peak_global_reattach_factor,
-                    global_target_ratio,
+                    lifetime_target,
                     &reattach_gate_ratio) &&
                 peak_general_listener_multiply_nonnegative_finite(
-                    global_target_ratio,
+                    lifetime_target,
                     total_execution_time,
                     &headroom_seconds) &&
                 peak_general_listener_subtract_nonnegative_finite(
@@ -5937,8 +5980,8 @@ void* peak_heartbeat_monitor(void* arg) {
         prev_global_time     = now;
 
         /* Normalized amount by which overhead exceeds the global target. */
-        double err = (global_target_ratio > 0.0)
-                         ? (profile_global_overhead / global_target_ratio - 1.0)
+        double err = (lifetime_target > 0.0)
+                         ? (profile_global_overhead / lifetime_target - 1.0)
                          : 0.0;
         if (err < 0.0) err = 0.0;
 
@@ -5958,6 +6001,13 @@ void* peak_heartbeat_monitor(void* arg) {
     }
 
 cleanup:
+#ifdef HAVE_MPI
+    if (reported_active_elapsed > 0.0)
+        peak_log_report("[peak mpi active clock] pid=%ld elapsed=%.9g blocked=%.9g "
+                        "lifetime_target=%.9g configured_target=%.9g\n",
+                        (long)getpid(), reported_active_elapsed, reported_active_blocked,
+                        reported_active_target, (double)global_target_ratio);
+#endif
     pthread_mutex_lock(&lock);
     peak_general_listener_snapshot_heartbeat_overhead_seconds_unlocked();
     pthread_mutex_unlock(&lock);

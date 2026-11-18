@@ -73,6 +73,7 @@ if(MPI_FOUND)
     list(APPEND sources_peak
         general_listener/mpi_report_transport.c
         mpi_teardown_guard.c
+        mpi_active_clock.c
         mpi_interceptor.c)
 endif()
 if(PEAK_CUDA_ENABLED)

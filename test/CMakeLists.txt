@@ -1,5 +1,10 @@
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(test_mpi_active_clock_policy heartbeat/test_mpi_active_clock_policy.c)
+    target_include_directories(test_mpi_active_clock_policy PRIVATE ${PROJECT_SOURCE_DIR}/include)
+    target_compile_options(test_mpi_active_clock_policy PRIVATE -UNDEBUG)
+    target_link_libraries(test_mpi_active_clock_policy PRIVATE m)
+    add_test(NAME test_mpi_active_clock_policy COMMAND test_mpi_active_clock_policy)
     if(CMAKE_SYSTEM_NAME MATCHES "Linux")
         add_test(NAME test_filesystem_stat_stop_guard
             COMMAND ${CMAKE_COMMAND} -E env CC=${CMAKE_C_COMPILER}

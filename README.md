@@ -378,6 +378,7 @@ full output and teardown behavior.
 | `PEAK_GLOBAL_OVERHEAD_RATIO` | Global profiling-overhead ratio. Default: `0.1`. |
 | `PEAK_ENABLE_PER_TARGET_HEARTBEAT` | Enable per-target heartbeat detach decisions. Default: disabled. |
 | `PEAK_ENABLE_GLOBAL_HEARTBEAT` | Enable global heartbeat detach decisions. Default: enabled; set `0` or `false` to disable. |
+| `PEAK_MPI_ACTIVE_CLOCK` | Set to `1` to estimate local time available to produce profiling cost by discounting eligible blocking C MPI calls. Requires the global heartbeat, CPU targets, a multi-rank MPI world, and MPI SINGLE or FUNNELED. Default: disabled. |
 | `PEAK_GLOBAL_DETACH_FACTOR` | Global detach hysteresis factor. Default: `1.2`. |
 | `PEAK_GLOBAL_REATTACH_FACTOR` | Global reattach hysteresis factor. Default: `0.85`. |
 | `PEAK_ENABLE_REATTACH` | Allow physical reattach. Default: enabled, but reattach also requires a running heartbeat, a nonzero hibernation cycle, and at least one enabled heartbeat policy. |
@@ -385,6 +386,15 @@ full output and teardown behavior.
 | `PEAK_HB_MIN_US`, `PEAK_HB_MAX_US` | Adaptive heartbeat sleep bounds. Defaults: `10000` and `500000` microseconds. |
 | `PEAK_HB_K_ERR`, `PEAK_HB_K_RATE` | Adaptive response coefficients. Defaults: `3.0` and `0.8`. |
 | `PEAK_HB_EMA_A` | Growth-rate EMA alpha in `(0, 1]`. Default: `0.3`. |
+
+The active clock is a rank-local sampling heuristic. It measures wall time
+inside selected blocking MPI calls on the initializing thread. This time can
+include MPI computation, and other application threads can still run. For
+communicators other than WORLD it treats a non-SELF communication call as
+potentially remote. Nonempty waits after an observed communication can
+include local or inactive requests. Uninterposed calls and unsupported
+thread modes retain the ordinary local budget. The policy does not synchronize
+ranks or establish an application slowdown bound.
 
 PEAK creates the heartbeat helper only when at least one CPU target is
 requested. GPU-only, memory-only, and JIT-only workloads do not start it.
