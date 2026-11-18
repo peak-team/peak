@@ -196,7 +196,7 @@ struct PeakMpiCausalService {
   uint64_t task_epoch;
   PeakMpiCostRef task_join, task_data;
   double task_paid_bound;
-  int pub_stage, pub_complete, pub_coarse;
+  int pub_stage, pub_complete, pub_coarse, pub_material, pub_liveness;
   size_t pub_sample;
   unsigned pub_root, pub_rank;
   size_t pub_op, pub_count, pub_dep;
@@ -880,8 +880,11 @@ int peak_mpi_causal_service_ingest_raw(PeakMpiCausalService *s, unsigned r,
       if (raw->known_peers[j] && j != r)
         merge(s, r, (unsigned)j);
   raw_to_policy(s, r);
-  if (raw->unknown_members)
-    peak_mpi_policy_set_membership_known(s->ranks[root(s, r)].policy, 0, now);
+  unsigned cohort = root(s, r);
+  if (raw->unknown_members &&
+      peak_mpi_policy_set_membership_known(s->ranks[cohort].policy, 0, now) ==
+          PEAK_MPI_POLICY_OK)
+    invalidate_feedback_cache(s, cohort);
   if ((raw->coarse_reason != PEAK_MPI_OBSERVER_REASON_NONE &&
        !(raw->coarse_reason == PEAK_MPI_OBSERVER_REASON_RING_OVERFLOW &&
          raw->recovery.epoch == s->recovery.epoch &&
@@ -2474,6 +2477,29 @@ static int prepare_root_cut(PeakMpiCausalService *s, size_t budget) {
   }
   return 0;
 }
+static void note_publication_sample(PeakMpiCausalService *s, unsigned rank,
+                                    const PeakMpiPolicySample *p) {
+  const Rank *r = &s->ranks[rank];
+  const PeakMpiPolicyFeedback *f = &s->feedback_cache[rank];
+  s->pub_liveness |= p->elapsed > f->local_elapsed_at_cut;
+  s->pub_material |= !s->feedback_valid[rank] ||
+      p->event_cut != f->event_cut ||
+      p->control_generation != f->control_generation ||
+      p->mixed_control || p->D != f->D_cut;
+  /* Only ignore changes to L when the whole feedback cut identifies A. */
+  if (p->app_cost_known && f->app_cost_known) {
+    uint64_t latest = p->cut.A_ns;
+    if (r->have_raw && r->raw_cut.A_ns > latest)
+      latest = r->raw_cut.A_ns;
+    s->pub_material |= p->cut.A_ns != f->cut.A_ns ||
+        p->cut.P_ns != f->cut.P_ns || latest != f->local_latest_A_ns;
+  } else {
+    double latest = fmax(p->L, r->have_raw ? r->L : 0);
+    s->pub_material |= p->app_cost_known != f->app_cost_known ||
+        p->L != f->L_cut || p->P != f->P_cut || latest != f->local_latest_L;
+  }
+}
+
 static int publish_work(PeakMpiCausalService *s, size_t budget) {
   s->last_work_used = 0;
   if (!s->pub_stage) {
@@ -2505,6 +2531,7 @@ static int publish_work(PeakMpiCausalService *s, size_t budget) {
       s->pub_F = s->pub_age = s->pub_oldest = 0;
       s->pub_complete = 1;
       s->pub_coarse = s->ranks[s->pub_root].coarse;
+      s->pub_material = s->pub_liveness = 0;
       s->pub_stage = 2;
     } else if (s->pub_stage == 2) {
       if (s->pub_rank == s->config.world_size) {
@@ -2532,11 +2559,11 @@ static int publish_work(PeakMpiCausalService *s, size_t budget) {
                                  a->elapsed,
                                  fmax(0, s->now - a->received_at),
                                  0};
-        s->samples[s->pub_count++] = p;
         p.A = a->A;
         p.app_cost_known = a->app_cost_known;
         p.cut = a->raw_cut;
-        s->samples[s->pub_count - 1] = p;
+        note_publication_sample(s, rank, &p);
+        s->samples[s->pub_count++] = p;
         s->pub_F += p.app_cost_known ? sec(p.cut.A_ns) : p.L;
         s->pub_age = fmax(s->pub_age, p.age_seconds);
         continue;
@@ -2556,6 +2583,7 @@ static int publish_work(PeakMpiCausalService *s, size_t budget) {
             fmax(p.age_seconds,
                  a->elapsed - p.elapsed + fmax(0, s->now - a->received_at));
       p.mixed_control = a->control != p.control_generation;
+      note_publication_sample(s, rank, &p);
       s->samples[s->pub_count++] = p;
       s->pub_F = fmax(s->pub_F, p.D);
       s->pub_age = fmax(s->pub_age, p.age_seconds);
@@ -2638,6 +2666,31 @@ static int publish_work(PeakMpiCausalService *s, size_t budget) {
       s->pub_dep = input->next;
     } else {
       if (s->pub_complete && s->pub_count) {
+        Rank *leader = &s->ranks[s->pub_root];
+        const PeakMpiPolicyFeedback *previous = &s->feedback_cache[s->pub_root];
+        double interval = s->config.policy.heartbeat_max_seconds;
+        double age = s->pub_age + fmax(0, s->now - s->pub_started);
+        double since_feedback = s->now - s->feedback_captured[s->pub_root];
+        int previously_stale = previous->mode == PEAK_MPI_POLICY_STALE ||
+            previous->age_seconds + since_feedback > 3 * interval;
+        int freshness_changed = !s->pub_coarse &&
+            (age > 3 * interval ? previous->mode != PEAK_MPI_POLICY_STALE
+                                : previously_stale);
+        int liveness_due = s->pub_liveness &&
+            since_feedback >= interval;
+        /* Elapsed time or management costs can refresh a proven cut. Coalesce
+         * that refresh across the cohort without delaying new costs or edges. */
+        if (!s->pub_material && !freshness_changed && !liveness_due &&
+            previous->cohort.epoch == leader->key.epoch &&
+            previous->policy_generation == s->config.policy.policy_generation &&
+            (previous->mode == PEAK_MPI_POLICY_COARSE) == s->pub_coarse &&
+            (s->pub_coarse || leader->progress_estimate == previous->approximate) &&
+            s->pub_F == previous->F &&
+            (s->pub_oldest > 0) == (previous->oldest_unresolved_age > 0)) {
+          s->pub_root++;
+          s->pub_stage = 1;
+          continue;
+        }
         /* Policy atomically commits one coherent cohort tuple. Admit its O(n)
          * arithmetic only when this round has the matching work allowance. */
         size_t cut_work = 1 + 4 * s->pub_count;
@@ -2648,13 +2701,12 @@ static int publish_work(PeakMpiCausalService *s, size_t budget) {
         }
         budget -= cut_work;
         s->last_work_used += cut_work;
-        Rank *leader = &s->ranks[s->pub_root];
         PeakMpiPolicyCut c = {leader->key,
                               ++s->generation,
                               s->generation,
                               s->config.policy.policy_generation,
                               s->pub_F,
-                              s->pub_age + fmax(0, s->now - s->pub_started),
+                              age,
                               s->pub_oldest,
                               leader->progress_estimate ? PEAK_MPI_POLICY_OBSERVED_PROGRESS_CUT
                                                         : PEAK_MPI_POLICY_COMPLETE_CUT,

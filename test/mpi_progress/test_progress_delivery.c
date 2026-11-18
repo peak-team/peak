@@ -1057,6 +1057,108 @@ static PeakMpiCausalService *fault_make_partial(void) {
   assert(s);
   return s;
 }
+
+static void idle_feedback_turn(PeakMpiCausalService *s,
+                               PeakMpiCausalTransport *const *clients,
+                               PeakMpiCausalRaw *raw, double now) {
+  for (unsigned r = 0; r < s->config.world_size; ++r) {
+    ++raw[r].generation;
+    raw[r].elapsed = now;
+    if (r) {
+      raw[r].watermark_nonce =
+          peak_mpi_causal_transport_requested_nonce(clients[r]);
+      peak_mpi_causal_transport_tick(clients[r], NULL, &raw[r], now, 65536);
+    }
+  }
+  peak_mpi_causal_service_tick(s, NULL, &raw[0], now, 65536, 16384);
+  peak_mpi_causal_service_tick(s, NULL, NULL, now, 65536, 16384);
+  for (unsigned r = 1; r < s->config.world_size; ++r)
+    peak_mpi_causal_transport_tick(clients[r], NULL, NULL, now, 65536);
+}
+
+static void test_idle_feedback_publication(void) {
+  PeakMpiCausalService *s = fault_make_partial();
+  PeakMpiCausalServiceConfig cfg = s->config;
+  PeakMpiCausalTransportSink sink = {0};
+  PeakMpiCausalTransport *clients[4] = {0};
+  PeakMpiCausalRaw raw[4] = {0};
+  unsigned char peers[4] = {1, 1, 1, 1};
+  uint64_t prefixes[2] = {0};
+  for (unsigned r = 0; r < 4; ++r) {
+    raw[r] = (PeakMpiCausalRaw){.incarnation = 100 + r, .active = 1,
+        .idle_cut = 1, .known_peers = peers, .peer_count = 4,
+        .slot_prefixes = prefixes, .slot_count = 2, .app_cost_known = 1,
+        .contract_profile = PEAK_MPI_PROGRESS_INTEL_2021_11_ASYNC};
+    Rank *rank = &s->ranks[r];
+    assert(node(s, r, 0, 0, NULL, &rank->continuation));
+    assert(good(s, r, peak_mpi_cost_model_seal(s->model, rank->continuation)));
+    rank->have_continuation = 1;
+    if (r) {
+      cfg.rank = r;
+      cfg.incarnation = 100 + r;
+      clients[r] = peak_mpi_causal_transport_create(&cfg, &sink);
+      assert(clients[r]);
+    }
+  }
+  PeakMpiPolicyFeedback feedback = {0};
+  peak_mpi_causal_service_tick(s, NULL, &raw[0], 1, 65536, 16384);
+  for (unsigned i = 0; i < 100; ++i) {
+    idle_feedback_turn(s, clients, raw, 1);
+    if (peak_mpi_causal_transport_feedback(clients[3], &feedback) &&
+        feedback.coverage_complete)
+      break;
+  }
+  assert(feedback.coverage_complete && feedback.member_count == 4);
+  PeakMpiCausalServiceStats before, after;
+  peak_mpi_causal_service_stats(s, &before);
+  uint64_t generation = s->generation;
+  for (unsigned i = 1; i <= 80; ++i) {
+    for (unsigned r = 0; r < 4; ++r) {
+      raw[r].cut.L_ns += 1000000;
+      raw[r].L = sec(raw[r].cut.L_ns);
+    }
+    idle_feedback_turn(s, clients, raw, 1 + i * .01);
+  }
+  peak_mpi_causal_service_stats(s, &after);
+  printf("idle TCP feedback: 80 turns, %llu cuts, %llu bytes sent, "
+         "%llu received\n", (unsigned long long)(s->generation - generation),
+         (unsigned long long)(after.sent_bytes - before.sent_bytes),
+         (unsigned long long)(after.received_bytes - before.received_bytes));
+  assert(s->generation == generation && after.sent_bytes == before.sent_bytes);
+  assert(after.received_bytes > before.received_bytes &&
+         s->ranks[3].raw_cut.L_ns == raw[3].cut.L_ns);
+
+  ++s->ranks[3].requested_nonce;
+  idle_feedback_turn(s, clients, raw, 1.81);
+  idle_feedback_turn(s, clients, raw, 1.82);
+  assert(s->ranks[3].verified_nonce == 1 && s->generation == generation);
+
+  raw[2].cut.A_ns = raw[2].cut.P_ns = 2000000;
+  raw[2].A = raw[2].P = .002;
+  idle_feedback_turn(s, clients, raw, 1.83);
+  assert(peak_mpi_causal_transport_feedback(clients[3], &feedback) &&
+         feedback.F == .002 && feedback.coverage_complete);
+  uint64_t updated = feedback.generation;
+  idle_feedback_turn(s, clients, raw, 2.84);
+  assert(peak_mpi_causal_transport_feedback(clients[3], &feedback) &&
+         feedback.generation > updated && feedback.local_elapsed_at_cut == 2.84);
+  peak_mpi_causal_service_tick(s, NULL, NULL, 6, 65536, 16384);
+  peak_mpi_causal_service_tick(s, NULL, NULL, 6, 65536, 16384);
+  peak_mpi_causal_transport_tick(clients[3], NULL, NULL, 6, 65536);
+  assert(peak_mpi_causal_transport_feedback(clients[3], &feedback) &&
+         feedback.mode == PEAK_MPI_POLICY_STALE);
+  idle_feedback_turn(s, clients, raw, 6.01);
+  assert(peak_mpi_causal_transport_feedback(clients[3], &feedback) &&
+         feedback.mode == PEAK_MPI_POLICY_COMPLETE);
+  raw[3].unknown_members = 1;
+  idle_feedback_turn(s, clients, raw, 6.02);
+  assert(peak_mpi_causal_transport_feedback(clients[3], &feedback) &&
+         !feedback.membership_complete && !feedback.risk_known);
+  for (unsigned r = 1; r < 4; ++r)
+    peak_mpi_causal_transport_destroy(clients[r]);
+  peak_mpi_causal_service_destroy(s);
+}
+
 static void test_raw_cohort_membership(void) {
   PeakMpiCausalService *s = fault_make_partial();
   unsigned char peers[4] = {0, 1, 0, 0};
@@ -2752,6 +2854,7 @@ static void test_model_cpu_continuation(void) {
 }
 
 int main(void) {
+  test_idle_feedback_publication();
   test_recovery_interrupted_operation_gc();
   test_model_cpu_continuation();
   test_immediate_ordered_send();
