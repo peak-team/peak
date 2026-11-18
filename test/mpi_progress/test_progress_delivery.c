@@ -277,6 +277,51 @@ static void test_resource_failure_advisory_pressure(void) {
   peak_mpi_policy_free(p);
   puts("observer resource failure retains observed pressure without unknown headroom PASS");
 }
+static void test_receiver_recovered_pressure(void) {
+  PeakMpiPolicyReceiver r;
+  PeakMpiPolicyDecision d;
+  assert(peak_mpi_policy_receiver_init(&r, &stale_cfg, stale_key, stale_ids[0], 0) == PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_receiver_rebind(&r, stale_key, 2, 1, 0) == PEAK_MPI_POLICY_OK);
+  PeakMpiPolicy *p = peak_mpi_policy_create(&stale_cfg, stale_key, stale_ids, 2, 1, 1, 0);
+  assert(p);
+  PeakMpiPolicyFeedback f = receiver_pressure_feedback(p, 1, 1.25);
+  assert(peak_mpi_policy_receiver_accept(&r, &f, 1) == PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_receiver_snapshot_cut(&r, 1, 1, f.cut, 1, &d) == PEAK_MPI_POLICY_OK);
+  assert(d.g == 1.25 && d.reattach_relaxation);
+
+  assert(peak_mpi_policy_receiver_mark_coarse(&r, PEAK_MPI_POLICY_EVENT_LOSS, 1.1) == PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_receiver_snapshot_cut(&r, 1.1, 1.1, f.cut, 1, &d) == PEAK_MPI_POLICY_OK);
+  assert(d.mode == PEAK_MPI_POLICY_COARSE && d.g == 2);
+  assert(!d.global_available && !d.headroom_known && !d.reattach_relaxation);
+
+  assert(peak_mpi_policy_receiver_recover(&r, 1.2));
+  assert(peak_mpi_policy_receiver_snapshot_cut(&r, 1.2, 1.2, f.cut, 1, &d) == PEAK_MPI_POLICY_OK);
+  assert(d.g == 1.25 && d.q_eff == stale_cfg.q / 1.25);
+  assert(!d.global_available && !d.headroom_known && !d.reattach_relaxation);
+  assert(peak_mpi_policy_receiver_snapshot_cut(&r, 2.8, 2.8, f.cut, 1, &d) == PEAK_MPI_POLICY_OK);
+  assert(d.mode == PEAK_MPI_POLICY_STALE && d.g == 1.25);
+  assert(!d.global_available && !d.headroom_known && !d.reattach_relaxation);
+
+  f = receiver_pressure_feedback(p, 3, 1.5);
+  assert(peak_mpi_policy_receiver_accept(&r, &f, 3) == PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_receiver_snapshot_cut(&r, 3, 3, f.cut, 1, &d) == PEAK_MPI_POLICY_OK);
+  assert(d.g == 1.5 && d.reattach_relaxation);
+
+  assert(peak_mpi_policy_receiver_mark_coarse(&r, PEAK_MPI_POLICY_EVENT_LOSS, 3.1) == PEAK_MPI_POLICY_OK);
+  f.generation++;
+  f.q = 0.2;
+  assert(peak_mpi_policy_receiver_accept(&r, &f, 3.2) == PEAK_MPI_POLICY_INVALID);
+  assert(peak_mpi_policy_receiver_recover(&r, 3.3));
+  assert(peak_mpi_policy_receiver_snapshot_cut(&r, 3.3, 3.3, f.cut, 1, &d) == PEAK_MPI_POLICY_OK);
+  assert(d.g == 2 && !d.headroom_known && !d.reattach_relaxation);
+
+  assert(peak_mpi_policy_receiver_mark_coarse(&r, PEAK_MPI_POLICY_BAD_CUT, 3.4) == PEAK_MPI_POLICY_OK);
+  assert(!peak_mpi_policy_receiver_recover(&r, 3.5));
+  assert(peak_mpi_policy_receiver_snapshot_cut(&r, 3.5, 3.5, f.cut, 1, &d) == PEAK_MPI_POLICY_OK);
+  assert(d.mode == PEAK_MPI_POLICY_COARSE && d.reason == PEAK_MPI_POLICY_BAD_CUT && d.g == 2);
+  assert(!d.global_available && !d.headroom_known && !d.reattach_relaxation);
+  peak_mpi_policy_free(p);
+}
 static void test_receiver_pressure_decline(void) {
   PeakMpiPolicyReceiver r;
   PeakMpiPolicyDecision d;
@@ -1367,6 +1412,16 @@ static void recovery_scale_init(RecoveryGroups *c, int age, double learned) {
   c->service->now = 1.1;
   assert(prepare_feedback_cache(c->service, 100000));
   assert(fabs(c->service->feedback_cache[0].g - learned) < 1e-12);
+  PeakMpiPolicyReceiver receiver;
+  PeakMpiPolicyDecision decision;
+  PeakMpiPolicyFeedback before = c->service->feedback_cache[0];
+  assert(peak_mpi_policy_receiver_init(&receiver, &stale_cfg, before.cohort,
+      before.member, 0) == PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_receiver_accept(&receiver, &before, 1.1) == PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_receiver_snapshot_cut(&receiver, 1.1, 1.1,
+      before.cut, 1, &decision) == PEAK_MPI_POLICY_OK);
+  assert(peak_mpi_policy_receiver_mark_coarse(&receiver, PEAK_MPI_POLICY_EVENT_LOSS,
+      6) == PEAK_MPI_POLICY_OK);
   if (age) {
     assert(peak_mpi_policy_tick(c->service->ranks[0].policy, 5) == PEAK_MPI_POLICY_OK);
     c->service->now = 5;
@@ -1415,6 +1470,30 @@ static void recovery_scale_init(RecoveryGroups *c, int age, double learned) {
     peak_mpi_causal_service_tick(c->service, NULL, NULL, 6.2, 65536, 100000);
   assert(c->service->recovery.state == PEAK_MPI_RECOVERY_ACK &&
          c->service->approximate && !c->service->hard_fault);
+  /* The runtime handles the recovery transition and then delivers the same
+   * feedback to the policy receiver. The ACK can precede the next cost cut. */
+  PeakMpiPolicyFeedback ack;
+  assert(peak_mpi_causal_service_feedback(c->service, &ack));
+  assert(ack.recovery.state == PEAK_MPI_RECOVERY_ACK && ack.event_cut == 0 &&
+         ack.local_elapsed_at_cut == 0 && before.event_cut > 0);
+  assert(peak_mpi_policy_receiver_recover(&receiver, 6.2));
+  assert(peak_mpi_policy_receiver_accept(&receiver, &ack, 6.2) == PEAK_MPI_POLICY_IGNORED);
+  PeakMpiCostCut local = {20000000, 100000000, 100000000};
+  assert(peak_mpi_policy_receiver_snapshot_cut(&receiver, 6.2, 6.2, local, 1,
+      &decision) == PEAK_MPI_POLICY_OK);
+  assert(fabs(decision.g - learned) < 1e-12 && !decision.global_available &&
+         !decision.headroom_known && !decision.reattach_relaxation);
+  assert(!receiver.have_feedback && receiver.feedback.event_cut == before.event_cut);
+
+  before.generation = ack.generation + 1;
+  before.recovery = ack.recovery;
+  before.event_cut--;
+  /* A real backward cut remains invalid even when it carries the ACK. */
+  assert(peak_mpi_policy_receiver_accept(&receiver, &before, 6.3) == PEAK_MPI_POLICY_INVALID);
+  assert(peak_mpi_policy_receiver_snapshot_cut(&receiver, 6.3, 6.3, local, 1,
+      &decision) == PEAK_MPI_POLICY_OK);
+  assert(decision.mode == PEAK_MPI_POLICY_STALE && decision.g == 2 &&
+         !decision.global_available && !decision.reattach_relaxation);
   for (unsigned rank = 0; rank < 2; ++rank) {
     c->raw[rank].recovery.state = PEAK_MPI_RECOVERY_ACK;
     c->raw[rank].recovery.fault_mask = 0;
@@ -2695,6 +2774,7 @@ int main(void) {
   test_compact_backend();
   test_delayed_receiver_pressure();
   test_resource_failure_advisory_pressure();
+  test_receiver_recovered_pressure();
   test_receiver_pressure_decline();
   test_stale_feedback();
   test_feedback_cache_guard();

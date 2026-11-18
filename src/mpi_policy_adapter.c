@@ -693,6 +693,10 @@ int peak_mpi_policy_receiver_recover(PeakMpiPolicyReceiver *r, double now) {
     if (!r ||
         (r->permanent_coarse && r->coarse_reason != PEAK_MPI_POLICY_EVENT_LOSS))
         return 0;
+    /* The loss bound is temporary. A valid recovery restores the last measured
+     * pressure while global headroom still awaits a fresh cut. */
+    if (r->permanent_coarse && !r->feedback_invalid)
+        r->conservative_g = r->observed_g;
     r->permanent_coarse = r->feedback_invalid = 0;
     r->coarse_reason = PEAK_MPI_POLICY_NO_REASON;
     r->have_feedback = 0;
@@ -708,8 +712,20 @@ PeakMpiPolicyResult peak_mpi_policy_receiver_accept(PeakMpiPolicyReceiver *r,
     /* Local reports are not cohort feedback and cannot activate a receiver. */
     if (f->mode == PEAK_MPI_POLICY_LOCAL) return PEAK_MPI_POLICY_IGNORED;
     if (!feedback_valid(f) || f->q != r->config.q ||
-        f->policy_generation < r->config.policy_generation ||
-        (r->have_history && (f->event_cut < r->feedback.event_cut ||
+        f->policy_generation < r->config.policy_generation) {
+        r->active = r->feedback_invalid = 1;
+        return PEAK_MPI_POLICY_INVALID;
+    }
+    /* The owner can publish an ACK before any new covered cut has settled.
+     * Its empty covered fields carry no cost history. */
+    if (f->recovery.state == PEAK_MPI_RECOVERY_ACK && f->recovery.epoch &&
+        f->approximate && f->mode != PEAK_MPI_POLICY_COARSE &&
+        !f->coverage_complete && !f->rate_baseline_valid &&
+        f->event_cut == 0 && f->local_elapsed_at_cut == 0 &&
+        f->control_generation == 0 && f->L_cut == 0 && f->P_cut == 0 &&
+        f->A_cut == 0 && f->D_cut == 0)
+        return PEAK_MPI_POLICY_IGNORED;
+    if (r->have_history && (f->event_cut < r->feedback.event_cut ||
          (f->app_cost_known && r->feedback.app_cost_known &&
           (f->cut.P_ns < r->feedback.cut.P_ns || f->cut.A_ns < r->feedback.cut.A_ns ||
            f->cut.L_ns < r->feedback.cut.L_ns || f->local_latest_A_ns < r->feedback.local_latest_A_ns ||
@@ -720,7 +736,7 @@ PeakMpiPolicyResult peak_mpi_policy_receiver_accept(PeakMpiPolicyReceiver *r,
            f->local_latest_L < r->feedback.local_latest_L)) ||
          f->local_elapsed_at_cut < r->feedback.local_elapsed_at_cut ||
          f->control_generation < r->feedback.control_generation ||
-         f->policy_generation < r->feedback.policy_generation))) {
+         f->policy_generation < r->feedback.policy_generation)) {
         r->active = r->feedback_invalid = 1;
         return PEAK_MPI_POLICY_INVALID;
     }
