@@ -103,6 +103,10 @@ def main():
         source, "peak_general_listener_retire_listener_slot"
     )
     total_calls = function_body(source, "peak_general_listener_total_calls")
+    total_calls_prefix = function_body(source, "peak_general_listener_total_calls_prefix")
+    refresh_hook_sample = function_body(
+        source, "peak_general_listener_refresh_hook_sample_cache_unlocked"
+    )
     local_report = function_body(
         source, "peak_general_listener_print_with_mpi_job_policy"
     )
@@ -229,12 +233,20 @@ def main():
     require(
         "peak_general_listener_add_calls_saturating" not in source
         and "listener->retired_num_calls += calls" in retire_slot
-        and "calls += peak_general_listener_num_calls_load" in total_calls
+        and "gulong calls = 0;" in total_calls_prefix
+        and "calls = listener->retired_num_calls;" in total_calls_prefix
+        and "calls += peak_general_listener_num_calls_load" in total_calls_prefix
         and "total_num_calls += peak_general_listener_num_calls_load" in publish
         and "sum_num_calls[i] += calls" in local_report
         and "total += calls" in test_call_count,
         "call totals must preserve origin's unsigned modular aggregation in "
         "retirement, controller, heartbeat, report, and test snapshots",
+    )
+    require(
+        "peak_general_listener_total_calls_prefix(listener, SIZE_MAX)" in total_calls
+        and "peak_general_listener_total_calls_prefix(pg_listener, slot_limit)"
+        in refresh_hook_sample,
+        "full and bounded call snapshots must use the same modular aggregation",
     )
     require(
         "PEAK_HOOK_UNRESOLVED" in threshold_adjacent_generation
