@@ -7528,6 +7528,148 @@ peak_general_listener_use_selector_resolution(
     return address;
 }
 
+static void
+peak_general_listener_publish_initial_attach(const PeakDetachRequest* request,
+                                             GumAttachReturn attach_status)
+{
+    size_t i = request->hook_id;
+    if (attach_status == GUM_ATTACH_OK) {
+        hook_address[i] = request->function_address;
+        array_listener[i] = request->listener;
+        array_listener_gum_detached[i] = FALSE;
+        array_listener_gum_detach_flushed[i] = TRUE;
+        peak_general_controller_set_state_unlocked(i, PEAK_HOOK_ATTACHED);
+        return;
+    }
+
+    g_printerr("[peak] Gum initial attach failed for hook %lu (%s), status=%d\n",
+               (unsigned long)i,
+               request->symbol_name != NULL ? request->symbol_name : "<unknown>",
+               attach_status);
+    peak_general_listener_free(PEAKGENERAL_LISTENER(request->listener));
+    g_object_unref(request->listener);
+    g_free(peak_demangled_strings[i]);
+    peak_demangled_strings[i] = NULL;
+}
+
+static void
+peak_general_listener_initial_attach_one(PeakDetachRequest request,
+                                          gboolean skip_stop)
+{
+    PeakGumTargetAttachPlan plan;
+    peak_gum_target_attach_plan(request.function_address, &plan);
+    request.blocked_pc_start = plan.mutation_guard_size ? plan.mutation_address : NULL;
+    request.blocked_pc_size = plan.mutation_guard_size;
+    PeakDetachStatus detach_status = PEAK_DETACH_STATUS_ERROR;
+    peak_gum_module_mutation_begin();
+    if (!skip_stop &&
+        !peak_detach_controller_prepare_hook_mutation(&request, &detach_status)) {
+        size_t i = request.hook_id;
+        g_printerr("[peak] skipping initial Gum attach for hook %lu (%s): %s\n",
+                   (unsigned long)i,
+                   request.symbol_name != NULL ? request.symbol_name : "<unknown>",
+                   peak_detach_controller_status_string(detach_status));
+        g_free(peak_demangled_strings[i]);
+        peak_demangled_strings[i] = NULL;
+        peak_general_listener_free(PEAKGENERAL_LISTENER(request.listener));
+        g_object_unref(request.listener);
+        peak_gum_module_mutation_end();
+        return;
+    }
+
+    gum_interceptor_begin_transaction(interceptor);
+    GumAttachReturn attach_status = peak_general_listener_gum_attach_target(
+        interceptor, request.function_address, request.listener, &plan);
+    gum_interceptor_end_transaction(interceptor);
+    if (!skip_stop &&
+        !peak_detach_controller_finish_hook_mutation(&request, &detach_status)) {
+        peak_detach_controller_abort_after_failed_finish("initial attach finish",
+                                                         detach_status);
+    }
+    peak_gum_module_mutation_end();
+    peak_general_listener_publish_initial_attach(&request, attach_status);
+}
+
+static void
+peak_general_listener_initial_attach_batch(
+    const PeakDetachRequest* requests, const PeakGumTargetAttachPlan* plans,
+    size_t count, gboolean skip_stop)
+{
+    if (count < 2 || skip_stop ||
+        !peak_detach_controller_strict_batch_supported()) {
+        for (size_t i = 0; i < count; ++i)
+            peak_general_listener_initial_attach_one(requests[i], skip_stop);
+        return;
+    }
+
+    PeakDetachStatus status = PEAK_DETACH_STATUS_ERROR;
+    size_t prepared = 0;
+    PeakDetachBatchResult results[PEAK_GENERAL_CONTROLLER_MAX_BATCH_CANDIDATES];
+    GumAttachReturn attached[PEAK_GENERAL_CONTROLLER_MAX_BATCH_CANDIDATES];
+
+    peak_gum_module_mutation_begin();
+    (void)peak_detach_controller_prepare_hook_mutation_batch(
+        requests, count, results, &prepared, &status);
+    if (prepared != count) {
+        /* Preserve singleton validation and target order when a batch cannot
+         * prove every candidate safe in the same STOP window. */
+        if (prepared &&
+            !peak_detach_controller_finish_hook_mutation_batch(&status)) {
+            peak_detach_controller_abort_after_failed_finish(
+                "initial attach batch release", status);
+        }
+        peak_gum_module_mutation_end();
+        for (size_t i = 0; i < count; ++i)
+            peak_general_listener_initial_attach_one(requests[i], skip_stop);
+        return;
+    }
+
+    gum_interceptor_begin_transaction(interceptor);
+    for (size_t i = 0; i < count; ++i) {
+        attached[i] = peak_general_listener_gum_attach_target(
+            interceptor, requests[i].function_address, requests[i].listener,
+            &plans[i]);
+    }
+    gum_interceptor_end_transaction(interceptor);
+    if (!peak_detach_controller_finish_hook_mutation_batch(&status)) {
+        peak_detach_controller_abort_after_failed_finish("initial attach batch finish",
+                                                         status);
+    }
+    peak_gum_module_mutation_end();
+
+    for (size_t i = 0; i < count; ++i)
+        peak_general_listener_publish_initial_attach(&requests[i], attached[i]);
+}
+
+#if defined(GUM_PEAK_REDIRECT_RESOLVER_API_VERSION) && \
+    defined(GUM_PEAK_MAX_PROLOGUE_SIZE)
+static gboolean
+peak_general_listener_initial_attach_can_batch(
+    gpointer address, PeakGumTargetAttachPlan* plan,
+    const PeakDetachRequest* pending, size_t count)
+{
+    gpointer canonical = NULL;
+    peak_gum_target_attach_plan(address, plan);
+    if (plan->attach_exact_entry || plan->mutation_guard_size ||
+        plan->mutation_address != address ||
+        !gum_interceptor_peak_resolve_redirect_chain(interceptor, address, &canonical) ||
+        canonical != address)
+        return FALSE;
+
+    uintptr_t target = (uintptr_t)address;
+    if (target > UINTPTR_MAX - GUM_PEAK_MAX_PROLOGUE_SIZE)
+        return FALSE;
+    for (size_t i = 0; i < count; ++i) {
+        uintptr_t prior = (uintptr_t)pending[i].function_address;
+        /* An overlapping patch can change the target bytes and redirect plan. */
+        uintptr_t distance = target < prior ? prior - target : target - prior;
+        if (distance < GUM_PEAK_MAX_PROLOGUE_SIZE)
+            return FALSE;
+    }
+    return TRUE;
+}
+#endif
+
 void
 peak_general_listener_attach()
 {
@@ -7644,6 +7786,14 @@ peak_general_listener_attach()
         peak_target_resolver_resolve_many(startup_resolutions,
                                           peak_hook_address_count);
     }
+    PeakDetachRequest startup_requests[PEAK_GENERAL_CONTROLLER_MAX_BATCH_CANDIDATES];
+    PeakGumTargetAttachPlan startup_plans[PEAK_GENERAL_CONTROLLER_MAX_BATCH_CANDIDATES];
+    size_t startup_count = 0;
+#if defined(GUM_PEAK_REDIRECT_RESOLVER_API_VERSION) && \
+    defined(GUM_PEAK_MAX_PROLOGUE_SIZE)
+    gboolean guarded_startup_batch = !startup_attach_can_skip_stop &&
+        peak_detach_controller_strict_batch_supported();
+#endif
     for (size_t i = 0; i < peak_hook_address_count; i++) {
         /* Redirect functions for which PEAK already owns support wrappers. */
         if (strcmp(peak_hook_strings[i], "MPI_Finalize") == 0 ||
@@ -7738,6 +7888,21 @@ peak_general_listener_attach()
         }
         if (hook_address[i]) {
             gpointer resolved_hook_address = hook_address[i];
+            PeakGumTargetAttachPlan attach_plan;
+            gboolean use_batch = FALSE;
+#if defined(GUM_PEAK_REDIRECT_RESOLVER_API_VERSION) && \
+    defined(GUM_PEAK_MAX_PROLOGUE_SIZE)
+            use_batch = guarded_startup_batch &&
+                peak_general_listener_initial_attach_can_batch(
+                    resolved_hook_address, &attach_plan, startup_requests,
+                    startup_count);
+#endif
+            if (!use_batch && startup_count) {
+                peak_general_listener_initial_attach_batch(
+                    startup_requests, startup_plans, startup_count,
+                    startup_attach_can_skip_stop);
+                startup_count = 0;
+            }
             gboolean duplicate_address = FALSE;
             for (size_t j = 0; j < i; j++) {
                 if (hook_address[j] == resolved_hook_address &&
@@ -7784,8 +7949,6 @@ peak_general_listener_attach()
                 peak_demangled_strings[i] = NULL;
                 continue;
             }
-            PeakGumTargetAttachPlan attach_plan;
-            peak_gum_target_attach_plan(resolved_hook_address, &attach_plan);
             PeakDetachRequest mutation_request = {
                 .hook_id = i,
                 .symbol_name = peak_hook_strings[i],
@@ -7793,59 +7956,29 @@ peak_general_listener_attach()
                 .interceptor = interceptor,
                 .listener = new_listener,
                 .operation = PEAK_DETACH_OPERATION_ATTACH,
-                .blocked_pc_start = attach_plan.mutation_guard_size > 0
-                    ? attach_plan.mutation_address
-                    : NULL,
-                .blocked_pc_size = attach_plan.mutation_guard_size
             };
-            PeakDetachStatus detach_status = PEAK_DETACH_STATUS_ERROR;
-            peak_gum_module_mutation_begin();
-            if (!startup_attach_can_skip_stop &&
-                !peak_detach_controller_prepare_hook_mutation(&mutation_request,
-                                                              &detach_status)) {
-                g_printerr("[peak] skipping initial Gum attach for hook %lu (%s): %s\n",
-                           (unsigned long)i,
-                           peak_hook_strings[i] != NULL ? peak_hook_strings[i] : "<unknown>",
-                           peak_detach_controller_status_string(detach_status));
-                g_free(peak_demangled_strings[i]);
-                peak_demangled_strings[i] = NULL;
-                peak_general_listener_free(PEAKGENERAL_LISTENER(new_listener));
-                g_object_unref(new_listener);
-                peak_gum_module_mutation_end();
+            if (!use_batch) {
+                peak_general_listener_initial_attach_one(
+                    mutation_request, startup_attach_can_skip_stop);
                 continue;
             }
-            gum_interceptor_begin_transaction(interceptor);
-            GumAttachReturn attach_status =
-                peak_general_listener_gum_attach_target(interceptor,
-                                                        resolved_hook_address,
-                                                        new_listener,
-                                                        &attach_plan);
-            gum_interceptor_end_transaction(interceptor);
-            if (!startup_attach_can_skip_stop &&
-                !peak_detach_controller_finish_hook_mutation(&mutation_request,
-                                                             &detach_status)) {
-                peak_detach_controller_abort_after_failed_finish("initial attach finish",
-                                                                detach_status);
-            }
-            peak_gum_module_mutation_end();
-            if (attach_status == GUM_ATTACH_OK) {
-                hook_address[i] = resolved_hook_address;
-                array_listener[i] = new_listener;
-                array_listener_gum_detached[i] = FALSE;
-                array_listener_gum_detach_flushed[i] = TRUE;
-                peak_general_controller_set_state_unlocked(i, PEAK_HOOK_ATTACHED);
-            } else {
-                g_printerr("[peak] Gum initial attach failed for hook %lu (%s), status=%d\n",
-                           (unsigned long)i,
-                           peak_hook_strings[i] != NULL ? peak_hook_strings[i] : "<unknown>",
-                           attach_status);
-                peak_general_listener_free(PEAKGENERAL_LISTENER(new_listener));
-                g_object_unref(new_listener);
-                g_free(peak_demangled_strings[i]);
-                peak_demangled_strings[i] = NULL;
+#if defined(GUM_PEAK_MAX_PROLOGUE_SIZE)
+            mutation_request.blocked_pc_start = resolved_hook_address;
+            mutation_request.blocked_pc_size = GUM_PEAK_MAX_PROLOGUE_SIZE;
+#endif
+            startup_requests[startup_count] = mutation_request;
+            startup_plans[startup_count++] = attach_plan;
+            if (startup_count == PEAK_GENERAL_CONTROLLER_MAX_BATCH_CANDIDATES) {
+                peak_general_listener_initial_attach_batch(
+                    startup_requests, startup_plans, startup_count,
+                    startup_attach_can_skip_stop);
+                startup_count = 0;
             }
         }
     }
+    peak_general_listener_initial_attach_batch(
+        startup_requests, startup_plans, startup_count,
+        startup_attach_can_skip_stop);
     for (size_t i = 0; startup_resolutions != NULL &&
                        i < peak_hook_address_count; i++) {
         peak_target_resolution_clear(&startup_resolutions[i].resolution);

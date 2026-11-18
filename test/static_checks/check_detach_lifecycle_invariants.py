@@ -763,27 +763,45 @@ def check_safe_arm64_plt_reads(repo_root):
         dlopen_source, "dlopen_interceptor_initialize_attach_candidate"
     )
     normalized_dlopen_plan = re.sub(r"\s+", " ", dlopen_plan)
-    for label, body in (
-        ("initial", initial_attach),
-        ("JIT", jit_attach),
+    initial_parts = (
+        "peak_general_listener_initial_attach_one",
+        "peak_general_listener_initial_attach_batch",
+    )
+    single, batch = (extract_function(general, name) for name in initial_parts)
+    eligibility = extract_function(general, "peak_general_listener_initial_attach_can_batch")
+    require(
+        "peak_gum_target_attach_plan(request.function_address, &plan)" in single and
+        "request.blocked_pc_start = plan.mutation_guard_size ? plan.mutation_address : NULL" in single and
+        "request.blocked_pc_size = plan.mutation_guard_size" in single and
+        "canonical != address" in eligibility and
+        "distance < GUM_PEAK_MAX_PROLOGUE_SIZE" in eligibility and
+        "mutation_request.blocked_pc_start = resolved_hook_address" in initial_attach and
+        "mutation_request.blocked_pc_size = GUM_PEAK_MAX_PROLOGUE_SIZE" in initial_attach and
+        "startup_requests[startup_count] = mutation_request" in initial_attach and
+        "startup_plans[startup_count++] = attach_plan" in initial_attach,
+        "initial attach must replan singletons and batch only disjoint canonical entry ranges",
+    )
+    for body, guard, plan in (
+        (single, "peak_detach_controller_prepare_hook_mutation(", "plan"),
+        (batch, "peak_detach_controller_prepare_hook_mutation_batch(", "&plans[i]"),
     ):
-        normalized = re.sub(r"\s+", " ", body)
-        plan_position = body.find("peak_gum_target_attach_plan(")
-        blocked_position = body.find(".blocked_pc_start =")
-        prepare_position = body.find("peak_detach_controller_prepare_hook_mutation")
-        require(plan_position != -1 and blocked_position != -1 and
-                prepare_position != -1 and
-                plan_position < blocked_position < prepare_position,
-                f"{label} first attach must guard its planned mutation range")
-        require(
+        guard_position = body.find(guard)
+        attach_position = body.find("peak_general_listener_gum_attach_target(")
+        require(guard_position >= 0 and attach_position > guard_position and
+                plan in body[attach_position:],
+                "startup mutators must apply the original target plan after guarding mutations")
+    normalized = " ".join(jit_attach.split())
+    plan_position = jit_attach.find("peak_gum_target_attach_plan(")
+    blocked_position = jit_attach.find(".blocked_pc_start =")
+    prepare_position = jit_attach.find("peak_detach_controller_prepare_hook_mutation")
+    require(0 <= plan_position < blocked_position < prepare_position and
             ".blocked_pc_start = attach_plan.mutation_guard_size > 0 ? "
             "attach_plan.mutation_address : NULL" in normalized and
             ".blocked_pc_size = attach_plan.mutation_guard_size" in normalized and
             ("peak_gum_interceptor_attach_target(" in normalized or
              "peak_general_listener_gum_attach_target(" in normalized) and
             "&attach_plan" in normalized,
-            f"{label} attach must use one plan for both strict guard and Gum options",
-        )
+            "JIT attach must use one plan for both strict guard and Gum options")
     require(
         "peak_gum_target_attach_plan(" in dlopen_plan and
         ".blocked_pc_start = candidate->attach_plan.mutation_guard_size > 0 ? "
@@ -2234,9 +2252,14 @@ def check_stop_window_accounting_sidecar(repo_root):
             "task_count > 1" in startup_skip and
             "return read_errno == 0 && task_count == 1;" in startup_skip,
             "startup attach stop-skip must fail closed on /proc read errors and be proven by a single-thread task count")
-    require("startup_attach_can_skip_stop" in general_listener_attach and
-            "!startup_attach_can_skip_stop &&" in general_listener_attach,
-            "initial attach must skip the stop backend only after a single-thread proof")
+    initial_one = extract_function(general, "peak_general_listener_initial_attach_one")
+    initial_batch = extract_function(general, "peak_general_listener_initial_attach_batch")
+    require("peak_general_listener_startup_attach_can_skip_stop()" in general_listener_attach and
+            "startup_attach_can_skip_stop);" in general_listener_attach and
+            "!skip_stop &&" in initial_one and "if (count < 2 || skip_stop ||" in initial_batch and
+            "prepared != count" in initial_batch and
+            "peak_general_listener_initial_attach_one(" in initial_batch,
+            "initial attach must preserve the single-thread proof or guard every target")
     require("startup_attach_can_skip_stop" in overhead_bootstrap and
             overhead_bootstrap.count(
                 "peak_general_listener_startup_attach_can_skip_stop()"

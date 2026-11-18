@@ -37,8 +37,8 @@ EXPECTED = {
     },
     ("strict-controller", "src/general_listener.c"): {
         "detach": 5,
-        "begin_transaction": 10,
-        "end_transaction": 10,
+        "begin_transaction": 11,
+        "end_transaction": 11,
         "flush": 2,
     },
     ("strict-target-attach", "src/unsafe_gum_prologue.c"): {
@@ -101,7 +101,8 @@ FUNCTION_ANCHORS = {
         "peak_general_controller_flush_teardown": "strict-controller",
         "peak_general_overhead_bootstrapping": "strict-controller",
         "peak_general_listener_dynamic_attach_symbol": "strict-controller",
-        "peak_general_listener_attach": "strict-controller",
+        "peak_general_listener_initial_attach_one": "strict-controller",
+        "peak_general_listener_initial_attach_batch": "strict-controller",
     },
     "src/malloc_interceptor.c": {
         "PEAK_MALLOC_REPLACE_FAST": "support-init",
