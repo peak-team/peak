@@ -198,8 +198,6 @@ function(_peak_replace_gum_relocator _source_dir _output_dir)
 endfunction()
 
 function(_peak_compile_peak_gum_overlay _source_dir _input_dir _output_dir)
-    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-        "${_source_dir}/peak-gum/peak_gum_invoke_cfi.inc")
     file(MAKE_DIRECTORY "${_output_dir}")
     configure_file("${_input_dir}/libfrida-gum.a"
                    "${_output_dir}/libfrida-gum.a" COPYONLY)
