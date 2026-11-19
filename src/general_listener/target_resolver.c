@@ -1040,11 +1040,6 @@ peak_target_collect_batch_symbol(const GumSymbolDetails* details,
     PeakTargetBatchCollectContext* batch = user_data;
     GPtrArray* exact_matches;
     char* demangled = NULL;
-    gchar* normalized = NULL;
-    gchar* qualified = NULL;
-    char* short_name = NULL;
-    char* legacy_short_name = NULL;
-
     if (details->type != GUM_SYMBOL_FUNCTION || details->address == 0 ||
         details->name == NULL) {
         return TRUE;
@@ -1072,18 +1067,26 @@ peak_target_collect_batch_symbol(const GumSymbolDetails* details,
                                       exact_matches,
                                       details->name, demangled,
                                       PEAK_TARGET_MATCH_EXACT, batch->current_module);
-    if (demangled != NULL) {
-        normalized = peak_target_without_space(demangled);
+    if (demangled == NULL) {
+        return TRUE;
+    }
+
+    if (g_hash_table_size(batch->full) != 0) {
+        gchar* normalized = peak_target_without_space(demangled);
         peak_target_collect_batch_matches(details,
                                           g_hash_table_lookup(batch->full,
                                                               normalized),
                                           details->name, demangled,
                                           PEAK_TARGET_MATCH_FULL, batch->current_module);
-        short_name = peak_target_full_function_id(demangled);
+        g_free(normalized);
+    }
+    if (g_hash_table_size(batch->full_by_name) != 0) {
+        char* function_id = peak_target_full_function_id(demangled);
         peak_target_collect_full_matches(details,
                                          g_hash_table_lookup(batch->full_by_name,
-                                                             short_name),
+                                                             function_id),
                                          details->name, demangled, batch->current_module);
+        free(function_id);
         for (const char* cursor = demangled; *cursor != '\0'; ) {
             const char* begin;
             const char* end;
@@ -1099,35 +1102,28 @@ peak_target_collect_batch_symbol(const GumSymbolDetails* details,
                 details->name, demangled, batch->current_module);
             g_free(key);
         }
-        qualified = peak_target_without_final_parameters(demangled);
-        {
-            char* return_prefix = strrchr(qualified, ' ');
-            if (return_prefix != NULL) {
-                memmove(qualified, return_prefix + 1,
-                        strlen(return_prefix + 1) + 1);
-            }
-        }
-        {
-            gchar* normalized_qualified = peak_target_without_space(qualified);
-            peak_target_collect_legacy_matches(details,
-                                               g_hash_table_lookup(
-                                                   batch->legacy_qualified,
-                                                   normalized_qualified),
-                                               details->name, demangled, batch->current_module);
-            g_free(normalized_qualified);
-        }
-        if (g_hash_table_size(batch->legacy_short) != 0) {
-            legacy_short_name = extract_function_name(demangled);
-            peak_target_collect_legacy_matches(
-                details,
-                g_hash_table_lookup(batch->legacy_short, legacy_short_name),
-                details->name, demangled, batch->current_module);
-        }
     }
-    free(legacy_short_name);
-    free(short_name);
-    g_free(qualified);
-    g_free(normalized);
+    if (g_hash_table_size(batch->legacy_qualified) != 0) {
+        gchar* qualified = peak_target_without_final_parameters(demangled);
+        char* return_prefix = strrchr(qualified, ' ');
+        if (return_prefix != NULL) {
+            memmove(qualified, return_prefix + 1, strlen(return_prefix + 1) + 1);
+        }
+
+        gchar* normalized = peak_target_without_space(qualified);
+        peak_target_collect_legacy_matches(
+            details, g_hash_table_lookup(batch->legacy_qualified, normalized),
+            details->name, demangled, batch->current_module);
+        g_free(normalized);
+        g_free(qualified);
+    }
+    if (g_hash_table_size(batch->legacy_short) != 0) {
+        char* short_name = extract_function_name(demangled);
+        peak_target_collect_legacy_matches(
+            details, g_hash_table_lookup(batch->legacy_short, short_name),
+            details->name, demangled, batch->current_module);
+        free(short_name);
+    }
     free(demangled);
     return TRUE;
 }
