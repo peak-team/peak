@@ -443,6 +443,13 @@ sleep_us =
   clip(heartbeat_time * scale, hb_min_us, hb_max_us)
 ```
 
+With a valid MPI active-clock sample, including a retained sample when a
+later read races, the rate term uses `max(ema_global_rate, 0)`. Falling
+pressure then leaves cadence to the current budget error. An unordered rate
+contribution also leaves the budget error in charge. Until the first valid
+sample, the signed-rate formula above applies, as it does when active
+clock is disabled or unsupported.
+
 Timed sleep is excluded from heartbeat-management CPU accounting. The wait uses
 a condition variable so shutdown can wake the heartbeat promptly.
 

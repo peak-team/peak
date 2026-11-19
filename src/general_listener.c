@@ -6029,8 +6029,14 @@ void* peak_heartbeat_monitor(void* arg) {
                          : 0.0;
         if (err < 0.0) err = 0.0;
 
-        /* Check more frequently when error or growth rate is larger. */
-        double scale = 1.0 / (1.0 + hb_k_err * err + hb_k_rate * ema_global_rate);
+        const double error_denominator = 1.0 + hb_k_err * err;
+        double denominator = error_denominator + hb_k_rate * ema_global_rate;
+#ifdef HAVE_MPI
+        /* A falling or unordered rate cannot cancel the active-clock budget error. */
+        if (reported_active_elapsed > 0.0)
+            denominator = fmax(fmax(1.0, error_denominator), denominator);
+#endif
+        double scale = 1.0 / denominator;
 
         long long sleep_us = (long long)(clipd((double)heartbeat_time * scale,
                                        (double)hb_min_us,
