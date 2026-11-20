@@ -188,13 +188,20 @@ int main(void)
 {
     gum_init_embedded();
     PeakGumInterceptor17 self = { 0 };
-    guint8 entry[32] = { 0x1f, 0x20, 0x03, 0xd5 }; /* nop */
+    /* Gum examines up to 1024 bytes beyond the relocated prefix. Model a
+     * complete function with a return and readable padding, even during the
+     * early fake-install cases that invoke the real checked relocator. */
+    guint32 code[32 / sizeof(guint32) + 1024 / sizeof(guint32)] = {
+        0xd503201fu, 0xd503201fu, 0xd503201fu, 0xd503201fu,
+        0xd503201fu, 0xd503201fu, 0xd503201fu, 0xd65f03c0u,
+    };
+    guint8* entry = (guint8*)code;
     guint8 original[32], active[32];
     gpointer canonical, original_function;
     guint len;
     GumInterceptor* interceptor = (GumInterceptor*)&self;
     GumInvocationListener* listener = (GumInvocationListener*)0x1234;
-    memcpy(patch_bytes, entry, sizeof(entry));
+    memcpy(patch_bytes, entry, sizeof(patch_bytes));
     g_rec_mutex_init(&self.mutex);
     self.allocator.pages_per_batch = 7;
     self.allocator.slice_size = 256;
@@ -292,12 +299,7 @@ int main(void)
     assert(near_allocations == reserved_releases);
     /* The custom redirect accepts short direct branches, declines short
      * unreachable entries, and emits a full absolute redirect when needed. */
-    for (guint i = 0; i < sizeof(entry); i += 4) {
-        guint32 nop = 0xd503201f;
-        memcpy(entry + i, &nop, 4);
-    }
-    guint32 ret = 0xd65f03c0u;
-    memcpy(entry + sizeof(entry) - 4, &ret, 4);
+    memcpy(entry, patch_bytes, sizeof(patch_bytes));
     GumArm64Writer writer;
     guint8 redirect[32] = { 0 };
     guint redirect_size = 0;
