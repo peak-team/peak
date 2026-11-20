@@ -897,6 +897,11 @@ void pthread_listener_attach()
     peak_detach_controller_note_thread_creation_gate_installed(FALSE);
 
 #ifdef PEAK_ATTACH_RUNTIME
+#if defined(__linux__) && defined(PEAK_HAVE_GUM_PEAK_PC_API)
+    /* Start Gum's module-registry worker before intercepting pthread_create
+     * so it never claims an application statistics slot. */
+    (void)gum_module_registry_obtain();
+#endif
     /* Resolve every address before STOP. The support symbol lookup is the
      * runtime's loaded-module lookup, never RTLD_NEXT from the injected DSO. */
     pthread_create_hook_address = peak_general_listener_find_function("pthread_create");

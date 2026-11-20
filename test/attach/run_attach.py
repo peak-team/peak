@@ -223,9 +223,9 @@ else:
                 paths = list(root.glob("calibration*.csv"))
                 assert len(paths) == 1, paths
                 with paths[0].open() as stream:
-                    rows = [row for row in csv.DictReader(stream)
-                            if row.get("function") == "peak_attach_existing_target"]
-                assert rows and sum(int(row["count"]) for row in rows) > 0, rows
+                    rows = list(csv.DictReader(stream))
+                assert sum(int(row["count"]) for row in rows
+                           if row.get("function") == "peak_attach_existing_target") > 0, rows
                 assert all(int(row["dropped_calls"]) == int(row["dropped_threads"]) == 0
                            for row in rows), rows
                 print("attach_calibration_ok")
