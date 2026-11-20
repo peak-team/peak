@@ -2778,14 +2778,14 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
                            resolved_targets[i].name);
                 continue;
             }
-            /* Dynamic C++ resolution is deliberately explicit. An
-             * ordinary raw-name misses use the exact owned-module batch;
-             * C++ selectors must name the DSO whose completed dlopen request
-             * is allowed to trigger a resolver scan. */
+            /* Ordinary raw-name misses use the exact owned-module batch.
+             * For C++ selectors, only a dlopen of the explicitly named
+             * DSO can trigger a scan. A valid startup selector can lack
+             * that scope, so report the late-load limit at INFO. */
             if (selector_module == NULL ||
                 strchr(selector_module, G_DIR_SEPARATOR) == NULL) {
-                g_printerr("[peak] dynamic C++ selector requires path-qualified module!symbol scope; refusing to attach: %s\n",
-                           resolved_targets[i].name);
+                peak_log_info("[peak] dynamic C++ selector requires path-qualified module!symbol scope; refusing to attach: %s\n",
+                              resolved_targets[i].name);
                 g_free(selector_module);
                 resolved_targets[i].terminal = TRUE;
                 continue;

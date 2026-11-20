@@ -22,7 +22,7 @@ def main() -> int:
     args = parser.parse_args()
 
     env = os.environ.copy()
-    for name in ("PEAK_TARGET_FILE", "PEAK_TARGET_GROUP"):
+    for name in ("PEAK_TARGET_FILE", "PEAK_TARGET_GROUP", "PEAK_VERBOSITY"):
         env.pop(name, None)
 
     existing_preload = env.get(args.preload_env, "")
@@ -36,29 +36,45 @@ def main() -> int:
         "PEAK_HEARTBEAT_INTERVAL": "0",
         "PEAK_TARGET": "my_sleep_func",
         "PEAK_TEXT_OUTPUT": "1",
-        "PEAK_VERBOSITY": "quiet",
     })
 
-    with tempfile.TemporaryDirectory(prefix="peak-report-format-") as tmpdir:
-        env["PEAK_STATSLOG_PATH"] = str(Path(tmpdir) / "stats.log")
-        completed = subprocess.run(
-            [args.exe],
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
+    def run(label, verbosity=None):
+        with tempfile.TemporaryDirectory(prefix="peak-report-format-") as tmpdir:
+            test_env = dict(env, PEAK_STATSLOG_PATH=str(Path(tmpdir) / "stats.log"))
+            if verbosity is not None:
+                test_env["PEAK_VERBOSITY"] = verbosity
+            completed = subprocess.run(
+                [args.exe],
+                env=test_env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        output = completed.stderr
+        require(completed.returncode == 0,
+                f"{label}: fixture exited with {completed.returncode}\n"
+                f"{completed.stdout}{output}")
+        return output
 
-    output = completed.stdout + completed.stderr
-    require(completed.returncode == 0,
-            f"fixture exited with {completed.returncode}\n{output}")
+    output = run("default")
+    detailed_output = run("info", "info")
+    diagnostics = (
+        "Profiler capability [",
+        "Profiler CUDA API coverage:",
+        "Controller accounting",
+        "Detailed metrics (stable key=value)",
+        "[peak] per-rank elapsed range:",
+        "[peak] local profile+control overhead:",
+        "[peak] local final transition coverage:",
+    )
+    for diagnostic in diagnostics:
+        require(diagnostic not in output, f"default report printed {diagnostic}")
+        require(diagnostic in detailed_output, f"info report omitted {diagnostic}")
 
     required_sections = (
         "Application",
         "Overhead summary",
-        "Controller accounting",
-        "Detailed metrics (stable key=value)",
         "Function call statistics",
         "Function timing statistics",
     )
@@ -89,10 +105,6 @@ def main() -> int:
     require(re.search(r"^Recorded calls: [1-9][0-9]*$",
                       output, re.MULTILINE),
             "missing recorded-call count")
-    require("[peak] local profile+control overhead:" in output,
-            "missing stable profile/control metric")
-    require("[peak] local final transition coverage:" in output,
-            "missing stable transition-coverage metric")
     require(output.count("my_sleep_func") >= 2,
             "profiled function must appear in both tables")
     require("Markers: * ever detached; ** ever reattached after detachment."

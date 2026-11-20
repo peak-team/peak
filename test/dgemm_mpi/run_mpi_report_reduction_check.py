@@ -2,6 +2,7 @@
 
 import argparse
 import math
+import os
 import re
 import shlex
 import subprocess
@@ -76,6 +77,7 @@ def main():
     ]
     proc = subprocess.run(
         command,
+        env=dict(os.environ, PEAK_VERBOSITY="info"),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,

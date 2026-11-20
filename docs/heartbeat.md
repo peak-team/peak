@@ -472,13 +472,20 @@ heartbeat and controller threads have joined. That snapshot contains:
 - local-rank-scaled control risk ratio;
 - management ratio.
 
-Single-process and rank-local output print the `local` stop-window label.
-Aggregate MPI/socket output prints per-rank maximum ratios where applicable and
-uses `rank-0/local` for the root rank's local stop-window count and wall. The
-stop-window report uses the same baseline-adjusted values:
+The default text report summarizes estimated profiling cost and measured control
+stop-window time. Set `PEAK_VERBOSITY=info` to include the controller accounting
+and detailed key=value metrics below.
+
+Single-process and rank-local diagnostics print the `local` stop-window label.
+Aggregate MPI/socket output reports per-rank maximum ratios where available.
+The stop-window diagnostic identifies the rank with the highest combined
+profile and control ratio. When per-rank maxima are unavailable, it reports
+the root rank's values with the `rank-0/local` label. The diagnostic uses
+baseline-adjusted values:
 
 ```text
 [peak] local control stop-window overhead: windows=N wall_seconds=S ratio=R
+[peak] owner/local control stop-window overhead: owner_rank=I windows=N wall_seconds=S ratio=R
 [peak] rank-0/local control stop-window overhead: windows=N wall_seconds=S ratio=R
 ```
 
@@ -491,9 +498,8 @@ parsable:
 ```
 
 MPI and socket aggregation sum the failed-window count and require a valid
-final snapshot from every rank. The completed-window wall metric remains
-explicitly rank-0/local because heartbeat accounting itself is not MPI
-synchronized.
+final snapshot from every rank. Completed-window wall time is an individual
+rank's measurement because each rank operates its own heartbeat.
 
 Transition coverage is also reported:
 
@@ -505,8 +511,15 @@ detached_targets=N reattached_targets=N revisited_targets=N
 and then accumulated additional profiled calls after the reattach request
 baseline.
 
-CSV output remains per-function profile data. The text report is where the
-profile/control/risk/management split is currently visible.
+The detailed text metrics include the local-rank risk estimate and heartbeat CPU
+time. CSV output is independent of text verbosity.
+
+For an MPI controller diagnostic, set `PEAK_VERBOSITY=debug`. The
+`[peak mpi active clock]` line describes the last valid sample on an individual
+process. `elapsed` is elapsed wall time in seconds, `blocked` is time in covered
+blocking MPI calls in seconds, and `lifetime_target` is the resulting
+rank-local overhead budget expressed as a fraction. `configured_target` is
+the configured global overhead budget before that adjustment.
 
 ## Environment Variables and Defaults
 

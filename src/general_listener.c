@@ -6052,11 +6052,12 @@ void* peak_heartbeat_monitor(void* arg) {
 
 cleanup:
 #ifdef HAVE_MPI
-    if (reported_active_elapsed > 0.0)
-        peak_log_report("[peak mpi active clock] pid=%ld elapsed=%.9g blocked=%.9g "
-                        "lifetime_target=%.9g configured_target=%.9g\n",
-                        (long)getpid(), reported_active_elapsed, reported_active_blocked,
-                        reported_active_target, (double)global_target_ratio);
+    if (reported_active_elapsed > 0.0) {
+        peak_log_debug("[peak mpi active clock] pid=%ld elapsed=%.9g blocked=%.9g "
+                       "lifetime_target=%.9g configured_target=%.9g\n",
+                       (long)getpid(), reported_active_elapsed, reported_active_blocked,
+                       reported_active_target, (double)global_target_ratio);
+    }
 #endif
     pthread_mutex_lock(&lock);
     peak_general_listener_snapshot_heartbeat_overhead_seconds_unlocked();

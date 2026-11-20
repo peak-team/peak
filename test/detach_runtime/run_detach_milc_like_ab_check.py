@@ -592,6 +592,7 @@ def run_case(args, peak, arm_name, trace_path=None):
             {
                 "LD_PRELOAD": args.libpeak,
                 "PEAK_TARGET": TARGET_LIST,
+                "PEAK_VERBOSITY": "info",
                 "PEAK_MAX_NUM_THREADS": str(args.peak_max_threads),
                 "PEAK_ENABLE_PER_TARGET_HEARTBEAT": "1",
                 "PEAK_ENABLE_GLOBAL_HEARTBEAT": "1",

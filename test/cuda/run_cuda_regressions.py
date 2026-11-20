@@ -42,7 +42,7 @@ def profiled_environment(peak: Path, **overrides: str) -> dict[str, str]:
         "LD_PRELOAD": str(peak),
         "PEAK_HEARTBEAT_INTERVAL": "0",
         "PEAK_OUTPUT_AGGREGATION": "local",
-        "PEAK_VERBOSITY": "warn",
+        "PEAK_VERBOSITY": "info",
     })
     env.update(overrides)
     return env

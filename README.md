@@ -286,7 +286,7 @@ in detail.
 | `PEAK_MEMLOG_TEMPLATE` | Complete memory-log CSV pathname template; it supports the same fields. |
 | `PEAK_OUTPUT_ALLOW_OVERWRITE` | Explicitly permit replacement of a completed statistics CSV. Default: disabled. |
 | `PEAK_TEXT_OUTPUT` | Force or suppress the human-readable stderr report. |
-| `PEAK_VERBOSITY` | `silent`, `report`/`quiet`, `warn`, `info`, or `debug`; numeric levels `0` through `4` are also accepted. |
+| `PEAK_VERBOSITY` | `silent`, `report`/`quiet`, `warn`, `info`, or `debug`; numeric levels `0` through `4` are also accepted. The default `warn` shows warnings and the text report when requested. Use `info` for capability and controller metrics, or `debug` for MPI active-clock samples and other internal diagnostics. |
 | `PEAK_NAME_TRUNCATE` | Truncate long function and kernel names in text output. |
 | `PEAK_MAX_NUM_THREADS` | Tracked-thread capacity. Default: twice the online CPU count; `0` uses one slot and values above `4096` clamp. A successful `pthread_join()` immediately releases a completed slot. On Linux, detached slots are reclaimed by a bounded controller slow path only after PEAK's final TLS-destructor pass and proof that the generation's kernel TID is absent from `/proc/self/task`; ambiguous cases remain quarantined. |
 | `PEAK_RUNTIME_ACTIVATION_WAIT_TIMEOUT_MS` | Maximum wait for another thread to finish deferred runtime activation. On timeout, dependent teardown/report work is skipped. Default: `5000`. |

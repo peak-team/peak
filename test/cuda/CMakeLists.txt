@@ -111,7 +111,7 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND Python3_EXECUTABLE)
                 -- $<TARGET_FILE:test_optional_backend_gating>)
     set_tests_properties(test_optional_backend_gating_runtime
         PROPERTIES
-            ENVIRONMENT "PEAK_TARGET=peak_optional_backend_cpu_target;PEAK_HEARTBEAT_INTERVAL=0;LD_PRELOAD=$<TARGET_FILE:peak>"
+            ENVIRONMENT "PEAK_TARGET=peak_optional_backend_cpu_target;PEAK_HEARTBEAT_INTERVAL=0;PEAK_VERBOSITY=info;LD_PRELOAD=$<TARGET_FILE:peak>"
             TIMEOUT 15)
     add_test(NAME test_unavailable_jit_backend_fail_open
         COMMAND ${Python3_EXECUTABLE}
@@ -124,7 +124,7 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND Python3_EXECUTABLE)
                 -- $<TARGET_FILE:test_optional_backend_gating>)
     set_tests_properties(test_unavailable_jit_backend_fail_open
         PROPERTIES
-            ENVIRONMENT "PEAK_TARGET=;PEAK_JIT_ENABLE=1;PEAK_JIT_PROVIDER=unsupported;PEAK_HEARTBEAT_INTERVAL=0;LD_PRELOAD=$<TARGET_FILE:peak>"
+            ENVIRONMENT "PEAK_TARGET=;PEAK_JIT_ENABLE=1;PEAK_JIT_PROVIDER=unsupported;PEAK_HEARTBEAT_INTERVAL=0;PEAK_VERBOSITY=info;LD_PRELOAD=$<TARGET_FILE:peak>"
             TIMEOUT 15)
     add_test(NAME test_cuda_event_recycling_runtime
         COMMAND ${Python3_EXECUTABLE}

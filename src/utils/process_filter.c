@@ -116,6 +116,7 @@ static const char *check_list[] = {
     "lscpu",
     "hostname",
     "numactl",
+    "modinfo",
     "sh",
     "bash",
     "lmod",
