@@ -6,6 +6,7 @@ import os
 import platform
 import re
 from pathlib import Path
+import shlex
 import signal
 import shutil
 import subprocess
@@ -693,6 +694,21 @@ print("collector_saturation_originals_ok")
                          if key not in ('PYTHONPATH', 'PYTHONHOME')}
         assert collect(bootstrap_script, cwd=bootstrap_cwd, env=bootstrap_env) == set()
         assert not bootstrap_marker.exists(), 'metadata probe executed a CWD module'
+
+        # Disable site imports so startup does not cache importlib ahead of
+        # the helper's imports on Python installations that preload it.
+        bootstrap_python = root/'python-no-site'
+        bootstrap_python.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} -S "$@"\n')
+        bootstrap_python.chmod(0o700)
+        bootstrap_runs = root/'bootstrap-runs'
+        bootstrap_script.write_text(
+            f'with open({str(bootstrap_runs)!r}, "a") as output:\n'
+            '    output.write("ok\\n")\n')
+        bootstrap_env.pop('PYTHONSAFEPATH', None)
+        collect(bootstrap_script, '--run-python', '--python', bootstrap_python,
+                cwd=bootstrap_cwd, env=bootstrap_env)
+        assert not bootstrap_marker.exists(), 'runtime helper executed a CWD module'
+        assert bootstrap_runs.read_text() == 'ok\n', 'target script did not run exactly once'
 
         shadow_cwd = root/'shadow-cwd'
         shadow_cwd.mkdir()
