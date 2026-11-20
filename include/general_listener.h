@@ -326,6 +326,9 @@ gpointer peak_general_listener_find_function(const char* symbol);
  * @brief Returns whether unresolved requested targets require dlopen rescans.
  */
 gboolean peak_general_listener_needs_dynamic_attach(void);
+#ifdef PEAK_ATTACH_RUNTIME
+size_t peak_general_listener_startup_pending_target_count(void);
+#endif
 
 /**
  * @brief Detaches the Peak General Listener.

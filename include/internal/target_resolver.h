@@ -77,6 +77,12 @@ PeakTargetResolveResult peak_target_resolver_resolve(
  * at most one demangle per encountered symbol. */
 void peak_target_resolver_resolve_many(PeakTargetResolveRequest* requests,
                                        size_t count);
+#ifdef PEAK_ATTACH_RUNTIME
+/* Resolve against the caller's pinned GumModule snapshot. */
+void peak_target_resolver_resolve_many_in_modules(PeakTargetResolveRequest* requests,
+                                                  size_t count,
+                                                  GPtrArray* modules);
+#endif
 
 #if defined(PEAK_TARGET_RESOLVER_TESTING) && defined(PEAK_ENABLE_TEST_HOOKS)
 PEAK_TARGET_RESOLVER_TEST_API void peak_target_resolver_reset_diagnostics(void);

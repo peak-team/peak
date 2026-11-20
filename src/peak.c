@@ -26,14 +26,23 @@
 #include "detach_controller.h"
 #include "exec_interceptor.h"
 #include "internal/exec_interceptor_internal.h"
+#ifdef PEAK_ATTACH_RUNTIME
+#include "internal/filesystem_stat_guard.h"
+#endif
 #include "internal/general_listener_internal.h"
 #if defined(__APPLE__)
 #include "internal/general_listener/attach_policy.h"
+#if defined(PEAK_HAVE_GUM_DARWIN_PATCH_API)
+#include "internal/gum_peak_darwin_patch_api.h"
+#endif
 #endif
 #include "internal/general_listener/report_snapshot.h"
 #include "internal/general_listener/runtime_config.h"
 #include "internal/general_listener/output_identity.h"
 #include "internal/jit_provider.h"
+#ifdef PEAK_ATTACH_RUNTIME
+#include "internal/target_resolver.h"
+#endif
 #include "logging.h"
 #include "pthread_listener.h"
 #include "dlopen_interceptor.h"
@@ -1020,8 +1029,8 @@ peak_has_requested_work(void)
            peak_requested_work.jit;
 }
 
-static void
-peak_freeze_capability_requests(void)
+static PeakProfilerCapabilityManifest
+peak_build_capability_manifest(PeakRequestedWork work)
 {
     PeakProfilerCapabilityManifest manifest = {0};
 
@@ -1058,20 +1067,28 @@ peak_freeze_capability_requests(void)
 #ifdef HAVE_MPI
     manifest.compiled |= PEAK_CAPABILITY_MPI_REPORT;
 #endif
-    if (peak_requested_work.cpu) {
+    if (work.cpu) {
         manifest.requested |=
             PEAK_CAPABILITY_CPU_TARGET |
             PEAK_CAPABILITY_STRICT_MUTATION;
     }
-    if (peak_requested_work.gpu) {
+    if (work.gpu) {
         manifest.requested |= PEAK_CAPABILITY_CUDA;
     }
-    if (peak_requested_work.memory) {
+    if (work.memory) {
         manifest.requested |= PEAK_CAPABILITY_MEMORY;
     }
-    if (peak_requested_work.jit) {
+    if (work.jit) {
         manifest.requested |= PEAK_CAPABILITY_JIT;
     }
+    return manifest;
+}
+
+static void
+peak_freeze_capability_requests(void)
+{
+    PeakProfilerCapabilityManifest manifest =
+        peak_build_capability_manifest(peak_requested_work);
     peak_report_capability_reset(&manifest);
 }
 
@@ -1175,6 +1192,7 @@ peak_output_aggregation_mode_from_value(const char* name,
     return PEAK_OUTPUT_AGGREGATION_LOCAL;
 }
 
+#ifndef PEAK_ATTACH_RUNTIME
 static gboolean
 peak_mpi_real_finalize_config_allowed(void)
 {
@@ -1185,6 +1203,8 @@ peak_mpi_real_finalize_config_allowed(void)
     }
     return TRUE;
 }
+
+#endif
 
 static PeakOutputAggregationMode
 peak_output_aggregation_mode(void)
@@ -1206,7 +1226,11 @@ peak_output_aggregation_mode(void)
             TRUE);
     }
 
+#ifdef PEAK_ATTACH_RUNTIME
+    return PEAK_OUTPUT_AGGREGATION_LOCAL;
+#else
     return PEAK_OUTPUT_AGGREGATION_MPI;
+#endif
 }
 
 #endif
@@ -1257,6 +1281,24 @@ peak_mpi_activation_policy_post_init(void)
 }
 #endif
 
+#ifdef PEAK_ATTACH_RUNTIME
+static size_t peak_attach_cpu_installed;
+static size_t peak_attach_cpu_pending;
+static size_t peak_attach_cpu_total;
+
+static void
+peak_attach_capture_cpu_startup(void)
+{
+    extern gpointer *hook_address;
+    peak_attach_cpu_total = peak_hook_address_count;
+    peak_attach_cpu_pending = peak_general_listener_startup_pending_target_count();
+    for (size_t i = 0; i < peak_attach_cpu_total; i++) {
+        if (hook_address[i] != NULL)
+            peak_attach_cpu_installed++;
+    }
+}
+#endif
+
 static void
 peak_activate_runtime(void)
 {
@@ -1287,13 +1329,16 @@ peak_activate_runtime(void)
 #endif
 
 #if defined(__APPLE__)
-    /*
-     * Darwin v1 has no strict protocol for installing Gum hooks after peer
-     * threads exist.  Prove the process is still single-threaded before even
-     * initializing Gum, so pthread, MPI, and target hook installation cannot
-     * begin from a post-init or early-constructor multithreaded state.
-     */
-    if (!peak_general_listener_startup_attach_can_skip_stop()) {
+    /* Preload startup retains its single-threaded bootstrap requirement.
+     * Injection may proceed only with the explicit staged Gum API: allocation
+     * and metadata preparation run before Mach peers are suspended. */
+    gboolean staged_attach_bootstrap = FALSE;
+#if defined(PEAK_ATTACH_RUNTIME) && defined(PEAK_HAVE_GUM_DARWIN_PATCH_API) && \
+    PEAK_GUM_DARWIN_STAGED_ATTACH_API_VERSION >= 1
+    staged_attach_bootstrap = peak_gum_darwin_staged_attach_supported();
+#endif
+    if (!peak_general_listener_startup_attach_can_skip_stop() &&
+        !staged_attach_bootstrap) {
         peak_log_warn(
             "[peak] refusing macOS runtime activation because the process is already multithreaded; Darwin Gum bootstrap requires single-threaded startup and no Gum hooks were installed\n");
         peak_runtime_activation_publish(PEAK_RUNTIME_ACTIVATION_REJECTED);
@@ -1306,6 +1351,7 @@ peak_activate_runtime(void)
      * using PEAK_MPI_ACTIVATION_POLICY=post-init reaches it only after a
      * successful MPI_Init* return, with no earlier Gum state or code mutation.
      */
+#if !defined(PEAK_ATTACH_RUNTIME)
     if (!gum_interceptor_peak_unwind_lifecycle_init()) {
         peak_log_warn(
             "[peak] refusing runtime activation because Gum thread-context cleanup was already initialized\n");
@@ -1313,12 +1359,25 @@ peak_activate_runtime(void)
         return;
     }
     gum_init_embedded();
+#endif
 
     atomic_store_explicit(&peak_runtime_owner_pid,
                           getpid(),
                           memory_order_release);
 
     pthread_listener_attach();
+#ifdef PEAK_ATTACH_RUNTIME
+    if (!pthread_listener_attach_ready()) {
+        peak_log_warn("[peak] refusing attach activation because safe pthread interception could not be installed\n");
+        peak_runtime_activation_publish(PEAK_RUNTIME_ACTIVATION_REJECTED);
+        return;
+    }
+    if (!peak_filesystem_stat_guard_attach()) {
+        peak_log_warn("[peak] refusing attach activation because filesystem-stat guards could not be installed safely\n");
+        peak_runtime_activation_publish(PEAK_RUNTIME_ACTIVATION_REJECTED);
+        return;
+    }
+#endif
     if (peak_hook_address_count > 0
 #ifdef HAVE_MPI
         && !found_MPI
@@ -1326,7 +1385,7 @@ peak_activate_runtime(void)
     ) {
         peak_detach_controller_warmup_backend();
     }
-#ifdef HAVE_MPI
+#if defined(HAVE_MPI) && !defined(PEAK_ATTACH_RUNTIME)
     if (found_MPI && mpi_interceptor_attach() != 0) {
         if (peak_requested_output_aggregation ==
             PEAK_OUTPUT_AGGREGATION_MPI) {
@@ -1392,6 +1451,9 @@ peak_activate_runtime(void)
         PeakProfilerCapabilityManifest capabilities;
 
         peak_general_listener_attach();
+#ifdef PEAK_ATTACH_RUNTIME
+        peak_attach_capture_cpu_startup();
+#endif
         peak_report_capability_note_active(PEAK_CAPABILITY_CPU_TARGET);
         capabilities = peak_report_capability_manifest();
         strict_mutation_active =
@@ -1533,7 +1595,7 @@ peak_activate_runtime(void)
     peak_runtime_activation_publish(PEAK_RUNTIME_ACTIVATION_ACTIVE);
 }
 
-#ifdef HAVE_MPI
+#if defined(HAVE_MPI) && !defined(PEAK_ATTACH_RUNTIME)
 PEAK_API void
 peak_mpi_init_completed(int result)
 {
@@ -1635,6 +1697,25 @@ peak_test_heartbeat_started(void)
 }
 #endif
 
+static size_t
+peak_parse_cpu_targets(char*** targets)
+{
+    size_t count = parse_env_w_delim(PEAK_TARGET_ENV, PEAK_TARGET_DELIM, targets);
+    count += load_profiling_symbols(PEAK_TARGET_FILE_ENV, targets, count);
+    count += load_symbols_from_array(PEAK_TARGET_GROUP_ENV, targets, count);
+    return count;
+}
+
+static size_t
+peak_parse_gpu_targets(char*** targets, size_t* file_count_out)
+{
+    size_t count = parse_env_w_delim(PEAK_GPU_TARGET_ENV, PEAK_TARGET_DELIM, targets);
+    size_t file_count = load_profiling_symbols(PEAK_GPU_TARGET_FILE_ENV, targets, count);
+    if (file_count_out != NULL)
+        *file_count_out = file_count;
+    return count + file_count;
+}
+
 void peak_init()
 {
     peak_output_identity_initialize();
@@ -1654,14 +1735,13 @@ void peak_init()
     peak_runtime_activation_wait_timeout_ms = (unsigned int)
         peak_parse_env_unsigned(&activation_wait_timeout_schema);
     peak_max_num_threads = peak_parse_max_num_threads();
-    peak_hook_address_count = parse_env_w_delim(PEAK_TARGET_ENV, PEAK_TARGET_DELIM, &peak_hook_strings);
-    peak_hook_address_count += load_profiling_symbols(PEAK_TARGET_FILE_ENV, &peak_hook_strings, peak_hook_address_count);
-    peak_hook_address_count += load_symbols_from_array(PEAK_TARGET_GROUP_ENV, &peak_hook_strings, peak_hook_address_count);
+#ifndef PEAK_ATTACH_RUNTIME
+    peak_hook_address_count = peak_parse_cpu_targets(&peak_hook_strings);
+    peak_gpu_hook_address_count = peak_parse_gpu_targets(&peak_gpu_hook_strings, NULL);
+#endif
     peak_hook_address_count = peak_deduplicate_target_names(
         peak_hook_strings,
         peak_hook_address_count);
-    peak_gpu_hook_address_count = parse_env_w_delim(PEAK_GPU_TARGET_ENV, PEAK_TARGET_DELIM, &peak_gpu_hook_strings);
-    peak_gpu_hook_address_count += load_profiling_symbols(PEAK_GPU_TARGET_FILE_ENV, &peak_gpu_hook_strings, peak_gpu_hook_address_count);
     numeric_config = peak_parse_runtime_numeric_config();
     peak_detach_cost = numeric_config.detach_cost;
     peak_gpu_monitor_all = parse_env_to_bool(PEAK_GPU_MONITOR_ALL);
@@ -1720,15 +1800,30 @@ void peak_init()
                           memory_order_release);
 
 #ifdef HAVE_MPI
+#ifdef PEAK_ATTACH_RUNTIME
+    /* MPI may have initialized long before injection, including singleton
+     * launches without rank environment variables. Query its actual state. */
+    int attached_mpi_initialized = 0, attached_mpi_finalized = 0;
+    found_MPI = MPI_Initialized(&attached_mpi_initialized) == MPI_SUCCESS &&
+        MPI_Finalized(&attached_mpi_finalized) == MPI_SUCCESS &&
+        attached_mpi_initialized && !attached_mpi_finalized;
+#else
     found_MPI = check_MPI();
+#endif
     if (found_MPI) {
         int is_parent_MPI = check_parent_process();
         if (is_parent_MPI > 0) {
             found_MPI = 0;
         }
     }
+#ifdef PEAK_ATTACH_RUNTIME
+    /* ELF MPI_Init interposers cannot be installed retroactively. Attached
+     * activation is immediate after the entrypoint's MPI lifecycle check. */
+    gboolean activate_post_mpi_init = FALSE;
+#else
     gboolean activate_post_mpi_init =
         peak_mpi_activation_policy_post_init();
+#endif
     /*
      * An explicit post-init policy is authoritative even for singleton MPI
      * launches whose runtime provides none of the rank environment variables
@@ -1776,7 +1871,7 @@ void peak_init()
     peak_activate_runtime();
 }
 
-#ifdef HAVE_MPI
+#if defined(HAVE_MPI) && !defined(PEAK_ATTACH_RUNTIME)
 static int
 peak_mpi_runtime_allows_collectives(void)
 {
@@ -1795,7 +1890,7 @@ peak_fini_impl(void)
 {
     double peak_runtime_start_time = peak_main_time;
 
-#ifdef HAVE_MPI
+#if defined(HAVE_MPI) && !defined(PEAK_ATTACH_RUNTIME)
     int mpi_finalize_path =
         found_MPI && mpi_interceptor_finalize_path_active();
     if (mpi_finalize_path) {
@@ -1840,7 +1935,7 @@ peak_fini_impl(void)
     }
 #if !defined(__APPLE__)
     if (
-#ifdef HAVE_MPI
+#if defined(HAVE_MPI) && !defined(PEAK_ATTACH_RUNTIME)
         !mpi_finalize_path &&
 #endif
         peak_memory_profile) {
@@ -1854,7 +1949,7 @@ peak_fini_impl(void)
      * dlclose guard, ownership thread, or queue was installed.
      */
 #else
-#ifdef HAVE_MPI
+#if defined(HAVE_MPI) && !defined(PEAK_ATTACH_RUNTIME)
     if (mpi_finalize_path) {
         /*
          * PMPI_Finalize may load DSOs after PEAK writes its report. Keep the
@@ -1873,7 +1968,7 @@ peak_fini_impl(void)
         g_printerr("[peak] Skipping remaining PEAK teardown because dlopen listener teardown was not proven safe\n");
         return;
     }
-#ifdef HAVE_MPI
+#if defined(HAVE_MPI) && !defined(PEAK_ATTACH_RUNTIME)
     uint64_t published_exit_status =
         atomic_load_explicit(&peak_exit_status, memory_order_acquire);
     int exit_status_known =
@@ -2194,19 +2289,30 @@ peak_fini_impl(void)
         return;
     }
 #else
+#ifdef HAVE_MPI
+    /* A PID attachment makes no guarantees about participation by peer ranks. */
+    (void)peak_general_listener_print_with_mpi_job_policy(
+        PEAK_OUTPUT_AGGREGATION_LOCAL, found_MPI != 0, NULL);
+#else
     (void)peak_general_listener_print(0, NULL);
+#endif
     #ifdef HAVE_CUDA
     if (peak_requested_work.gpu) {
     cuda_interceptor_print_with_mpi_job_policy(
-        PEAK_OUTPUT_AGGREGATION_LOCAL, FALSE);
-    cuda_interceptor_dettach();
+        PEAK_OUTPUT_AGGREGATION_LOCAL,
+#ifdef HAVE_MPI
+        found_MPI != 0);
+#else
+        FALSE);
+#endif
+        cuda_interceptor_dettach();
     }
     #endif
 #endif
     gboolean general_listener_shutdown_flushed = peak_general_listener_dettach();
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(PEAK_ATTACH_RUNTIME)
     (void)general_listener_shutdown_flushed;
-    peak_log_info("[peak] Darwin process-exit teardown leaves Gum support hook state alive\n");
+    peak_log_info("[peak] Resident process-exit teardown leaves Gum support hook state alive\n");
     peak_log_shutdown();
     return;
 #else
@@ -2346,6 +2452,7 @@ peak_checkpoint_for_exec(const char* path, char* const argv[])
     return wrote ? 0 : -1;
 }
 
+#if !defined(PEAK_ATTACH_RUNTIME)
 #if defined(__APPLE__)
 __attribute__((constructor)) static void
 peak_macos_init(void)
@@ -2527,4 +2634,233 @@ int __libc_start_main(main_fn main, int argc, char** argv,
 }
 #else
 #error Unsupported platform
+#endif
+
+#endif /* !PEAK_ATTACH_RUNTIME: process-startup interposition */
+
+#ifdef PEAK_ATTACH_RUNTIME
+/* The attached library stays resident for the process lifetime. Its normal
+ * exit path uses exactly the same heartbeat shutdown, listener teardown and
+ * report implementation as a preloaded runtime. */
+static void
+peak_attach_at_exit(void)
+{
+    peak_fini();
+}
+
+__attribute__((destructor)) static void
+peak_attach_library_fini(void)
+{
+    peak_fini();
+}
+
+static _Atomic int peak_attach_gum_prepared;
+static _Atomic int peak_attach_attempt_terminal;
+
+int
+peak_attach_runtime_attempt_is_terminal(void)
+{
+    return atomic_load_explicit(&peak_attach_attempt_terminal, memory_order_acquire);
+}
+
+int
+peak_attach_runtime_prepare(void)
+{
+    if (atomic_load_explicit(&peak_attach_gum_prepared, memory_order_acquire))
+        return 1;
+#if defined(__APPLE__)
+#if defined(PEAK_HAVE_GUM_DARWIN_PATCH_API) && \
+    PEAK_GUM_DARWIN_STAGED_ATTACH_API_VERSION >= 1
+    if (!peak_gum_darwin_staged_attach_supported())
+        return -1;
+#else
+    return -1;
+#endif
+#endif
+    /* The bundled GLib implementation requires Gum's embedded initialization
+     * before GVariant/configuration APIs or GLib threading can be used. */
+    if (!gum_interceptor_peak_unwind_lifecycle_init())
+        return 0;
+    gum_init_embedded();
+    atomic_store_explicit(&peak_attach_gum_prepared, 1, memory_order_release);
+    return 1;
+}
+
+int
+peak_attach_runtime_start(char **message)
+{
+#if !defined(__linux__) && !defined(__APPLE__)
+    *message = g_strdup("attach activation is supported on Linux and macOS");
+    return 0;
+#else
+    if (parse_env_to_bool("PEAK_EXEC_CHAIN") ||
+        parse_env_to_bool("PEAK_EXEC_CHECKPOINT")) {
+        *message = g_strdup("late attach cannot propagate PEAK across exec: PEAK_EXEC_CHAIN and PEAK_EXEC_CHECKPOINT require startup interposition");
+        return 0;
+    }
+#ifdef HAVE_MPI
+    {
+        int initialized = 0, finalized = 0;
+        if (MPI_Initialized(&initialized) != MPI_SUCCESS ||
+            MPI_Finalized(&finalized) != MPI_SUCCESS) {
+            *message = g_strdup("cannot determine the existing MPI runtime lifecycle");
+            return 0;
+        }
+        if (initialized && peak_output_aggregation_mode() !=
+                           PEAK_OUTPUT_AGGREGATION_LOCAL) {
+            *message = g_strdup("live MPI attach produces independent rank-local reports; select PEAK_OUTPUT_AGGREGATION=local");
+            return 0;
+        }
+        if (!initialized &&
+            (check_MPI() || peak_mpi_activation_policy_post_init())) {
+            *message = g_strdup("late attach to an MPI process requires MPI_Init to have completed; attach after MPI_Init");
+            return 0;
+        }
+        if (initialized && !finalized) {
+            int provided = MPI_THREAD_SINGLE;
+
+            if (MPI_Query_thread(&provided) != MPI_SUCCESS) {
+                *message = g_strdup("cannot determine the existing MPI thread support level");
+                return 0;
+            }
+            if (provided < MPI_THREAD_MULTIPLE) {
+                *message = g_strdup("late attach to an active MPI runtime requires MPI_THREAD_MULTIPLE; initialize the application with MPI_Init_thread requesting MPI_THREAD_MULTIPLE and verify the provided level before attaching");
+                return 0;
+            }
+        }
+    }
+#endif
+    /* Validate configured target syntax before any Gum/bootstrap mutation.
+     * Target resolution itself preserves PEAK's normal pending-DSO behavior. */
+    char **configured_targets = NULL;
+    size_t configured_count = peak_parse_cpu_targets(&configured_targets);
+    for (size_t i = 0; i < configured_count; i++) {
+        if (!peak_target_resolver_validate_selector(configured_targets[i])) {
+            *message = g_strdup_printf("invalid PEAK target selector: %s",
+                                       configured_targets[i]);
+            free_parsed_result(configured_targets, configured_count);
+            return 0;
+        }
+    }
+    char **gpu_targets = NULL;
+    size_t gpu_file_count;
+    size_t gpu_count = peak_parse_gpu_targets(&gpu_targets, &gpu_file_count);
+    PeakRequestedWork work = {
+        .cpu = configured_count > 0,
+        .gpu = gpu_count > 0 || parse_env_to_bool(PEAK_GPU_MONITOR_ALL),
+        .memory = parse_env_to_bool(PEAK_MEMORY_PROFILE),
+        .jit = peak_jit_provider_requested(),
+    };
+    PeakProfilerCapabilityManifest manifest = peak_build_capability_manifest(work);
+    const uint32_t profiling_backends = PEAK_CAPABILITY_CPU_TARGET |
+        PEAK_CAPABILITY_CUDA | PEAK_CAPABILITY_MEMORY | PEAK_CAPABILITY_JIT;
+    const char* gpu_file = getenv(PEAK_GPU_TARGET_FILE_ENV);
+    if (gpu_file != NULL && gpu_file[0] != '\0' && gpu_file_count == 0) {
+        *message = g_strdup_printf("PEAK_GPU_TARGET_FILE has no readable GPU targets: %s",
+                                   gpu_file);
+    } else if ((manifest.requested & manifest.compiled & profiling_backends) == 0) {
+        if (work.gpu)
+            *message = g_strdup("requested CUDA backend is not compiled into this PEAK build");
+        else if (work.memory)
+            *message = g_strdup("requested memory backend is unavailable on this platform");
+        else if (work.jit)
+            *message = g_strdup("requested JIT backend is unavailable on this platform");
+        else
+            *message = g_strdup("no profiling work was requested; configure PEAK_TARGET or another supported profiling mode");
+    }
+    if (*message != NULL) {
+        free_parsed_result(configured_targets, configured_count);
+        free_parsed_result(gpu_targets, gpu_count);
+        return 0;
+    }
+    /* From this boundary onward, runtime state, callbacks or exit handlers
+     * can become consumers of the immutable config. Even a later failure is
+     * terminal: neither configuration nor a partial runtime may be reused. */
+    atomic_store_explicit(&peak_attach_attempt_terminal, 1, memory_order_release);
+    /* Helper/control threads never contribute application statistics. */
+    pthread_listener_exclude_current_thread();
+    peak_set_process_profile_enabled(TRUE);
+    if (atexit(peak_attach_at_exit) != 0) {
+        free_parsed_result(configured_targets, configured_count);
+        free_parsed_result(gpu_targets, gpu_count);
+        *message = g_strdup("cannot register PEAK process-exit reporting");
+        return 0;
+    }
+    /* Use the validated lists without reopening target files inside peak_init. */
+    peak_hook_strings = configured_targets;
+    peak_hook_address_count = configured_count;
+    peak_gpu_hook_strings = gpu_targets;
+    peak_gpu_hook_address_count = gpu_count;
+    peak_init();
+    if (atomic_load_explicit(&peak_runtime_active, memory_order_acquire) == 0) {
+        *message = g_strdup("PEAK runtime activation failed or no profiling work was requested; inspect target stderr");
+        return 0;
+    }
+#ifdef HAVE_MPI
+    if (found_MPI) {
+        peak_log_info("[peak] late MPI attach uses rank-local reporting and whole-wall heartbeat timing\n");
+        if (parse_env_to_bool("PEAK_MPI_ACTIVE_CLOCK"))
+            peak_log_warn("[peak] PEAK_MPI_ACTIVE_CLOCK is unavailable for live MPI attach\n");
+    }
+#endif
+    PeakProfilerCapabilityManifest capabilities =
+        peak_report_capability_manifest();
+#if !defined(PEAK_HAVE_GUM_DARWIN_PATCH_API)
+    if (peak_requested_work.cpu &&
+        !(capabilities.active & PEAK_CAPABILITY_STRICT_MUTATION)) {
+        *message = g_strdup("PEAK activated but strict hook mutation support is unavailable; overhead control cannot operate safely");
+        return 0;
+    }
+#endif
+    const size_t pending = (capabilities.active & PEAK_CAPABILITY_DYNAMIC_DSO)
+        ? peak_attach_cpu_pending : 0;
+    const uint32_t backend_mask = PEAK_CAPABILITY_MEMORY |
+        PEAK_CAPABILITY_CUDA | PEAK_CAPABILITY_JIT;
+    const gboolean collecting = peak_attach_cpu_installed != 0 ||
+        (capabilities.active & backend_mask) != 0;
+    const gboolean ready = collecting || pending != 0;
+
+    GString *summary = g_string_new(collecting ? "PEAK profiling started" :
+        pending != 0 ? "PEAK is waiting for pending CPU targets" :
+        "PEAK could not start any requested profiling backend");
+    if (peak_attach_cpu_total != 0) {
+        g_string_append_printf(summary,
+            ". CPU targets at startup: %zu installed, %zu pending, %zu skipped",
+            peak_attach_cpu_installed, pending,
+            peak_attach_cpu_total - peak_attach_cpu_installed - pending);
+    }
+    const struct {
+        uint32_t flag;
+        const char *name;
+        const char *failure;
+    } backends[] = {
+        {PEAK_CAPABILITY_MEMORY, "memory", "allocator hook installation failed"},
+        {PEAK_CAPABILITY_CUDA, "CUDA", "CUDA interception unavailable"},
+        {PEAK_CAPABILITY_JIT, "JIT", "JIT provider unavailable"},
+    };
+    for (size_t i = 0; i < G_N_ELEMENTS(backends); i++) {
+        const uint32_t flag = backends[i].flag;
+        if (!(capabilities.requested & flag))
+            continue;
+        if (capabilities.active & flag) {
+            g_string_append_printf(summary, ". %s enabled%s", backends[i].name,
+                capabilities.partial & flag ? " (partial coverage)" : "");
+        } else {
+            g_string_append_printf(summary, ". %s not enabled (%s)",
+                backends[i].name, capabilities.compiled & flag
+                    ? backends[i].failure : "unavailable in this build");
+        }
+    }
+    const char *output_prefix = getenv("PEAK_STATSLOG_PATH");
+    if (ready && (output_prefix == NULL || output_prefix[0] == '\0')) {
+        g_string_append(summary,
+            ". Default output prefix ./peak_statslog (target working directory)");
+    }
+    g_string_append(summary, ready
+        ? ". PEAK writes its report at normal process exit"
+        : ". See target stderr for activation details");
+    *message = g_string_free(summary, FALSE);
+    return ready;
+#endif
+}
 #endif
