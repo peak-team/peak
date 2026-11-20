@@ -11,6 +11,9 @@
 #include <errno.h>
 #include <limits.h>
 #include <pthread.h>
+#ifdef PEAK_ATTACH_RUNTIME
+#include <spawn.h>
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1344,7 +1347,39 @@ peak_detach_controller_helper_env(void)
     return configured_helper_env;
 }
 
-#ifdef PEAK_HAVE_GUM_PEAK_PC_API
+#if defined(PEAK_ATTACH_RUNTIME)
+/* A running MPI process may already have registered an atfork handler
+ * that aborts on fork, e.g. libfabric's EFA provider. Spawn only the helper
+ * executable, with no application callbacks in the new process. */
+static int
+peak_detach_controller_spawn_helper(pid_t* pid, const char* path,
+                                    char* const argv[], char* const env[],
+                                    const int sockets[2])
+{
+    posix_spawn_file_actions_t actions;
+    int error = posix_spawn_file_actions_init(&actions);
+    if (error != 0)
+        return error;
+
+    error = posix_spawn_file_actions_addclose(&actions, sockets[0]);
+    if (error == 0)
+        error = posix_spawn_file_actions_adddup2(
+            &actions, sockets[1], PEAK_DETACH_HELPER_PROTOCOL_FD);
+    if (error == 0 && sockets[1] != PEAK_DETACH_HELPER_PROTOCOL_FD)
+        error = posix_spawn_file_actions_addclose(&actions, sockets[1]);
+#if defined(__GLIBC_PREREQ)
+#if __GLIBC_PREREQ(2, 34)
+    if (error == 0)
+        error = posix_spawn_file_actions_addclosefrom_np(
+            &actions, PEAK_DETACH_HELPER_PROTOCOL_FD + 1);
+#endif
+#endif
+    if (error == 0)
+        error = posix_spawn(pid, path, &actions, NULL, argv, env);
+    posix_spawn_file_actions_destroy(&actions);
+    return error;
+}
+#elif defined(PEAK_HAVE_GUM_PEAK_PC_API)
 static void
 peak_detach_controller_child_close_inherited_fds(int protocol_fd)
 {
@@ -1467,7 +1502,11 @@ peak_detach_controller_ensure_helper(PeakDetachStatus* status_out)
         return FALSE;
     }
 
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) {
+    int socket_type = SOCK_STREAM;
+#ifdef PEAK_ATTACH_RUNTIME
+    socket_type |= SOCK_CLOEXEC;
+#endif
+    if (socketpair(AF_UNIX, socket_type, 0, sockets) != 0) {
         peak_detach_controller_note_failure_detail(
             "helper-socketpair",
             0,
@@ -1482,6 +1521,14 @@ peak_detach_controller_ensure_helper(PeakDetachStatus* status_out)
     }
 
     snprintf(fd_arg, sizeof(fd_arg), "%d", PEAK_DETACH_HELPER_PROTOCOL_FD);
+#ifdef PEAK_ATTACH_RUNTIME
+    char* const helper_argv[] = { (char*)path, fd_arg, NULL };
+    int spawn_error = peak_detach_controller_spawn_helper(
+        &pid, path, helper_argv, helper_env, sockets);
+    if (spawn_error != 0) {
+        peak_detach_controller_note_failure_detail(
+            "helper-spawn", 0, (uintptr_t)spawn_error, 0);
+#else
     pid = fork();
     if (pid < 0) {
         peak_detach_controller_note_failure_detail(
@@ -1489,6 +1536,7 @@ peak_detach_controller_ensure_helper(PeakDetachStatus* status_out)
             0,
             (uintptr_t)errno,
             0);
+#endif
         peak_detach_controller_raw_close(sockets[0]);
         peak_detach_controller_raw_close(sockets[1]);
         if (status_out != NULL) {
@@ -1497,6 +1545,7 @@ peak_detach_controller_ensure_helper(PeakDetachStatus* status_out)
         return FALSE;
     }
 
+#ifndef PEAK_ATTACH_RUNTIME
     if (pid == 0) {
         char* const helper_argv[] = { (char*)path, fd_arg, NULL };
         peak_detach_controller_raw_close(sockets[0]);
@@ -1504,6 +1553,7 @@ peak_detach_controller_ensure_helper(PeakDetachStatus* status_out)
         execve(path, helper_argv, helper_env);
         _exit(127);
     }
+#endif
 
     peak_detach_controller_raw_close(sockets[1]);
     helper_fd = sockets[0];

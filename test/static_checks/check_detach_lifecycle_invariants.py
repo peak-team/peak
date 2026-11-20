@@ -1114,10 +1114,12 @@ def check_peak_init_heartbeat_order(repo_root):
     body = extract_function(source, "peak_activate_runtime")
     fini = extract_function(source, "peak_fini_impl")
 
-    group_load_position = init.find("load_symbols_from_array(PEAK_TARGET_GROUP_ENV")
+    cpu_parser = extract_function(source, "peak_parse_cpu_targets")
+    cpu_load_position = init.find("peak_parse_cpu_targets(")
     deduplicate_position = init.find("peak_deduplicate_target_names(")
-    require(group_load_position != -1 and deduplicate_position != -1 and
-            group_load_position < deduplicate_position,
+    require("load_symbols_from_array(PEAK_TARGET_GROUP_ENV" in cpu_parser and
+            cpu_load_position != -1 and deduplicate_position != -1 and
+            cpu_load_position < deduplicate_position,
             "explicit and group target names must be deduplicated before setup")
     log_output_position = init.find("peak_log_initialize_output(")
     runtime_activation_position = init.find("peak_activate_runtime()")

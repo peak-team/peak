@@ -124,7 +124,7 @@ endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND MPI_C_FOUND AND MPIEXEC_EXECUTABLE)
     add_executable(test_attach_mpi_fixture mpi_fixture.c)
     set_target_properties(test_attach_mpi_fixture PROPERTIES ENABLE_EXPORTS TRUE)
-    target_link_libraries(test_attach_mpi_fixture PRIVATE MPI::MPI_C)
+    target_link_libraries(test_attach_mpi_fixture PRIVATE MPI::MPI_C Threads::Threads)
     foreach(_case IN ITEMS baseline partial all partial_local all_local)
         set(_local)
         if(_case STREQUAL "baseline")
@@ -158,4 +158,15 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
             $<TARGET_FILE:peak_attach> $<TARGET_FILE:peak_attach_agent>
             $<TARGET_FILE:test_attach_module_fixture> $<TARGET_FILE:test_attach_module_target>)
     set_tests_properties(test_attach_startup_module PROPERTIES TIMEOUT 45)
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+    add_executable(test_attach_memory_failure_fixture fixture.c unrelocatable_allocator.c)
+    target_link_libraries(test_attach_memory_failure_fixture PRIVATE Threads::Threads)
+    set_target_properties(test_attach_memory_failure_fixture PROPERTIES ENABLE_EXPORTS ON)
+    add_test(NAME test_attach_memory_failure
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/run_attach.py
+            --cli $<TARGET_FILE:peak_attach> --agent $<TARGET_FILE:peak_attach_agent>
+            --fixture $<TARGET_FILE:test_attach_memory_failure_fixture> --mode memory_failure)
+    set_tests_properties(test_attach_memory_failure PROPERTIES TIMEOUT 70)
 endif()

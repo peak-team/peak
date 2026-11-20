@@ -1,4 +1,5 @@
 #include <mpi.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <sys/prctl.h>
 #include <unistd.h>
@@ -7,6 +8,15 @@ __attribute__((noinline, visibility("default")))
 void peak_attach_mpi_target(void)
 {
     __asm__ volatile(".rept 20; nop; .endr" ::: "memory");
+}
+
+/* Some transports reject fork once MPI is active. Keep that restriction
+ * testable with any MPICH provider, including local development installs. */
+static void reject_fork(void)
+{
+    static const char message[] = "unexpected fork in the active MPI rank\n";
+    (void)write(STDERR_FILENO, message, sizeof(message) - 1);
+    _exit(97);
 }
 
 int main(int argc, char **argv)
@@ -18,6 +28,8 @@ int main(int argc, char **argv)
         MPI_Comm_rank(MPI_COMM_WORLD, &rank) != MPI_SUCCESS)
         return 1;
     if (prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0) != 0)
+        return 1;
+    if (pthread_atfork(reject_fork, NULL, NULL) != 0)
         return 1;
 
     char path[4096];

@@ -824,7 +824,36 @@ static GVariant *build_configuration(GPtrArray *targets, const char *output)
     }
     if (output)
         g_hash_table_replace(config, g_strdup("PEAK_STATSLOG_PATH"),
-                             g_canonicalize_filename(output, NULL));
+                             g_strdup(output));
+    const char *const path_keys[] = {
+        "PEAK_TARGET_FILE", "PEAK_GPU_TARGET_FILE", "PEAK_STATSLOG_PATH",
+    };
+    char *cwd = NULL;
+    for (size_t i = 0; i < G_N_ELEMENTS(path_keys); ++i) {
+        const char *key = path_keys[i];
+        const char *value = g_hash_table_lookup(config, key);
+        if (!value || !*value || g_path_is_absolute(value))
+            continue;
+        if (!cwd)
+            cwd = getcwd(NULL, 0);
+        if (!cwd) {
+            perror("peak-attach: getcwd");
+            g_hash_table_unref(config);
+            return NULL;
+        }
+        /* Keep '..' intact: a preceding component may be a symlink. */
+        char *absolute = g_build_filename(cwd, value, NULL);
+        if (strlen(absolute) > 65536) {
+            fprintf(stderr, "peak-attach: %s path exceeds the configuration limit\n",
+                    key);
+            g_free(absolute);
+            free(cwd);
+            g_hash_table_unref(config);
+            return NULL;
+        }
+        g_hash_table_replace(config, g_strdup(key), absolute);
+    }
+    free(cwd);
     if (!g_hash_table_contains(config, "PEAK_DETACH_HELPER")) {
         char *helper = default_helper();
         if (helper)
@@ -840,7 +869,6 @@ static GVariant *build_configuration(GPtrArray *targets, const char *output)
         g_variant_builder_add(&options, "{ss}", (char *)key, (char *)value);
     GVariant *configuration = g_variant_ref_sink(g_variant_new(
         PEAK_ATTACH_CONFIG_TYPE, &options, PEAK_ATTACH_PROTOCOL_VERSION));
-    g_hash_table_unref(config);
     char *serialized = g_variant_print(configuration, TRUE);
     gboolean valid = strlen(serialized) <= PEAK_ATTACH_MAX_FRAME;
     g_free(serialized);
@@ -848,8 +876,18 @@ static GVariant *build_configuration(GPtrArray *targets, const char *output)
         fprintf(stderr,
                 "peak-attach: configuration exceeds protocol frame limit\n");
         g_variant_unref(configuration);
+        g_hash_table_unref(config);
         return NULL;
     }
+    for (size_t i = 0; i < G_N_ELEMENTS(path_keys); ++i) {
+        const char *path = g_hash_table_lookup(config, path_keys[i]);
+        if (path && *path) {
+            char *escaped = g_strescape(path, NULL);
+            fprintf(stderr, "peak-attach: %s=\"%s\"\n", path_keys[i], escaped);
+            g_free(escaped);
+        }
+    }
+    g_hash_table_unref(config);
     return configuration;
 }
 /* Keep lock inodes persistent: unlinking a held file permits a second inode

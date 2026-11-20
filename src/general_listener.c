@@ -452,7 +452,7 @@ static unsigned int peak_controller_configured_shutdown_drain_ms = 1000;
 static gsize peak_controller_trace_config_initialized = 0;
 static gchar* peak_controller_trace_path = NULL;
 static gboolean peak_controller_trace_enabled = FALSE;
-static gboolean peak_dynamic_attach_needed = FALSE;
+static size_t peak_startup_pending_target_count;
 #define PEAK_GENERAL_CONTROLLER_MAX_BATCH_CANDIDATES 64U
 
 /*
@@ -488,8 +488,16 @@ peak_general_listener_init_reattach_policy(void)
 gboolean
 peak_general_listener_needs_dynamic_attach(void)
 {
-    return peak_dynamic_attach_needed;
+    return peak_startup_pending_target_count != 0;
 }
+
+#ifdef PEAK_ATTACH_RUNTIME
+size_t
+peak_general_listener_startup_pending_target_count(void)
+{
+    return peak_startup_pending_target_count;
+}
+#endif
 
 typedef struct {
     size_t hook_id;
@@ -8096,7 +8104,7 @@ peak_general_listener_attach()
                 }
                 if (hook_address[i] == NULL) {
                     if (peak_demangled_strings[i] == NULL) {
-                        peak_dynamic_attach_needed = TRUE;
+                        peak_startup_pending_target_count++;
                     }
                 }
             }
@@ -8127,7 +8135,7 @@ peak_general_listener_attach()
                 startup_pins[i] = NULL;
                 hook_address[i] = NULL;
                 g_clear_pointer(&peak_demangled_strings[i], g_free);
-                peak_dynamic_attach_needed = TRUE;
+                peak_startup_pending_target_count++;
                 continue;
             }
 #endif

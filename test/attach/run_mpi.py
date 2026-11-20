@@ -26,6 +26,22 @@ def read_pid(path, deadline):
     raise AssertionError(f"MPI rank did not become ready: {path}")
 
 
+def dump_rank_threads(pid):
+    try:
+        tasks = sorted(Path(f"/proc/{pid}/task").iterdir())
+    except OSError:
+        return
+    for task in tasks[:16]:
+        try:
+            status = (task / "status").read_text()
+            fields = [line for line in status.splitlines()
+                      if line.startswith(("Name:", "State:", "TracerPid:"))]
+            wchan = (task / "wchan").read_text().strip()
+            print(f"rank pid={pid} tid={task.name} wchan={wchan} {' '.join(fields)}")
+        except OSError:
+            continue
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--cli", required=True)
@@ -84,7 +100,10 @@ def main():
                                    int(row["count"]) >= 100
                                    for row in csv.DictReader(report)), paths[0]
             except Exception:
-                print(log.read_text())
+                with log.open() as stream:
+                    print(stream.read(64 * 1024))
+                for pid in pids:
+                    dump_rank_threads(pid)
                 raise
             finally:
                 stop_group(job)

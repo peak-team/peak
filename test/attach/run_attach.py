@@ -165,7 +165,7 @@ parser.add_argument("--cli", type=Path, required=True)
 parser.add_argument("--agent", type=Path)
 parser.add_argument("--fixture", type=Path)
 parser.add_argument("--require-injection", action="store_true")
-parser.add_argument("--mode", choices=("cli", "runtime", "memory", "calibration"), required=True)
+parser.add_argument("--mode", choices=("cli", "runtime", "memory", "calibration", "memory_failure"), required=True)
 args = parser.parse_args()
 env = {k: v for k, v in os.environ.items()
        if not k.startswith(("PEAK_", "FLAME_"))
@@ -196,6 +196,7 @@ else:
             fixture_command.append("--single-thread")
         target = subprocess.Popen(fixture_command,
                                   env=env, stdin=subprocess.PIPE, stdout=log, stderr=log,
+                                  cwd=root if args.mode == "memory_failure" else None,
                                   start_new_session=True)
         target.peak_started_at = time.time()
         try:
@@ -206,6 +207,40 @@ else:
             alive(target, progress, root / "fixture.log")
             agent_options = ["--agent", str(args.agent.resolve())] if args.agent else []
             base = [cli, str(target.pid)] + agent_options
+            if args.mode == "memory_failure":
+                memory = dict(env, PEAK_MEMORY_PROFILE="1", PEAK_HEARTBEAT_INTERVAL="0",
+                              PEAK_OUTPUT_AGGREGATION="local")
+                code, output = run(base + ["--output", str(root / "memory-report")], memory)
+                assert code != 0 and "memory not enabled (allocator hook installation failed)" in output, output
+                assert "could not start any requested profiling backend" in output, output
+                alive(target, progress, root / "fixture.log")
+                target.stdin.write(b"Q")
+                target.stdin.flush()
+                assert target.wait(timeout=8) == 0
+
+                # Once hooks may be published, use a new process for the
+                # mixed request. The original activation claim is terminal.
+                mixed_progress = root / "mixed-progress"
+                mixed = subprocess.Popen([str(args.fixture.resolve()), str(mixed_progress)],
+                                         env=env, stdin=subprocess.PIPE, stdout=log,
+                                         stderr=log, cwd=root, start_new_session=True)
+                try:
+                    alive(mixed, mixed_progress, root / "fixture.log")
+                    prefix = root / "mixed-report"
+                    code, output = run([cli, str(mixed.pid)] + agent_options +
+                        ["--target", "peak_attach_existing_target", "--target",
+                         "peak_attach_churn_target", "--output", str(prefix)], memory)
+                    assert code == 0 and "memory not enabled (allocator hook installation failed)" in output, output
+                    assert "2 installed, 0 pending, 0 skipped" in output, output
+                    alive(mixed, mixed_progress, root / "fixture.log")
+                    mixed.stdin.write(b"Q")
+                    mixed.stdin.flush()
+                    assert mixed.wait(timeout=8) == 0
+                    report(prefix)
+                finally:
+                    reap(mixed)
+                    mixed.stdin.close()
+                raise SystemExit(0)
             if args.mode == "calibration":
                 env.update(PEAK_MAX_NUM_THREADS="1", PEAK_HEARTBEAT_INTERVAL="0.05",
                            PEAK_VERBOSITY="info", PEAK_OUTPUT_AGGREGATION="local")
@@ -268,10 +303,16 @@ else:
                 ("!", env, "invalid PEAK target selector"),
                 ("peak_attach_existing_target", dict(env, PEAK_EXEC_CHAIN="1"),
                  "late attach cannot propagate PEAK across exec"),
+                (None, dict(env, PEAK_GPU_TARGET_FILE=str(root / "missing-gpu.txt")),
+                 "PEAK_GPU_TARGET_FILE has no readable GPU targets"),
             ]
+            if sys.platform == "darwin":
+                retry_cases.append((None, dict(env, PEAK_MEMORY_PROFILE="1"),
+                                    "requested memory backend is unavailable"))
             for selector, rejected_env, diagnostic in retry_cases:
                 filesystem_phase(target, root / "fixture.log", "B")
-                code, output = run(base + ["--target", selector, "--output",
+                target_option = ["--target", selector] if selector is not None else []
+                code, output = run(base + target_option + ["--output",
                                           str(rejected_prefix)], rejected_env,
                                    fixture_log=root / "fixture.log")
                 assert code != 0 and diagnostic in output, (
@@ -382,8 +423,10 @@ else:
                 wait_for(lambda: counter(other_progress) > 20)
                 code, output = run([cli, str(other.pid)] + agent_options + ["--target",
                                     "peak_attach_missing_target"], env)
-                assert code == 0 and output.strip(), (code, output)
-                assert "pending" in output.lower(), output
+                if sys.platform == "darwin":
+                    assert code != 0 and "0 installed, 0 pending, 1 skipped" in output, (code, output)
+                else:
+                    assert code == 0 and "0 installed, 1 pending, 0 skipped" in output, (code, output)
                 alive(other, other_progress, root / "fixture.log")
                 other.stdin.write(b"Q")
                 other.stdin.flush()

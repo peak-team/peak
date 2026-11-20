@@ -1029,8 +1029,8 @@ peak_has_requested_work(void)
            peak_requested_work.jit;
 }
 
-static void
-peak_freeze_capability_requests(void)
+static PeakProfilerCapabilityManifest
+peak_build_capability_manifest(PeakRequestedWork work)
 {
     PeakProfilerCapabilityManifest manifest = {0};
 
@@ -1067,20 +1067,28 @@ peak_freeze_capability_requests(void)
 #ifdef HAVE_MPI
     manifest.compiled |= PEAK_CAPABILITY_MPI_REPORT;
 #endif
-    if (peak_requested_work.cpu) {
+    if (work.cpu) {
         manifest.requested |=
             PEAK_CAPABILITY_CPU_TARGET |
             PEAK_CAPABILITY_STRICT_MUTATION;
     }
-    if (peak_requested_work.gpu) {
+    if (work.gpu) {
         manifest.requested |= PEAK_CAPABILITY_CUDA;
     }
-    if (peak_requested_work.memory) {
+    if (work.memory) {
         manifest.requested |= PEAK_CAPABILITY_MEMORY;
     }
-    if (peak_requested_work.jit) {
+    if (work.jit) {
         manifest.requested |= PEAK_CAPABILITY_JIT;
     }
+    return manifest;
+}
+
+static void
+peak_freeze_capability_requests(void)
+{
+    PeakProfilerCapabilityManifest manifest =
+        peak_build_capability_manifest(peak_requested_work);
     peak_report_capability_reset(&manifest);
 }
 
@@ -1273,6 +1281,24 @@ peak_mpi_activation_policy_post_init(void)
 }
 #endif
 
+#ifdef PEAK_ATTACH_RUNTIME
+static size_t peak_attach_cpu_installed;
+static size_t peak_attach_cpu_pending;
+static size_t peak_attach_cpu_total;
+
+static void
+peak_attach_capture_cpu_startup(void)
+{
+    extern gpointer *hook_address;
+    peak_attach_cpu_total = peak_hook_address_count;
+    peak_attach_cpu_pending = peak_general_listener_startup_pending_target_count();
+    for (size_t i = 0; i < peak_attach_cpu_total; i++) {
+        if (hook_address[i] != NULL)
+            peak_attach_cpu_installed++;
+    }
+}
+#endif
+
 static void
 peak_activate_runtime(void)
 {
@@ -1425,6 +1451,9 @@ peak_activate_runtime(void)
         PeakProfilerCapabilityManifest capabilities;
 
         peak_general_listener_attach();
+#ifdef PEAK_ATTACH_RUNTIME
+        peak_attach_capture_cpu_startup();
+#endif
         peak_report_capability_note_active(PEAK_CAPABILITY_CPU_TARGET);
         capabilities = peak_report_capability_manifest();
         strict_mutation_active =
@@ -1668,6 +1697,25 @@ peak_test_heartbeat_started(void)
 }
 #endif
 
+static size_t
+peak_parse_cpu_targets(char*** targets)
+{
+    size_t count = parse_env_w_delim(PEAK_TARGET_ENV, PEAK_TARGET_DELIM, targets);
+    count += load_profiling_symbols(PEAK_TARGET_FILE_ENV, targets, count);
+    count += load_symbols_from_array(PEAK_TARGET_GROUP_ENV, targets, count);
+    return count;
+}
+
+static size_t
+peak_parse_gpu_targets(char*** targets, size_t* file_count_out)
+{
+    size_t count = parse_env_w_delim(PEAK_GPU_TARGET_ENV, PEAK_TARGET_DELIM, targets);
+    size_t file_count = load_profiling_symbols(PEAK_GPU_TARGET_FILE_ENV, targets, count);
+    if (file_count_out != NULL)
+        *file_count_out = file_count;
+    return count + file_count;
+}
+
 void peak_init()
 {
     peak_output_identity_initialize();
@@ -1687,14 +1735,13 @@ void peak_init()
     peak_runtime_activation_wait_timeout_ms = (unsigned int)
         peak_parse_env_unsigned(&activation_wait_timeout_schema);
     peak_max_num_threads = peak_parse_max_num_threads();
-    peak_hook_address_count = parse_env_w_delim(PEAK_TARGET_ENV, PEAK_TARGET_DELIM, &peak_hook_strings);
-    peak_hook_address_count += load_profiling_symbols(PEAK_TARGET_FILE_ENV, &peak_hook_strings, peak_hook_address_count);
-    peak_hook_address_count += load_symbols_from_array(PEAK_TARGET_GROUP_ENV, &peak_hook_strings, peak_hook_address_count);
+#ifndef PEAK_ATTACH_RUNTIME
+    peak_hook_address_count = peak_parse_cpu_targets(&peak_hook_strings);
+    peak_gpu_hook_address_count = peak_parse_gpu_targets(&peak_gpu_hook_strings, NULL);
+#endif
     peak_hook_address_count = peak_deduplicate_target_names(
         peak_hook_strings,
         peak_hook_address_count);
-    peak_gpu_hook_address_count = parse_env_w_delim(PEAK_GPU_TARGET_ENV, PEAK_TARGET_DELIM, &peak_gpu_hook_strings);
-    peak_gpu_hook_address_count += load_profiling_symbols(PEAK_GPU_TARGET_FILE_ENV, &peak_gpu_hook_strings, peak_gpu_hook_address_count);
     numeric_config = peak_parse_runtime_numeric_config();
     peak_detach_cost = numeric_config.detach_cost;
     peak_gpu_monitor_all = parse_env_to_bool(PEAK_GPU_MONITOR_ALL);
@@ -2686,13 +2733,8 @@ peak_attach_runtime_start(char **message)
     /* Validate configured target syntax before any Gum/bootstrap mutation.
      * Target resolution itself preserves PEAK's normal pending-DSO behavior. */
     char **configured_targets = NULL;
-    int configured_count = parse_env_w_delim(PEAK_TARGET_ENV,
-        PEAK_TARGET_DELIM, &configured_targets);
-    configured_count += load_profiling_symbols(PEAK_TARGET_FILE_ENV,
-        &configured_targets, configured_count);
-    configured_count += load_symbols_from_array(PEAK_TARGET_GROUP_ENV,
-        &configured_targets, configured_count);
-    for (int i = 0; i < configured_count; i++) {
+    size_t configured_count = peak_parse_cpu_targets(&configured_targets);
+    for (size_t i = 0; i < configured_count; i++) {
         if (!peak_target_resolver_validate_selector(configured_targets[i])) {
             *message = g_strdup_printf("invalid PEAK target selector: %s",
                                        configured_targets[i]);
@@ -2700,15 +2742,35 @@ peak_attach_runtime_start(char **message)
             return 0;
         }
     }
-    free_parsed_result(configured_targets, configured_count);
-    const char *gpu_targets = getenv(PEAK_GPU_TARGET_ENV);
-    const char *gpu_target_file = getenv(PEAK_GPU_TARGET_FILE_ENV);
-    if (configured_count == 0 && !parse_env_to_bool(PEAK_MEMORY_PROFILE) &&
-        !parse_env_to_bool(PEAK_GPU_MONITOR_ALL) &&
-        (gpu_targets == NULL || gpu_targets[0] == '\0') &&
-        (gpu_target_file == NULL || gpu_target_file[0] == '\0') &&
-        !peak_jit_provider_requested()) {
-        *message = g_strdup("no profiling work was requested; configure PEAK_TARGET or another supported profiling mode");
+    char **gpu_targets = NULL;
+    size_t gpu_file_count;
+    size_t gpu_count = peak_parse_gpu_targets(&gpu_targets, &gpu_file_count);
+    PeakRequestedWork work = {
+        .cpu = configured_count > 0,
+        .gpu = gpu_count > 0 || parse_env_to_bool(PEAK_GPU_MONITOR_ALL),
+        .memory = parse_env_to_bool(PEAK_MEMORY_PROFILE),
+        .jit = peak_jit_provider_requested(),
+    };
+    PeakProfilerCapabilityManifest manifest = peak_build_capability_manifest(work);
+    const uint32_t profiling_backends = PEAK_CAPABILITY_CPU_TARGET |
+        PEAK_CAPABILITY_CUDA | PEAK_CAPABILITY_MEMORY | PEAK_CAPABILITY_JIT;
+    const char* gpu_file = getenv(PEAK_GPU_TARGET_FILE_ENV);
+    if (gpu_file != NULL && gpu_file[0] != '\0' && gpu_file_count == 0) {
+        *message = g_strdup_printf("PEAK_GPU_TARGET_FILE has no readable GPU targets: %s",
+                                   gpu_file);
+    } else if ((manifest.requested & manifest.compiled & profiling_backends) == 0) {
+        if (work.gpu)
+            *message = g_strdup("requested CUDA backend is not compiled into this PEAK build");
+        else if (work.memory)
+            *message = g_strdup("requested memory backend is unavailable on this platform");
+        else if (work.jit)
+            *message = g_strdup("requested JIT backend is unavailable on this platform");
+        else
+            *message = g_strdup("no profiling work was requested; configure PEAK_TARGET or another supported profiling mode");
+    }
+    if (*message != NULL) {
+        free_parsed_result(configured_targets, configured_count);
+        free_parsed_result(gpu_targets, gpu_count);
         return 0;
     }
     /* From this boundary onward, runtime state, callbacks or exit handlers
@@ -2719,9 +2781,16 @@ peak_attach_runtime_start(char **message)
     pthread_listener_exclude_current_thread();
     peak_set_process_profile_enabled(TRUE);
     if (atexit(peak_attach_at_exit) != 0) {
+        free_parsed_result(configured_targets, configured_count);
+        free_parsed_result(gpu_targets, gpu_count);
         *message = g_strdup("cannot register PEAK process-exit reporting");
         return 0;
     }
+    /* Use the validated lists without reopening target files inside peak_init. */
+    peak_hook_strings = configured_targets;
+    peak_hook_address_count = configured_count;
+    peak_gpu_hook_strings = gpu_targets;
+    peak_gpu_hook_address_count = gpu_count;
     peak_init();
     if (atomic_load_explicit(&peak_runtime_active, memory_order_acquire) == 0) {
         *message = g_strdup("PEAK runtime activation failed or no profiling work was requested; inspect target stderr");
@@ -2734,26 +2803,64 @@ peak_attach_runtime_start(char **message)
             peak_log_warn("[peak] PEAK_MPI_ACTIVE_CLOCK is unavailable for live MPI attach\n");
     }
 #endif
-    if (peak_requested_work.cpu) {
+    PeakProfilerCapabilityManifest capabilities =
+        peak_report_capability_manifest();
 #if !defined(PEAK_HAVE_GUM_DARWIN_PATCH_API)
-        if (!peak_detach_controller_strict_batch_supported()) {
-            *message = g_strdup("PEAK activated but strict hook mutation support is unavailable; overhead control cannot operate safely");
-            return 0;
-        }
+    if (peak_requested_work.cpu &&
+        !(capabilities.active & PEAK_CAPABILITY_STRICT_MUTATION)) {
+        *message = g_strdup("PEAK activated but strict hook mutation support is unavailable; overhead control cannot operate safely");
+        return 0;
+    }
 #endif
-        gboolean any_target_attached = FALSE;
-        extern gpointer *hook_address;
-        for (size_t i = 0; i < peak_hook_address_count; i++) {
-            if (hook_address != NULL && hook_address[i] != NULL) {
-                any_target_attached = TRUE;
-                break;
-            }
-        }
-        if (!any_target_attached) {
-            *message = g_strdup("PEAK is active with pending CPU targets or skipped initial hooks; no CPU target was initially instrumented. Inspect target stderr and normal reports for resolution and attachment diagnostics");
+    const size_t pending = (capabilities.active & PEAK_CAPABILITY_DYNAMIC_DSO)
+        ? peak_attach_cpu_pending : 0;
+    const uint32_t backend_mask = PEAK_CAPABILITY_MEMORY |
+        PEAK_CAPABILITY_CUDA | PEAK_CAPABILITY_JIT;
+    const gboolean collecting = peak_attach_cpu_installed != 0 ||
+        (capabilities.active & backend_mask) != 0;
+    const gboolean ready = collecting || pending != 0;
+
+    GString *summary = g_string_new(collecting ? "PEAK profiling started" :
+        pending != 0 ? "PEAK is waiting for pending CPU targets" :
+        "PEAK could not start any requested profiling backend");
+    if (peak_attach_cpu_total != 0) {
+        g_string_append_printf(summary,
+            ". CPU targets at startup: %zu installed, %zu pending, %zu skipped",
+            peak_attach_cpu_installed, pending,
+            peak_attach_cpu_total - peak_attach_cpu_installed - pending);
+    }
+    const struct {
+        uint32_t flag;
+        const char *name;
+        const char *failure;
+    } backends[] = {
+        {PEAK_CAPABILITY_MEMORY, "memory", "allocator hook installation failed"},
+        {PEAK_CAPABILITY_CUDA, "CUDA", "CUDA interception unavailable"},
+        {PEAK_CAPABILITY_JIT, "JIT", "JIT provider unavailable"},
+    };
+    for (size_t i = 0; i < G_N_ELEMENTS(backends); i++) {
+        const uint32_t flag = backends[i].flag;
+        if (!(capabilities.requested & flag))
+            continue;
+        if (capabilities.active & flag) {
+            g_string_append_printf(summary, ". %s enabled%s", backends[i].name,
+                capabilities.partial & flag ? " (partial coverage)" : "");
+        } else {
+            g_string_append_printf(summary, ". %s not enabled (%s)",
+                backends[i].name, capabilities.compiled & flag
+                    ? backends[i].failure : "unavailable in this build");
         }
     }
-    return 1;
+    const char *output_prefix = getenv("PEAK_STATSLOG_PATH");
+    if (ready && (output_prefix == NULL || output_prefix[0] == '\0')) {
+        g_string_append(summary,
+            ". Default output prefix ./peak_statslog (target working directory)");
+    }
+    g_string_append(summary, ready
+        ? ". PEAK writes its report at normal process exit"
+        : ". See target stderr for activation details");
+    *message = g_string_free(summary, FALSE);
+    return ready;
 #endif
 }
 #endif
