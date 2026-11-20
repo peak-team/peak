@@ -1100,7 +1100,7 @@ print("collector_saturation_originals_ok")
             inherited_native = root/('collector_inherited'+sysconfig.get_config_var('EXT_SUFFIX'))
             build('inherited-native.c', '#include <Python.h>\nextern int inherited_leaf(void); static struct PyModuleDef m={PyModuleDef_HEAD_INIT,"collector_inherited",NULL,-1,NULL}; PyMODINIT_FUNC PyInit_collector_inherited(void){if(inherited_leaf()!=17)return NULL;return PyModule_Create(&m);}',
                   inherited_native, '-shared', '-fPIC', '-nostdlib', '-I'+python_include,
-                  '-L'+str(inherited_lib), '-lcollector_inherited')
+                  '-L'+str(inherited_lib), '-lcollector_inherited', compiler=loader_cc)
             inherited_script = root/'inherited-app.py'
             inherited_script.write_text('import collector_inherited\n')
             inherited_env = os.environ.copy()
