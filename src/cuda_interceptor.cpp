@@ -11,6 +11,10 @@
 #endif
 
 #include "cuda_interceptor.h"
+extern "C" {
+#include "detach_controller.h"
+#include "internal/gum_module_mutation.h"
+}
 #include "internal/cuda_profiler_state.h"
 #include "internal/general_listener/report_snapshot.h"
 #include "internal/general_listener/socket_report_transport.h"
@@ -3112,10 +3116,43 @@ peak_cuda_attach_capture_entry(gpointer target,
     }
 #endif
 
-    return peak_gum_interceptor_attach_target(cuda_interceptor,
-                                              target,
-                                              listener,
-                                              &plan);
+#ifdef PEAK_ATTACH_RUNTIME
+    PeakDetachRequest request = {};
+    request.hook_id = SIZE_MAX - 64;
+    request.symbol_name = "CUDA capture lifecycle";
+    request.function_address = target;
+    request.interceptor = cuda_interceptor;
+    request.listener = listener;
+    request.operation = PEAK_DETACH_OPERATION_ATTACH;
+    request.attach_options = &plan.options;
+    request.blocked_pc_start = plan.mutation_address;
+    request.blocked_pc_size = plan.mutation_guard_size;
+    PeakDetachStatus status = PEAK_DETACH_STATUS_ERROR;
+    peak_gum_module_mutation_begin();
+    if (!peak_detach_controller_prepare_hook_mutation(&request, &status)) {
+        peak_gum_module_mutation_end();
+        peak_log_warn("[peak] cannot safely attach CUDA capture listener (%s)\n",
+                      peak_detach_controller_status_string(status));
+        return GUM_ATTACH_WRONG_SIGNATURE;
+    }
+    if (!peak_detach_controller_current_mutation_uses_physical_patch())
+        gum_interceptor_begin_transaction(cuda_interceptor);
+#endif
+    GumAttachReturn result =
+#ifdef PEAK_ATTACH_RUNTIME
+        peak_detach_controller_current_mutation_uses_physical_patch() ? GUM_ATTACH_OK :
+#endif
+        peak_gum_interceptor_attach_target(cuda_interceptor,
+                                              target, listener, &plan);
+#ifdef PEAK_ATTACH_RUNTIME
+    if (!peak_detach_controller_current_mutation_uses_physical_patch())
+        gum_interceptor_end_transaction(cuda_interceptor);
+    if (!peak_detach_controller_finish_hook_mutation(&request, &status)) {
+        peak_detach_controller_abort_after_failed_finish("CUDA capture attach", status);
+    }
+    peak_gum_module_mutation_end();
+#endif
+    return result;
 }
 
 static gboolean
@@ -3378,8 +3415,41 @@ peak_cuda_replace_fast(gpointer address,
     (void)symbol;
 #endif
     {
+#ifdef PEAK_ATTACH_RUNTIME
+        PeakDetachRequest request = {};
+        request.hook_id = SIZE_MAX - 65;
+        request.symbol_name = symbol;
+        request.function_address = address;
+        request.interceptor = cuda_interceptor;
+        request.operation = PEAK_DETACH_OPERATION_REPLACE;
+        request.replacement_function = replacement;
+        request.original_function = original;
+        PeakDetachStatus status = PEAK_DETACH_STATUS_ERROR;
+        peak_gum_module_mutation_begin();
+        if (peak_detach_controller_prepare_hook_mutation(&request, &status)) {
+            if (peak_detach_controller_current_mutation_uses_physical_patch()) {
+                result = GUM_REPLACE_OK;
+            } else {
+            gum_interceptor_begin_transaction(cuda_interceptor);
+            /* Dynamic TLS first touch can allocate. Keep Gum's standard
+             * replacement recursion protection around the launch wrapper. */
+            result = gum_interceptor_replace(
+                cuda_interceptor, address, replacement, original, NULL);
+            gum_interceptor_end_transaction(cuda_interceptor);
+            }
+            if (!peak_detach_controller_finish_hook_mutation(&request, &status)) {
+                peak_detach_controller_abort_after_failed_finish("CUDA replacement attach", status);
+            }
+        } else {
+            result = GUM_REPLACE_WRONG_SIGNATURE;
+            peak_log_warn("[peak] cannot safely attach CUDA hook %s (%s)\n",
+                          symbol, peak_detach_controller_status_string(status));
+        }
+        peak_gum_module_mutation_end();
+#else
         result = gum_interceptor_replace_fast(
             cuda_interceptor, address, replacement, original, NULL);
+#endif
     }
     if (result == GUM_REPLACE_OK) {
         peak_cuda_capabilities.installed_apis |= capability;
@@ -3497,7 +3567,9 @@ extern "C" int cuda_interceptor_attach()
         peak_log_warn(
             "[peak] CUDA Driver exports share an ABI-generic dispatcher; Driver launch timing remains disabled\n");
     }
+#ifndef PEAK_ATTACH_RUNTIME
     gum_interceptor_begin_transaction(cuda_interceptor);
+#endif
 
     hook_cuda_launch =
         (gpointer*) peak_general_listener_find_function("cudaLaunchKernel");
@@ -3680,6 +3752,7 @@ extern "C" int cuda_interceptor_attach()
      * available, while retaining the Runtime replacement for any missing
      * Driver entry instead of making unrelated legacy APIs block the fast
      * path. */
+#ifndef PEAK_ATTACH_RUNTIME
     if (driver_typed_replacements_are_isolated) {
         if (hook_cuda_launch != NULL && hook_cu_launch != NULL) {
             gum_interceptor_revert(cuda_interceptor, hook_cuda_launch);
@@ -3722,6 +3795,8 @@ extern "C" int cuda_interceptor_attach()
                 ~PEAK_CUDA_API_RUNTIME_GRAPH;
         }
     }
+
+#endif
 
     for (size_t hook_index = 0;
          hook_index < PEAK_CUDA_CAPTURE_HOOK_COUNT;
@@ -3843,7 +3918,9 @@ extern "C" int cuda_interceptor_attach()
         (peak_cuda_has_timed_hook() && !peak_cuda_capture_hooks_ready);
 
     peak_cuda_lifecycle_open();
+#ifndef PEAK_ATTACH_RUNTIME
     gum_interceptor_end_transaction(cuda_interceptor);
+#endif
     if (peak_cuda_has_timed_hook() && peak_cuda_capture_hooks_ready) {
         if (!peak_cuda_start_harvester()) {
             peak_cuda_capabilities.active = FALSE;
@@ -3874,6 +3951,14 @@ extern "C" void cuda_interceptor_dettach()
 
     peak_cuda_lifecycle_close();
     peak_cuda_disable_harvester_initialization();
+#ifdef PEAK_ATTACH_RUNTIME
+    /* Other application threads may still return through these callbacks.
+     * Finalize bounded event harvesting but preserve hooks and all their
+     * reachable state until process reclamation. */
+    peak_cuda_finalize_pending();
+    peak_cuda_note_retained_state();
+    return;
+#endif
     if (!peak_cuda_hooks_reverted) {
         gum_interceptor_begin_transaction(cuda_interceptor);
         if (hook_cuda_launch) {

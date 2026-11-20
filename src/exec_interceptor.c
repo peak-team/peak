@@ -31,6 +31,15 @@
 #include <sys/auxv.h>
 #endif
 
+/* A late-loaded runtime follows libc in the link map. Its private wrapper
+ * symbols are not visible to RTLD_DEFAULT, which resolves the real process
+ * implementation without relying on preload ordering. */
+#if defined(PEAK_ATTACH_RUNTIME)
+#define PEAK_EXEC_REAL_SYMBOL_SCOPE RTLD_DEFAULT
+#else
+#define PEAK_EXEC_REAL_SYMBOL_SCOPE RTLD_NEXT
+#endif
+
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
@@ -144,8 +153,12 @@ static __thread int peak_exec_prepublication_execve_resolving;
 #endif
 #if defined(PEAK_ENABLE_TEST_HOOKS)
 static int peak_exec_test_force_execvpe_fallback;
+/* The resolver reentry callback belongs to the Linux-only exec preinit
+ * fixture; do not import an absent test callback into the Mach-O runtime. */
+#if defined(__linux__)
 extern void peak_test_exec_resolver_reentry_hook(void)
     __attribute__((weak));
+#endif
 #endif
 
 static int
@@ -177,7 +190,7 @@ peak_exec_prepublication_execve(const char* path,
         return -1;
     }
     peak_exec_prepublication_execve_resolving = 1;
-    fn = (peak_execve_fn)dlsym(RTLD_NEXT, "execve");
+    fn = (peak_execve_fn)dlsym(PEAK_EXEC_REAL_SYMBOL_SCOPE, "execve");
     peak_exec_prepublication_execve_resolving = 0;
     if (fn == NULL) {
         errno = ENOSYS;
@@ -1836,60 +1849,60 @@ static __thread int peak_posix_spawn_resolving;
 
 static void peak_lookup_execve(void)
 {
-#if defined(PEAK_ENABLE_TEST_HOOKS)
+#if defined(PEAK_ENABLE_TEST_HOOKS) && defined(__linux__)
     if (peak_test_exec_resolver_reentry_hook != NULL) {
         peak_test_exec_resolver_reentry_hook();
     }
 #endif
-    peak_real_execve_ptr = (peak_execve_fn)dlsym(RTLD_NEXT, "execve");
+    peak_real_execve_ptr = (peak_execve_fn)dlsym(PEAK_EXEC_REAL_SYMBOL_SCOPE, "execve");
 }
 
 static void peak_lookup_execvp(void)
 {
-    peak_real_execvp_ptr = (peak_execvp_fn)dlsym(RTLD_NEXT, "execvp");
+    peak_real_execvp_ptr = (peak_execvp_fn)dlsym(PEAK_EXEC_REAL_SYMBOL_SCOPE, "execvp");
 }
 
 static void peak_lookup_execvpe(void)
 {
-    peak_real_execvpe_ptr = (peak_execvpe_fn)dlsym(RTLD_NEXT, "execvpe");
+    peak_real_execvpe_ptr = (peak_execvpe_fn)dlsym(PEAK_EXEC_REAL_SYMBOL_SCOPE, "execvpe");
 }
 
 static void peak_lookup_fexecve(void)
 {
-    peak_real_fexecve_ptr = (peak_fexecve_fn)dlsym(RTLD_NEXT, "fexecve");
+    peak_real_fexecve_ptr = (peak_fexecve_fn)dlsym(PEAK_EXEC_REAL_SYMBOL_SCOPE, "fexecve");
 }
 
 static void peak_lookup_execveat(void)
 {
-    peak_real_execveat_ptr = (peak_execveat_fn)dlsym(RTLD_NEXT, "execveat");
+    peak_real_execveat_ptr = (peak_execveat_fn)dlsym(PEAK_EXEC_REAL_SYMBOL_SCOPE, "execveat");
 }
 
 static peak_posix_spawn_fn
 peak_lookup_posix_spawn(void)
 {
-#if defined(PEAK_ENABLE_TEST_HOOKS)
+#if defined(PEAK_ENABLE_TEST_HOOKS) && defined(__linux__)
     extern void peak_test_exec_spawn_resolver_reentry_hook(int)
-        __attribute__((weak));
+    __attribute__((weak));
 
     if (peak_test_exec_spawn_resolver_reentry_hook != NULL) {
         peak_test_exec_spawn_resolver_reentry_hook(0);
     }
 #endif
-    return (peak_posix_spawn_fn)dlsym(RTLD_NEXT, "posix_spawn");
+    return (peak_posix_spawn_fn)dlsym(PEAK_EXEC_REAL_SYMBOL_SCOPE, "posix_spawn");
 }
 
 static peak_posix_spawnp_fn
 peak_lookup_posix_spawnp(void)
 {
-#if defined(PEAK_ENABLE_TEST_HOOKS)
+#if defined(PEAK_ENABLE_TEST_HOOKS) && defined(__linux__)
     extern void peak_test_exec_spawn_resolver_reentry_hook(int)
-        __attribute__((weak));
+    __attribute__((weak));
 
     if (peak_test_exec_spawn_resolver_reentry_hook != NULL) {
         peak_test_exec_spawn_resolver_reentry_hook(1);
     }
 #endif
-    return (peak_posix_spawnp_fn)dlsym(RTLD_NEXT, "posix_spawnp");
+    return (peak_posix_spawnp_fn)dlsym(PEAK_EXEC_REAL_SYMBOL_SCOPE, "posix_spawnp");
 }
 
 static peak_execve_fn
@@ -1966,10 +1979,10 @@ peak_real_posix_spawn(void)
                                       memory_order_release);
                 resolved = peak_lookup_posix_spawn();
                 peak_real_posix_spawn_ptr = resolved;
-#if defined(PEAK_ENABLE_TEST_HOOKS)
+#if defined(PEAK_ENABLE_TEST_HOOKS) && defined(__linux__)
                 {
                     extern void peak_test_exec_spawn_publication_hook(int)
-                        __attribute__((weak));
+    __attribute__((weak));
 
                     if (peak_test_exec_spawn_publication_hook != NULL) {
                         peak_test_exec_spawn_publication_hook(0);
@@ -1988,10 +2001,10 @@ peak_real_posix_spawn(void)
         if (owner != self) {
             return NULL;
         }
-#if defined(PEAK_ENABLE_TEST_HOOKS)
+#if defined(PEAK_ENABLE_TEST_HOOKS) && defined(__linux__)
         {
             extern void peak_test_exec_spawn_waiter_hook(int)
-                __attribute__((weak));
+    __attribute__((weak));
 
             if (peak_test_exec_spawn_waiter_hook != NULL) {
                 peak_test_exec_spawn_waiter_hook(0);
@@ -2047,10 +2060,10 @@ peak_real_posix_spawnp(void)
                                       memory_order_release);
                 resolved = peak_lookup_posix_spawnp();
                 peak_real_posix_spawnp_ptr = resolved;
-#if defined(PEAK_ENABLE_TEST_HOOKS)
+#if defined(PEAK_ENABLE_TEST_HOOKS) && defined(__linux__)
                 {
                     extern void peak_test_exec_spawn_publication_hook(int)
-                        __attribute__((weak));
+    __attribute__((weak));
 
                     if (peak_test_exec_spawn_publication_hook != NULL) {
                         peak_test_exec_spawn_publication_hook(1);
@@ -2069,10 +2082,10 @@ peak_real_posix_spawnp(void)
         if (owner != self) {
             return NULL;
         }
-#if defined(PEAK_ENABLE_TEST_HOOKS)
+#if defined(PEAK_ENABLE_TEST_HOOKS) && defined(__linux__)
         {
             extern void peak_test_exec_spawn_waiter_hook(int)
-                __attribute__((weak));
+    __attribute__((weak));
 
             if (peak_test_exec_spawn_waiter_hook != NULL) {
                 peak_test_exec_spawn_waiter_hook(1);

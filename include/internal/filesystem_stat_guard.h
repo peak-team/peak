@@ -5,6 +5,14 @@
  * Readers never acquire the controller mutation mutex. Internal controller
  * scopes alone may bypass admission; normal application calls may not. */
 
+#ifdef PEAK_ATTACH_RUNTIME
+/* Install native libc guards after the pthread bootstrap, before recurring
+ * profiling/control mutations. The attached library retains them until exit. */
+int peak_filesystem_stat_guard_attach(void);
+/* Owned entries must not be unpatched by user-target overhead control. */
+int peak_filesystem_stat_guard_owns_address(const void *address);
+#endif
+
 /* Close admission with a 16 ms active-reader wait deadline. Return success only
  * after the reader count reaches zero, including after writer scheduling delay;
  * timeout with active readers reopens entry and defers. */

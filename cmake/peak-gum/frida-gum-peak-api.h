@@ -10,6 +10,12 @@
 extern "C" {
 #endif
 
+#define GUM_PEAK_STAGED_MUTATION_API_VERSION 1
+typedef struct _GumPeakStagedMutation GumPeakStagedMutation;
+GUM_API gboolean gum_interceptor_peak_prepare_staged_mutation(GumInterceptor *, gpointer, GumInvocationListener *, const GumAttachOptions *, gpointer, gpointer *, GumPeakStagedMutation **);
+GUM_API gboolean gum_interceptor_peak_staged_mutation_patch(GumPeakStagedMutation *, gpointer *, guint8 *, guint8 *, guint *);
+GUM_API void gum_interceptor_peak_finish_staged_mutation(GumPeakStagedMutation *, gboolean);
+
 typedef struct _GumPeakFunctionContext GumPeakFunctionContext;
 
 GUM_API guint gum_interceptor_peak_abi_fingerprint(void);
