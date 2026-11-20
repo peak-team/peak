@@ -534,6 +534,16 @@ int local_dynamic_target(int value)
 
     return second + PEAK_FIXTURE_VALUE;
 }
+
+template <typename T>
+struct SpacedType {
+    static T get(T value)
+    {
+        return value;
+    }
+};
+
+template struct SpacedType<char const*>;
 }
 
 extern "C" __attribute__((noinline, used, visibility("default")))

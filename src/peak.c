@@ -14,6 +14,7 @@
 #ifdef HAVE_MPI
 #include <mpi.h>
 #include "internal/mpi_teardown_guard.h"
+#include "internal/mpi_active_clock.h"
 #include "mpi_interceptor.h"
 #endif
 
@@ -1538,6 +1539,8 @@ peak_mpi_init_completed(int result)
 {
     if (result == MPI_SUCCESS) {
         peak_activate_runtime();
+        if (peak_requested_work.cpu && enable_global_heartbeat && heartbeat_time)
+            peak_mpi_active_clock_start(peak_main_time);
     } else if (atomic_load_explicit(&peak_runtime_activation_state,
                                     memory_order_acquire) ==
                PEAK_RUNTIME_ACTIVATION_READY) {

@@ -245,13 +245,23 @@ PEAK_TARGET='/opt/lib/libfoo.so!namespace::Class::func(int,double),libfoo.so!_ZN
 matches every loaded DSO with that basename; a path is matched exactly or
 canonically when both paths can be resolved. PEAK attaches function listeners
 only at resolved function entries; arbitrary instruction offsets are not a
-supported target syntax. PEAK first considers exact symbol names, then exact full
-demangled signatures, then legacy C++ short names. A selector with more than
-one candidate at its best matching level is not attached; PEAK prints every
-candidate instead of choosing one. Reports retain the module spelling from a
+supported target syntax. PEAK first considers exact symbol names, then full
+demangled signatures, then qualified function names such as `namespace::func`.
+A bare function name such as `func` requires `PEAK_ENABLE_CXX_SYMBOL_SCAN=1`
+for C++ name matching. A selector with more than one candidate at its best
+matching level is left unattached and produces a warning. Set
+`PEAK_VERBOSITY=info` to see the candidates. The final text report also warns
+about explicit selectors with no hook installed in the process writing the
+report. For an MPI aggregate this warning describes the reporting process.
+Reports retain the module spelling from a
 module-qualified selector, for example
 `/opt/lib/libfoo.so!namespace::Class::func(int, double)`, so equal signatures
-from different DSOs remain distinguishable.
+from different DSOs remain distinguishable. At startup, the selector is checked
+across loaded DSOs. On Linux with owned-module lookup enabled, an unscoped or
+basename-scoped C++ selector can also attach when a later `dlopen()` provides
+a unique match. The first matching module processed by PEAK gets the hook.
+Specify a `path!symbol` selector to target a particular library regardless of
+the order in which libraries are opened.
 
 Use the installed inspection command before profiling when selecting an
 overload or checking several DSOs:
@@ -280,13 +290,13 @@ in detail.
 | `PEAK_TARGET_GROUP` | Comma-separated built-in groups: `FFTW`, `PBLAS`, `ScaLAPACK`, `LAPACK`, and `BLAS`. |
 | `PEAK_TARGET_FILE` | File containing one complete CPU target name or C++ selector per line; this avoids comma-list quoting concerns for complex signatures. |
 | `PEAK_PROFILE_INTERPRETERS` | Allow normally skipped interpreter processes to initialize PEAK. |
-| `PEAK_ENABLE_CXX_SYMBOL_SCAN` | At startup, permit legacy C++ short-name matching only after an ordinary exact lookup misses. After `dlopen()`, legacy matching is available only through an absolute or slash-containing `path!symbol` selector; an unqualified C miss remains unresolved for later DSOs. |
+| `PEAK_ENABLE_CXX_SYMBOL_SCAN` | Permit legacy lookup of bare C++ function names at startup after an ordinary exact lookup misses, or in explicit `module!symbol` selectors during `dlopen()`. Names containing a C++ namespace or type qualifier are eligible for C++ matching by default. |
 | `PEAK_STATSLOG_PATH` | CSV output prefix. Default: `./peak_statslog`. |
 | `PEAK_STATSLOG_TEMPLATE` | Complete statistics-CSV pathname template. Supports `{jobid}`, `{stepid}`, `{host}`, `{rank}`, `{pid}`, and `{session}`; for example `{jobid}/{stepid}/{host}/peak-{rank}-{pid}-{session}.csv`. Missing parent directories are created for an explicit template. A template without `.csv` is valid; an exec checkpoint appends `-execN.csv` to it, while the final report uses the literal rendered name. The default adds all identity fields plus `.csv` to the prefix. |
 | `PEAK_MEMLOG_TEMPLATE` | Complete memory-log CSV pathname template; it supports the same fields. |
 | `PEAK_OUTPUT_ALLOW_OVERWRITE` | Explicitly permit replacement of a completed statistics CSV. Default: disabled. |
 | `PEAK_TEXT_OUTPUT` | Force or suppress the human-readable stderr report. |
-| `PEAK_VERBOSITY` | `silent`, `report`/`quiet`, `warn`, `info`, or `debug`; numeric levels `0` through `4` are also accepted. |
+| `PEAK_VERBOSITY` | `silent`, `report`/`quiet`, `warn`, `info`, or `debug`; numeric levels `0` through `4` are also accepted. The default `warn` shows warnings and the text report when requested. Use `info` for capability and controller metrics, or `debug` for MPI active-clock samples and other internal diagnostics. |
 | `PEAK_NAME_TRUNCATE` | Truncate long function and kernel names in text output. |
 | `PEAK_MAX_NUM_THREADS` | Tracked-thread capacity. Default: twice the online CPU count; `0` uses one slot and values above `4096` clamp. A successful `pthread_join()` immediately releases a completed slot. On Linux, detached slots are reclaimed by a bounded controller slow path only after PEAK's final TLS-destructor pass and proof that the generation's kernel TID is absent from `/proc/self/task`; ambiguous cases remain quarantined. |
 | `PEAK_RUNTIME_ACTIVATION_WAIT_TIMEOUT_MS` | Maximum wait for another thread to finish deferred runtime activation. On timeout, dependent teardown/report work is skipped. Default: `5000`. |
@@ -378,6 +388,7 @@ full output and teardown behavior.
 | `PEAK_GLOBAL_OVERHEAD_RATIO` | Global profiling-overhead ratio. Default: `0.1`. |
 | `PEAK_ENABLE_PER_TARGET_HEARTBEAT` | Enable per-target heartbeat detach decisions. Default: disabled. |
 | `PEAK_ENABLE_GLOBAL_HEARTBEAT` | Enable global heartbeat detach decisions. Default: enabled; set `0` or `false` to disable. |
+| `PEAK_MPI_ACTIVE_CLOCK` | Set to `1` to estimate local time available to produce profiling cost by discounting eligible blocking C MPI calls. Requires the global heartbeat, CPU targets, a multi-rank MPI world, and MPI SINGLE or FUNNELED. Default: disabled. |
 | `PEAK_GLOBAL_DETACH_FACTOR` | Global detach hysteresis factor. Default: `1.2`. |
 | `PEAK_GLOBAL_REATTACH_FACTOR` | Global reattach hysteresis factor. Default: `0.85`. |
 | `PEAK_ENABLE_REATTACH` | Allow physical reattach. Default: enabled, but reattach also requires a running heartbeat, a nonzero hibernation cycle, and at least one enabled heartbeat policy. |
@@ -385,6 +396,29 @@ full output and teardown behavior.
 | `PEAK_HB_MIN_US`, `PEAK_HB_MAX_US` | Adaptive heartbeat sleep bounds. Defaults: `10000` and `500000` microseconds. |
 | `PEAK_HB_K_ERR`, `PEAK_HB_K_RATE` | Adaptive response coefficients. Defaults: `3.0` and `0.8`. |
 | `PEAK_HB_EMA_A` | Growth-rate EMA alpha in `(0, 1]`. Default: `0.3`. |
+
+The active clock is a rank-local sampling heuristic. It measures wall time
+inside selected blocking MPI calls on the initializing thread of a
+multi-rank job with `MPI_THREAD_SINGLE` or `MPI_THREAD_FUNNELED`. Covered
+MPI and PMPI entry points are `Send`, `Ssend`, `Recv`, `Sendrecv`,
+`Barrier`, `Bcast`, `Reduce`, `Allreduce`, `Allgather`, `Alltoall`,
+`Wait`, `Waitall`, `Waitany`, and `Waitsome`. Point-to-point operations
+must have a potentially remote peer. Collective calls are measured for
+communicators other than `MPI_COMM_NULL` and `MPI_COMM_SELF`.
+
+`Wait` requires a non-null request. The array forms require a non-null
+array with positive count and can include local, null, or inactive requests.
+A wait can contribute even when its request came from an unwrapped API.
+Time in `Test*`, unlisted MPI APIs, and calls that bypass interposition
+continues to count toward the otherwise applicable wall-time budget.
+Unsupported MPI thread modes use the ordinary local policy.
+
+MPI call residence can include computation, and other application threads
+can still run. The budget calculation treats all estimated profiling cost
+and measured control STOP time as potentially overlapping MPI residence and
+adds them back before capping the budget time at elapsed wall time. This is
+a local sampling adjustment without rank synchronization or a guarantee
+on whole-job slowdown.
 
 PEAK creates the heartbeat helper only when at least one CPU target is
 requested. GPU-only, memory-only, and JIT-only workloads do not start it.

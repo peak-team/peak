@@ -1,5 +1,10 @@
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(test_mpi_active_clock_policy heartbeat/test_mpi_active_clock_policy.c)
+    target_include_directories(test_mpi_active_clock_policy PRIVATE ${PROJECT_SOURCE_DIR}/include)
+    target_compile_options(test_mpi_active_clock_policy PRIVATE -UNDEBUG)
+    target_link_libraries(test_mpi_active_clock_policy PRIVATE m)
+    add_test(NAME test_mpi_active_clock_policy COMMAND test_mpi_active_clock_policy)
     if(CMAKE_SYSTEM_NAME MATCHES "Linux")
         add_test(NAME test_filesystem_stat_stop_guard
             COMMAND ${CMAKE_COMMAND} -E env CC=${CMAKE_C_COMPILER}
@@ -248,7 +253,7 @@ if(BUILD_TESTING)
                     -- $<TARGET_FILE:test_uncompiled_backend_gating>)
         set_tests_properties(test_uncompiled_strict_mutation_capability
             PROPERTIES
-                ENVIRONMENT "PEAK_TARGET=main;PEAK_HEARTBEAT_INTERVAL=0.1;PEAK_TEXT_OUTPUT=1;PEAK_TEST_HIDE_COMPILED_STRICT_MUTATION=1;${PRELOAD_VAR}"
+                ENVIRONMENT "PEAK_TARGET=main;PEAK_HEARTBEAT_INTERVAL=0.1;PEAK_TEXT_OUTPUT=1;PEAK_VERBOSITY=info;PEAK_TEST_HIDE_COMPILED_STRICT_MUTATION=1;${PRELOAD_VAR}"
                 TIMEOUT 15)
     endif()
 
@@ -2479,6 +2484,18 @@ if(BUILD_TESTING)
         endif()
         string(JOIN " " _PEAK_MPIEXEC_PREFLAGS_STRING ${MPIEXEC_PREFLAGS})
         string(JOIN " " _PEAK_MPIEXEC_POSTFLAGS_STRING ${MPIEXEC_POSTFLAGS})
+        if(TARGET test_mpi_active_clock AND _PEAK_MPI_TEST_NPROCS EQUAL 2)
+            add_test(NAME test_mpi_active_clock
+                COMMAND ${Python3_EXECUTABLE}
+                        ${PROJECT_SOURCE_DIR}/test/dgemm_mpi/run_mpi_active_clock_check.py
+                        --mpiexec ${MPIEXEC_EXECUTABLE}
+                        --nproc-flag=${MPIEXEC_NUMPROC_FLAG}
+                        --exe $<TARGET_FILE:test_mpi_active_clock>
+                        --libpeak $<TARGET_FILE:peak>
+                        "--preflags=${_PEAK_MPIEXEC_PREFLAGS_STRING}"
+                        "--postflags=${_PEAK_MPIEXEC_POSTFLAGS_STRING}")
+            set_tests_properties(test_mpi_active_clock PROPERTIES TIMEOUT 35 PROCESSORS 2)
+        endif()
         if(_PEAK_MPI_REPORT_TRANSPORT_AVAILABLE)
             add_test(NAME test_mpi_report_transport
                 COMMAND ${MPIEXEC_EXECUTABLE}

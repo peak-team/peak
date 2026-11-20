@@ -776,25 +776,6 @@ peak_target_resolver_full_signature_matches(const char* selector,
     return peak_target_demangled_contains_name_only_selector(selector, demangled);
 }
 
-static char*
-peak_target_without_final_parameters(const char* demangled)
-{
-    const char* close = strrchr(demangled, ')');
-    unsigned int depth = 1;
-
-    if (close == NULL) {
-        return g_strdup(demangled);
-    }
-    for (const char* cursor = close; cursor-- > demangled;) {
-        if (*cursor == ')') {
-            depth++;
-        } else if (*cursor == '(' && --depth == 0) {
-            return g_strndup(demangled, (gsize)(cursor - demangled));
-        }
-    }
-    return g_strdup(demangled);
-}
-
 static gpointer
 peak_target_module_owner(gpointer address)
 {
@@ -1040,11 +1021,6 @@ peak_target_collect_batch_symbol(const GumSymbolDetails* details,
     PeakTargetBatchCollectContext* batch = user_data;
     GPtrArray* exact_matches;
     char* demangled = NULL;
-    gchar* normalized = NULL;
-    gchar* qualified = NULL;
-    char* short_name = NULL;
-    char* legacy_short_name = NULL;
-
     if (details->type != GUM_SYMBOL_FUNCTION || details->address == 0 ||
         details->name == NULL) {
         return TRUE;
@@ -1072,18 +1048,26 @@ peak_target_collect_batch_symbol(const GumSymbolDetails* details,
                                       exact_matches,
                                       details->name, demangled,
                                       PEAK_TARGET_MATCH_EXACT, batch->current_module);
-    if (demangled != NULL) {
-        normalized = peak_target_without_space(demangled);
+    if (demangled == NULL) {
+        return TRUE;
+    }
+
+    if (g_hash_table_size(batch->full) != 0) {
+        gchar* normalized = peak_target_without_space(demangled);
         peak_target_collect_batch_matches(details,
                                           g_hash_table_lookup(batch->full,
                                                               normalized),
                                           details->name, demangled,
                                           PEAK_TARGET_MATCH_FULL, batch->current_module);
-        short_name = peak_target_full_function_id(demangled);
+        g_free(normalized);
+    }
+    if (g_hash_table_size(batch->full_by_name) != 0) {
+        char* function_id = peak_target_full_function_id(demangled);
         peak_target_collect_full_matches(details,
                                          g_hash_table_lookup(batch->full_by_name,
-                                                             short_name),
+                                                             function_id),
                                          details->name, demangled, batch->current_module);
+        free(function_id);
         for (const char* cursor = demangled; *cursor != '\0'; ) {
             const char* begin;
             const char* end;
@@ -1099,35 +1083,31 @@ peak_target_collect_batch_symbol(const GumSymbolDetails* details,
                 details->name, demangled, batch->current_module);
             g_free(key);
         }
-        qualified = peak_target_without_final_parameters(demangled);
-        {
-            char* return_prefix = strrchr(qualified, ' ');
-            if (return_prefix != NULL) {
-                memmove(qualified, return_prefix + 1,
-                        strlen(return_prefix + 1) + 1);
-            }
-        }
-        {
-            gchar* normalized_qualified = peak_target_without_space(qualified);
-            peak_target_collect_legacy_matches(details,
-                                               g_hash_table_lookup(
-                                                   batch->legacy_qualified,
-                                                   normalized_qualified),
-                                               details->name, demangled, batch->current_module);
-            g_free(normalized_qualified);
-        }
-        if (g_hash_table_size(batch->legacy_short) != 0) {
-            legacy_short_name = extract_function_name(demangled);
-            peak_target_collect_legacy_matches(
-                details,
-                g_hash_table_lookup(batch->legacy_short, legacy_short_name),
-                details->name, demangled, batch->current_module);
-        }
     }
-    free(legacy_short_name);
-    free(short_name);
-    g_free(qualified);
-    g_free(normalized);
+    if (g_hash_table_size(batch->legacy_qualified) != 0 &&
+        !peak_target_is_artificial_prefix(demangled)) {
+        const char* start = peak_target_demangled_function_start(demangled);
+        const char* end = peak_target_final_parameter_open(start);
+        gchar* qualified = end != NULL
+            ? g_strndup(start, (gsize)(end - start))
+            : NULL;
+        gchar* normalized = qualified != NULL
+            ? peak_target_without_space(qualified)
+            : NULL;
+        peak_target_collect_legacy_matches(
+            details, normalized != NULL
+                ? g_hash_table_lookup(batch->legacy_qualified, normalized) : NULL,
+            details->name, demangled, batch->current_module);
+        g_free(normalized);
+        g_free(qualified);
+    }
+    if (g_hash_table_size(batch->legacy_short) != 0) {
+        char* short_name = extract_function_name(demangled);
+        peak_target_collect_legacy_matches(
+            details, g_hash_table_lookup(batch->legacy_short, short_name),
+            details->name, demangled, batch->current_module);
+        free(short_name);
+    }
     free(demangled);
     return TRUE;
 }
@@ -1302,12 +1282,15 @@ peak_target_resolver_resolve_many(PeakTargetResolveRequest* requests,
              strchr(selectors[i].symbol, '<') != NULL);
         gboolean complete_signature = human_signature &&
             peak_target_selector_is_complete_signature(selectors[i].symbol);
+        gboolean qualified_function_name = !mangled_selector &&
+            !complete_signature && strstr(selectors[i].symbol, "::") != NULL;
 
         contexts[i] = (PeakTargetCollectContext){
             .selector = &selectors[i],
             .module_path = requests[i].module_path,
             .candidates = requests[i].resolution.candidates,
-            .cxx_selector = human_signature || requests[i].allow_legacy_short,
+            .cxx_selector = human_signature || qualified_function_name ||
+                            requests[i].allow_legacy_short,
             .ordinary_first_match = requests[i].ordinary_first_match,
             .owned_module = requests[i].owned_module,
             .module_seen = &requests[i].module_seen,
@@ -1337,16 +1320,14 @@ peak_target_resolver_resolve_many(PeakTargetResolveRequest* requests,
                                                      selectors[i].symbol,
                                                      &contexts[i]);
             }
+        } else if (qualified_function_name) {
+            peak_target_batch_add(batch.legacy_qualified,
+                                  peak_target_without_space(selectors[i].symbol),
+                                  &contexts[i]);
         } else if (!mangled_selector && requests[i].allow_legacy_short) {
-            if (strstr(selectors[i].symbol, "::") != NULL) {
-                peak_target_batch_add(batch.legacy_qualified,
-                                      peak_target_without_space(selectors[i].symbol),
-                                      &contexts[i]);
-            } else {
-                peak_target_batch_add(batch.legacy_short,
-                                      g_strdup(selectors[i].symbol),
-                                      &contexts[i]);
-            }
+            peak_target_batch_add(batch.legacy_short,
+                                  g_strdup(selectors[i].symbol),
+                                  &contexts[i]);
         }
     }
     batch.contexts = contexts;

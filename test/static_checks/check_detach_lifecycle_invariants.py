@@ -763,27 +763,45 @@ def check_safe_arm64_plt_reads(repo_root):
         dlopen_source, "dlopen_interceptor_initialize_attach_candidate"
     )
     normalized_dlopen_plan = re.sub(r"\s+", " ", dlopen_plan)
-    for label, body in (
-        ("initial", initial_attach),
-        ("JIT", jit_attach),
+    initial_parts = (
+        "peak_general_listener_initial_attach_one",
+        "peak_general_listener_initial_attach_batch",
+    )
+    single, batch = (extract_function(general, name) for name in initial_parts)
+    eligibility = extract_function(general, "peak_general_listener_initial_attach_can_batch")
+    require(
+        "peak_gum_target_attach_plan(request.function_address, &plan)" in single and
+        "request.blocked_pc_start = plan.mutation_guard_size ? plan.mutation_address : NULL" in single and
+        "request.blocked_pc_size = plan.mutation_guard_size" in single and
+        "canonical != address" in eligibility and
+        "distance < GUM_PEAK_MAX_PROLOGUE_SIZE" in eligibility and
+        "mutation_request.blocked_pc_start = resolved_hook_address" in initial_attach and
+        "mutation_request.blocked_pc_size = GUM_PEAK_MAX_PROLOGUE_SIZE" in initial_attach and
+        "startup_requests[startup_count] = mutation_request" in initial_attach and
+        "startup_plans[startup_count++] = attach_plan" in initial_attach,
+        "initial attach must replan singletons and batch only disjoint canonical entry ranges",
+    )
+    for body, guard, plan in (
+        (single, "peak_detach_controller_prepare_hook_mutation(", "plan"),
+        (batch, "peak_detach_controller_prepare_hook_mutation_batch(", "&plans[i]"),
     ):
-        normalized = re.sub(r"\s+", " ", body)
-        plan_position = body.find("peak_gum_target_attach_plan(")
-        blocked_position = body.find(".blocked_pc_start =")
-        prepare_position = body.find("peak_detach_controller_prepare_hook_mutation")
-        require(plan_position != -1 and blocked_position != -1 and
-                prepare_position != -1 and
-                plan_position < blocked_position < prepare_position,
-                f"{label} first attach must guard its planned mutation range")
-        require(
+        guard_position = body.find(guard)
+        attach_position = body.find("peak_general_listener_gum_attach_target(")
+        require(guard_position >= 0 and attach_position > guard_position and
+                plan in body[attach_position:],
+                "startup mutators must apply the original target plan after guarding mutations")
+    normalized = " ".join(jit_attach.split())
+    plan_position = jit_attach.find("peak_gum_target_attach_plan(")
+    blocked_position = jit_attach.find(".blocked_pc_start =")
+    prepare_position = jit_attach.find("peak_detach_controller_prepare_hook_mutation")
+    require(0 <= plan_position < blocked_position < prepare_position and
             ".blocked_pc_start = attach_plan.mutation_guard_size > 0 ? "
             "attach_plan.mutation_address : NULL" in normalized and
             ".blocked_pc_size = attach_plan.mutation_guard_size" in normalized and
             ("peak_gum_interceptor_attach_target(" in normalized or
              "peak_general_listener_gum_attach_target(" in normalized) and
             "&attach_plan" in normalized,
-            f"{label} attach must use one plan for both strict guard and Gum options",
-        )
+            "JIT attach must use one plan for both strict guard and Gum options")
     require(
         "peak_gum_target_attach_plan(" in dlopen_plan and
         ".blocked_pc_start = candidate->attach_plan.mutation_guard_size > 0 ? "
@@ -1921,20 +1939,33 @@ def check_stop_window_accounting_sidecar(repo_root):
             "local_mpi_ranks" not in per_target_detach and
             "spent_ratio" not in per_target_detach,
             "per-target detach must remain cumulative-only and independent of reattach risk")
-    require("double projected_global_overhead =\n                MAX(projected_attached_recent_sum,\n                    projected_attached_lifetime_sum)" in global_detach_for_budget and
-            "if (projected_global_overhead >\n                global_target_ratio * peak_global_detach_factor)" in global_detach_for_budget and
-            "double contribution =\n                        MAX(rate_snapshot[i], ratio_snapshot[i])" in global_detach_for_budget and
+    # Each threshold is specific to its own time window. Either pressure can
+    # trigger detachment, and both must fit before the reduction loop stops.
+    global_detach_tokens = " ".join(global_detach_for_budget.split())
+    require(
+            "if (projected_attached_recent_sum > recent_target * peak_global_detach_factor || "
+            "projected_attached_lifetime_sum > lifetime_target * peak_global_detach_factor)"
+            in global_detach_tokens and
+            "if (reduced_recent_sum <= recent_target && reduced_lifetime_sum <= lifetime_target)"
+            in global_detach_tokens,
+            "global detach must trigger on either window exceeding its own threshold "
+            "and reduce until both windows fit")
+    require("double recent_target = global_target_ratio" in heartbeat and
+            "double lifetime_target = global_target_ratio" in heartbeat and
+            "recent_target = recent.ratio" in heartbeat and
+            "lifetime_target = lifetime.ratio" in heartbeat,
+            "detach window targets must default to the configured ratio and use "
+            "their matching active-clock decisions")
+    require("double contribution = MAX(rate_snapshot[i], ratio_snapshot[i])"
+            in global_detach_tokens and
             "if (contribution <= 0.0) continue;" in global_detach_for_budget and
             "entries[n_attached].ratio = contribution" in global_detach_for_budget and
             "entries[n_attached].rate = rate_snapshot[i]" in global_detach_for_budget and
             "entries[n_attached].lifetime = ratio_snapshot[i]" in global_detach_for_budget and
             "double reduced_recent_sum = projected_attached_recent_sum" in global_detach_for_budget and
             "double reduced_lifetime_sum = projected_attached_lifetime_sum" in global_detach_for_budget and
-            "double reduced_global_overhead = projected_global_overhead" in global_detach_for_budget and
-            "if (reduced_global_overhead <= global_target_ratio)" in global_detach_for_budget and
             "reduced_recent_sum -= entries[k].rate" in global_detach_for_budget and
             "reduced_lifetime_sum -= entries[k].lifetime" in global_detach_for_budget and
-            "reduced_global_overhead =\n                            MAX(reduced_recent_sum, reduced_lifetime_sum)" in global_detach_for_budget and
             "projected_attached_recent_sum = reduced_recent_sum" in global_detach_for_budget and
             "projected_attached_lifetime_sum = reduced_lifetime_sum" in global_detach_for_budget and
             "spent_ratio" not in global_detach_for_budget and
@@ -1944,12 +1975,12 @@ def check_stop_window_accounting_sidecar(repo_root):
             "local_mpi_ranks" not in global_detach_for_budget,
             "global detach must carry both profile signals and exclude raw and risk control spend")
     require("profile_global_overhead - prev_global_overhead" in adaptive_sleep and
-            "profile_global_overhead / global_target_ratio" in adaptive_sleep and
+            "profile_global_overhead / lifetime_target" in adaptive_sleep and
             "recent_rate" not in adaptive_sleep and
             "rate_snapshot" not in adaptive_sleep and
             "risk" not in adaptive_sleep and
             "local_mpi_ranks" not in adaptive_sleep,
-            "adaptive heartbeat sleep must use only the immutable hybrid global overhead")
+            "adaptive heartbeat sleep must compare immutable hybrid pressure with the lifetime target")
     reattach_section = heartbeat[
         heartbeat.find("/* 3) Reattach. */"):]
     require("value >= 0.0" in nonnegative_finite and
@@ -2000,6 +2031,23 @@ def check_stop_window_accounting_sidecar(repo_root):
             "                    global_target_ratio,\n"
             "                    &reattach_gate_ratio)" in reattach_section,
             "reattach gate must be built with checked factor-times-target arithmetic")
+    active_debits = " ".join(reattach_section.split())
+    require(
+        "lifetime_target, total_execution_time, &active_headroom_seconds)"
+        in active_debits and
+        "peak_mpi_active_clock_reattach_debit( &active_headroom_seconds, "
+        "profile_spent_seconds, reattach_control_spent_seconds, 1)"
+        in active_debits and
+        "peak_mpi_active_clock_reattach_debit( &active_headroom_seconds, "
+        "projected_pending_reattach_seconds, last_stop_seconds, pending_batch_windows)"
+        in active_debits and
+        "peak_mpi_active_clock_reattach_debit( &remaining_active_headroom, "
+        "incremental_lease_seconds, last_stop_seconds, after_windows - before_windows)"
+        in active_debits and
+        active_debits.index("active_headroom_seconds = remaining_active_headroom") >
+        active_debits.index("if (!accepted)"),
+        "active-clock admission must charge raw STOP and the shared lease "
+        "once at each stage, then commit the debit only on request acceptance")
     require("double headroom_seconds = 0.0" in reattach_section and
             "peak_general_listener_multiply_nonnegative_finite(\n"
             "                    global_target_ratio,\n"
@@ -2204,9 +2252,14 @@ def check_stop_window_accounting_sidecar(repo_root):
             "task_count > 1" in startup_skip and
             "return read_errno == 0 && task_count == 1;" in startup_skip,
             "startup attach stop-skip must fail closed on /proc read errors and be proven by a single-thread task count")
-    require("startup_attach_can_skip_stop" in general_listener_attach and
-            "!startup_attach_can_skip_stop &&" in general_listener_attach,
-            "initial attach must skip the stop backend only after a single-thread proof")
+    initial_one = extract_function(general, "peak_general_listener_initial_attach_one")
+    initial_batch = extract_function(general, "peak_general_listener_initial_attach_batch")
+    require("peak_general_listener_startup_attach_can_skip_stop()" in general_listener_attach and
+            "startup_attach_can_skip_stop);" in general_listener_attach and
+            "!skip_stop &&" in initial_one and "if (count < 2 || skip_stop ||" in initial_batch and
+            "prepared != count" in initial_batch and
+            "peak_general_listener_initial_attach_one(" in initial_batch,
+            "initial attach must preserve the single-thread proof or guard every target")
     require("startup_attach_can_skip_stop" in overhead_bootstrap and
             overhead_bootstrap.count(
                 "peak_general_listener_startup_attach_can_skip_stop()"

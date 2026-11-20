@@ -193,6 +193,11 @@ main(void)
         "./su3_rhmd_hisq.skx",
         NULL
     };
+    char* modinfo_tool[] = {
+        "/sbin/modinfo",
+        "hfi1",
+        NULL
+    };
     char* milc_app[] = {
         "./su3_rhmd_hisq.skx",
         NULL
@@ -212,6 +217,8 @@ main(void)
     ok &= expect_filtered("/usr/bin/env");
     ok &= expect_filtered("timeout");
     ok &= expect_filtered("/usr/bin/time");
+    ok &= expect_filtered("modinfo");
+    ok &= expect_filtered("/sbin/modinfo");
     ok &= expect_filtered("tee");
     ok &= expect_filtered("ln");
     ok &= expect_filtered("/usr/bin/ln");
@@ -260,6 +267,7 @@ main(void)
                                   timeout_path_wrapper,
                                   0,
                                   "/usr/bin/timeout wrapper");
+    ok &= expect_profile_decision(2, modinfo_tool, 0, "modinfo with PEAK_TARGET_FILE");
     ok &= expect_profile_decision(1, milc_app, 1, "MILC app");
     ok &= expect_profile_decision(2, python_app, 0, "python default skip");
     ok &= expect_profile_decision(2, node_app, 0, "node default skip");

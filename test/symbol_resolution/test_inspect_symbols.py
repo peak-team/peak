@@ -36,6 +36,11 @@ def probe_optional_demangle(*args):
 def main():
     peak, module_a, module_b = sys.argv[1:]
     output = run(
+        peak, "inspect-symbols", "--module", module_a,
+        "peak_test::SpacedType<char const*>::get", expected=0)
+    assert "candidates=1" in output
+    assert "demangled=peak_test::SpacedType<char const*>::get(char const*)" in output
+    output = run(
         peak, "inspect-symbols", "--module", module_a, "--module", module_b,
         "peak_test::Widget::func(int,double)", expected=1)
     assert "candidates=2" in output

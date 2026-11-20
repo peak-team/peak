@@ -1,6 +1,11 @@
 
 add_executable(test_dgemm_mpi test_dgemm_mpi.c)
 add_executable(test_mpi_exit_before_finalize test_mpi_exit_before_finalize.c)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(test_mpi_active_clock test_mpi_active_clock.c)
+    target_link_libraries(test_mpi_active_clock PRIVATE MPI::MPI_C)
+    target_link_options(test_mpi_active_clock PRIVATE -Wl,--export-dynamic)
+endif()
 add_library(test_mpi_init_deferred_module MODULE
     mpi_init_deferred_module.c)
 set_target_properties(test_mpi_init_deferred_module

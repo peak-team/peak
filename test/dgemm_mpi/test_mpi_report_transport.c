@@ -372,6 +372,9 @@ run_fail_closed_case(int rank, const char* label, bool abandon_active_request)
 int
 main(int argc, char** argv)
 {
+    /* Base stages plus the degraded-mode mask, two capability reductions,
+     * and max/sum for each of the two dropped-event counters. */
+    const int expected_collectives = 54 + 1 + 2 + 4;
     PeakReportSnapshot* local;
     PeakReportSnapshot* aggregate = NULL;
     PeakReportSnapshot* root_aggregate = NULL;
@@ -412,8 +415,13 @@ main(int argc, char** argv)
         MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
     }
     result = peak_mpi_report_transport_reduce(local, &aggregate);
-    if (collective_observer_count != 54 ||
+    if (collective_observer_count != expected_collectives ||
         collective_observer_failures != 0) {
+        fprintf(stderr,
+                "rank %d observed %d staged collectives (expected %d), "
+                "with %d staging validation failures\n",
+                rank, collective_observer_count, expected_collectives,
+                collective_observer_failures);
         failures++;
     }
     if (rank == 0) {

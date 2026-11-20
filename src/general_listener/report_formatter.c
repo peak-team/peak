@@ -641,10 +641,10 @@ peak_report_formatter_truncate_name(const char* name,
 
 static void
 peak_report_formatter_print_text_section(const char* title,
-                                         const char* separator)
+                                         const char* separator,
+                                         PeakVerbosity level)
 {
-    peak_log_report("\n%s\n", title);
-    peak_log_report("%s\n", separator);
+    peak_log_message(level, "\n%s\n%s\n", title, separator);
 }
 
 void
@@ -652,52 +652,52 @@ peak_report_formatter_write_rank_maxima(
     const PeakReportRankTuple maximum[PEAK_REPORT_METRIC_COUNT],
     const int owner_rank[PEAK_REPORT_METRIC_COUNT])
 {
-    peak_log_report("[peak] per-rank maximum profile+control overhead: owner_rank=%d profile_seconds=%.9f control_seconds=%.9f elapsed_seconds=%.9f ratio=%.9f\n",
-                    owner_rank[PEAK_REPORT_METRIC_COMBINED],
-                    maximum[PEAK_REPORT_METRIC_COMBINED].profile_seconds,
-                    maximum[PEAK_REPORT_METRIC_COMBINED].control_seconds,
-                    maximum[PEAK_REPORT_METRIC_COMBINED].elapsed_seconds,
-                    maximum[PEAK_REPORT_METRIC_COMBINED].ratio);
-    peak_log_report("[peak] per-rank maximum profile overhead: owner_rank=%d profile_seconds=%.9f elapsed_seconds=%.9f ratio=%.9f\n",
-                    owner_rank[PEAK_REPORT_METRIC_PROFILE],
-                    maximum[PEAK_REPORT_METRIC_PROFILE].profile_seconds,
-                    maximum[PEAK_REPORT_METRIC_PROFILE].elapsed_seconds,
-                    maximum[PEAK_REPORT_METRIC_PROFILE].profile_ratio);
-    peak_log_report("[peak] per-rank maximum control overhead: owner_rank=%d control_seconds=%.9f elapsed_seconds=%.9f ratio=%.9f\n",
-                    owner_rank[PEAK_REPORT_METRIC_CONTROL],
-                    maximum[PEAK_REPORT_METRIC_CONTROL].control_seconds,
-                    maximum[PEAK_REPORT_METRIC_CONTROL].elapsed_seconds,
-                    maximum[PEAK_REPORT_METRIC_CONTROL].control_ratio);
-    peak_log_report("[peak] per-rank maximum profile+control risk overhead: owner_rank=%d profile_seconds=%.9f raw_control_seconds=%.9f local_ranks=%u control_risk_seconds=%.9f risk_seconds=%.9f elapsed_seconds=%.9f ratio=%.9f\n",
-                    owner_rank[PEAK_REPORT_METRIC_PROFILE_CONTROL_RISK],
-                    maximum[PEAK_REPORT_METRIC_PROFILE_CONTROL_RISK]
-                        .profile_seconds,
-                    maximum[PEAK_REPORT_METRIC_PROFILE_CONTROL_RISK]
-                        .control_seconds,
-                    maximum[PEAK_REPORT_METRIC_PROFILE_CONTROL_RISK]
-                        .local_ranks,
-                    maximum[PEAK_REPORT_METRIC_PROFILE_CONTROL_RISK]
-                        .control_risk_seconds,
-                    maximum[PEAK_REPORT_METRIC_PROFILE_CONTROL_RISK]
-                        .profile_control_risk_seconds,
-                    maximum[PEAK_REPORT_METRIC_PROFILE_CONTROL_RISK]
-                        .elapsed_seconds,
-                    maximum[PEAK_REPORT_METRIC_PROFILE_CONTROL_RISK]
-                        .profile_control_risk_ratio);
-    peak_log_report("[peak] per-rank maximum control risk overhead: owner_rank=%d raw_control_seconds=%.9f local_ranks=%u control_risk_seconds=%.9f elapsed_seconds=%.9f ratio=%.9f\n",
-                    owner_rank[PEAK_REPORT_METRIC_CONTROL_RISK],
-                    maximum[PEAK_REPORT_METRIC_CONTROL_RISK].control_seconds,
-                    maximum[PEAK_REPORT_METRIC_CONTROL_RISK].local_ranks,
-                    maximum[PEAK_REPORT_METRIC_CONTROL_RISK]
-                        .control_risk_seconds,
-                    maximum[PEAK_REPORT_METRIC_CONTROL_RISK].elapsed_seconds,
-                    maximum[PEAK_REPORT_METRIC_CONTROL_RISK]
-                        .control_risk_ratio);
-    peak_log_report("[peak] per-rank maximum heartbeat management overhead: owner_rank=%d cpu_seconds=%.9f elapsed_seconds=%.9f ratio=%.9f\n",
-                    owner_rank[PEAK_REPORT_METRIC_MANAGEMENT],
-                    maximum[PEAK_REPORT_METRIC_MANAGEMENT].management_seconds,
-                    maximum[PEAK_REPORT_METRIC_MANAGEMENT].elapsed_seconds,
-                    maximum[PEAK_REPORT_METRIC_MANAGEMENT].management_ratio);
+    peak_log_info("[peak] per-rank maximum profile+control overhead: owner_rank=%d profile_seconds=%.9f control_seconds=%.9f elapsed_seconds=%.9f ratio=%.9f\n",
+                  owner_rank[PEAK_REPORT_METRIC_COMBINED],
+                  maximum[PEAK_REPORT_METRIC_COMBINED].profile_seconds,
+                  maximum[PEAK_REPORT_METRIC_COMBINED].control_seconds,
+                  maximum[PEAK_REPORT_METRIC_COMBINED].elapsed_seconds,
+                  maximum[PEAK_REPORT_METRIC_COMBINED].ratio);
+    peak_log_info("[peak] per-rank maximum profile overhead: owner_rank=%d profile_seconds=%.9f elapsed_seconds=%.9f ratio=%.9f\n",
+                  owner_rank[PEAK_REPORT_METRIC_PROFILE],
+                  maximum[PEAK_REPORT_METRIC_PROFILE].profile_seconds,
+                  maximum[PEAK_REPORT_METRIC_PROFILE].elapsed_seconds,
+                  maximum[PEAK_REPORT_METRIC_PROFILE].profile_ratio);
+    peak_log_info("[peak] per-rank maximum control overhead: owner_rank=%d control_seconds=%.9f elapsed_seconds=%.9f ratio=%.9f\n",
+                  owner_rank[PEAK_REPORT_METRIC_CONTROL],
+                  maximum[PEAK_REPORT_METRIC_CONTROL].control_seconds,
+                  maximum[PEAK_REPORT_METRIC_CONTROL].elapsed_seconds,
+                  maximum[PEAK_REPORT_METRIC_CONTROL].control_ratio);
+    peak_log_info("[peak] per-rank maximum profile+control risk overhead: owner_rank=%d profile_seconds=%.9f raw_control_seconds=%.9f local_ranks=%u control_risk_seconds=%.9f risk_seconds=%.9f elapsed_seconds=%.9f ratio=%.9f\n",
+                  owner_rank[PEAK_REPORT_METRIC_PROFILE_CONTROL_RISK],
+                  maximum[PEAK_REPORT_METRIC_PROFILE_CONTROL_RISK]
+                      .profile_seconds,
+                  maximum[PEAK_REPORT_METRIC_PROFILE_CONTROL_RISK]
+                      .control_seconds,
+                  maximum[PEAK_REPORT_METRIC_PROFILE_CONTROL_RISK]
+                      .local_ranks,
+                  maximum[PEAK_REPORT_METRIC_PROFILE_CONTROL_RISK]
+                      .control_risk_seconds,
+                  maximum[PEAK_REPORT_METRIC_PROFILE_CONTROL_RISK]
+                      .profile_control_risk_seconds,
+                  maximum[PEAK_REPORT_METRIC_PROFILE_CONTROL_RISK]
+                      .elapsed_seconds,
+                  maximum[PEAK_REPORT_METRIC_PROFILE_CONTROL_RISK]
+                      .profile_control_risk_ratio);
+    peak_log_info("[peak] per-rank maximum control risk overhead: owner_rank=%d raw_control_seconds=%.9f local_ranks=%u control_risk_seconds=%.9f elapsed_seconds=%.9f ratio=%.9f\n",
+                  owner_rank[PEAK_REPORT_METRIC_CONTROL_RISK],
+                  maximum[PEAK_REPORT_METRIC_CONTROL_RISK].control_seconds,
+                  maximum[PEAK_REPORT_METRIC_CONTROL_RISK].local_ranks,
+                  maximum[PEAK_REPORT_METRIC_CONTROL_RISK]
+                      .control_risk_seconds,
+                  maximum[PEAK_REPORT_METRIC_CONTROL_RISK].elapsed_seconds,
+                  maximum[PEAK_REPORT_METRIC_CONTROL_RISK]
+                      .control_risk_ratio);
+    peak_log_info("[peak] per-rank maximum heartbeat management overhead: owner_rank=%d cpu_seconds=%.9f elapsed_seconds=%.9f ratio=%.9f\n",
+                  owner_rank[PEAK_REPORT_METRIC_MANAGEMENT],
+                  maximum[PEAK_REPORT_METRIC_MANAGEMENT].management_seconds,
+                  maximum[PEAK_REPORT_METRIC_MANAGEMENT].elapsed_seconds,
+                  maximum[PEAK_REPORT_METRIC_MANAGEMENT].management_ratio);
 }
 
 static PeakReportTextSummary
@@ -1106,12 +1106,13 @@ peak_report_formatter_write_text(
         peak_log_report("%s\n", report_separator);
     }
 
-    peak_report_formatter_print_text_section("Application", row_separator);
+    peak_report_formatter_print_text_section(
+        "Application", row_separator, PEAK_VERBOSITY_REPORT);
     peak_log_report("Time: %f\n", summary.elapsed_seconds);
     if (overhead->valid) {
-        peak_log_report("[peak] per-rank elapsed range: min_seconds=%.9f max_seconds=%.9f\n",
-                        overhead->elapsed_min_seconds,
-                        overhead->elapsed_max_seconds);
+        peak_log_info("[peak] per-rank elapsed range: min_seconds=%.9f max_seconds=%.9f\n",
+                      overhead->elapsed_min_seconds,
+                      overhead->elapsed_max_seconds);
     }
     peak_log_report("PEAK done with: %s\n",
                     snapshot->program != NULL ? snapshot->program : "");
@@ -1142,7 +1143,7 @@ peak_report_formatter_write_text(
              capability++) {
             const uint32_t mask =
                 peak_report_capability_names[capability].mask;
-            peak_log_report(
+            peak_log_info(
                 "Profiler capability [%s]: requested=%d compiled=%d active=%d partial=%d retained=%d failed=%d\n",
                 peak_report_capability_names[capability].name,
                 (snapshot->capabilities.requested & mask) != 0,
@@ -1152,7 +1153,7 @@ peak_report_formatter_write_text(
                 (snapshot->capabilities.retained & mask) != 0,
                 (snapshot->capabilities.failed & mask) != 0);
         }
-        peak_log_report(
+        peak_log_info(
             "Profiler CUDA API coverage: compiled=0x%08x found=0x%08x installed=0x%08x failed=0x%08x\n",
             snapshot->capabilities.cuda_compiled_apis,
             snapshot->capabilities.cuda_found_apis,
@@ -1160,7 +1161,7 @@ peak_report_formatter_write_text(
             snapshot->capabilities.cuda_failed_apis);
         if ((snapshot->capabilities.requested & PEAK_CAPABILITY_JIT) != 0 ||
             snapshot->jit.provider_generation != 0) {
-            peak_log_report(
+            peak_log_info(
                 "Profiler JIT diagnostics: generation=%llu pending=%llu high_water=%llu queue_full=%llu non_executable_timeout=%llu attach_retry_timeout=%llu allocation_failure=%llu\n",
                 (unsigned long long)snapshot->jit.provider_generation,
                 (unsigned long long)snapshot->jit.pending_count,
@@ -1178,15 +1179,21 @@ peak_report_formatter_write_text(
                         (unsigned long long)snapshot->dropped_threads);
     }
 
-    peak_report_formatter_print_text_section("Overhead summary",
-                                             row_separator);
+    peak_report_formatter_print_text_section(
+        "Overhead summary", row_separator, PEAK_VERBOSITY_REPORT);
     peak_log_report("Estimated overhead: %.3es per call and %.3es total\n",
                     snapshot->overhead_per_call,
                     summary.total_overhead);
     if (overhead->valid) {
         if (overhead->per_rank_max) {
-            peak_log_report("Aggregated profile estimate: %.9f s\n",
-                            overhead->profile_seconds);
+            const PeakReportRankTuple* maximum =
+                &overhead->per_rank_maxima.tuples[PEAK_REPORT_METRIC_COMBINED];
+
+            peak_log_report("Highest profile + control: %8.4f%% of rank runtime (rank %d)\n",
+                            maximum->ratio * 100.0,
+                            summary.stop_window_owner_rank);
+            peak_log_report("  Profile estimate: %.9f s, control stop windows: %.9f s\n",
+                            maximum->profile_seconds, maximum->control_seconds);
         } else {
             peak_log_report("Profile estimate: %.9f s (%8.4f%% of runtime)\n",
                             overhead->profile_seconds,
@@ -1196,95 +1203,95 @@ peak_report_formatter_write_text(
                             overhead->control_ratio * 100.0);
             peak_log_report("Profile + control: %8.4f%% of runtime\n",
                             overhead->ratio * 100.0);
-            peak_log_report("Local-rank risk estimate: %.9f s (%8.4f%% of runtime)\n",
-                            overhead->profile_control_risk_seconds,
-                            overhead->profile_control_risk_ratio * 100.0);
-            peak_log_report("Heartbeat management CPU: %.9f s (%8.4f%% of runtime)\n",
-                            overhead->management_seconds,
-                            overhead->management_ratio * 100.0);
+            peak_log_info("Local-rank risk estimate: %.9f s (%8.4f%% of runtime)\n",
+                          overhead->profile_control_risk_seconds,
+                          overhead->profile_control_risk_ratio * 100.0);
+            peak_log_info("Heartbeat management CPU: %.9f s (%8.4f%% of runtime)\n",
+                          overhead->management_seconds,
+                          overhead->management_ratio * 100.0);
         }
     }
 
-    peak_report_formatter_print_text_section("Controller accounting",
-                                             row_separator);
+    peak_report_formatter_print_text_section(
+        "Controller accounting", row_separator, PEAK_VERBOSITY_INFO);
     if (summary.stop_window_owner_rank >= 0) {
-        peak_log_report("Control windows: %llu, %.9f s (%8.4f%%), owner rank %d\n",
-                        (unsigned long long)summary.stop_window_count,
-                        summary.stop_window_seconds,
-                        summary.stop_window_ratio * 100.0,
-                        summary.stop_window_owner_rank);
+        peak_log_info("Control windows: %llu, %.9f s (%8.4f%%), owner rank %d\n",
+                      (unsigned long long)summary.stop_window_count,
+                      summary.stop_window_seconds,
+                      summary.stop_window_ratio * 100.0,
+                      summary.stop_window_owner_rank);
     } else {
-        peak_log_report("Control windows: %llu, %.9f s (%8.4f%%), %s\n",
-                        (unsigned long long)summary.stop_window_count,
-                        summary.stop_window_seconds,
-                        summary.stop_window_ratio * 100.0,
-                        rank_count > 1 ? "rank-0 local" : "local");
+        peak_log_info("Control windows: %llu, %.9f s (%8.4f%%), %s\n",
+                      (unsigned long long)summary.stop_window_count,
+                      summary.stop_window_seconds,
+                      summary.stop_window_ratio * 100.0,
+                      rank_count > 1 ? "rank-0 local" : "local");
     }
-    peak_log_report("Failed control windows: %llu (%s scope)\n",
-                    (unsigned long long)summary.failed_stop_window_count,
-                    rank_count > 1 ? "aggregate" : "local");
-    peak_log_report("Accounting snapshot: %s\n",
-                    overhead->accounting_valid ? "valid" : "unavailable");
-    peak_log_report("Transition coverage (%s, ever observed): %zu detached, %zu reattached, %zu revisited\n",
-                    rank_count > 1 ? "aggregate" : "local",
-                    summary.detached_targets,
-                    summary.reattached_targets,
-                    summary.revisited_targets);
+    peak_log_info("Failed control windows: %llu (%s scope)\n",
+                  (unsigned long long)summary.failed_stop_window_count,
+                  rank_count > 1 ? "aggregate" : "local");
+    peak_log_info("Accounting snapshot: %s\n",
+                  overhead->accounting_valid ? "valid" : "unavailable");
+    peak_log_info("Transition coverage (%s, ever observed): %zu detached, %zu reattached, %zu revisited\n",
+                  rank_count > 1 ? "aggregate" : "local",
+                  summary.detached_targets,
+                  summary.reattached_targets,
+                  summary.revisited_targets);
 
     peak_report_formatter_print_text_section(
-        "Detailed metrics (stable key=value)", row_separator);
+        "Detailed metrics (stable key=value)", row_separator, PEAK_VERBOSITY_INFO);
     if (overhead->valid) {
         if (overhead->per_rank_max) {
             peak_report_formatter_write_rank_maxima(
                 overhead->per_rank_maxima.tuples,
                 overhead->per_rank_maxima.owner_ranks);
         } else {
-            peak_log_report("[peak] local profile+control overhead: profile_seconds=%.9f control_seconds=%.9f profile_ratio=%.9f control_ratio=%.9f ratio=%.9f\n",
-                            overhead->profile_seconds,
-                            overhead->control_seconds,
-                            overhead->profile_ratio,
-                            overhead->control_ratio,
-                            overhead->ratio);
-            peak_log_report("[peak] local profile+local-rank-control risk: profile_seconds=%.9f raw_control_seconds=%.9f local_ranks=%u risk_control_seconds=%.9f ratio=%.9f\n",
-                            overhead->profile_seconds,
-                            overhead->control_seconds,
-                            overhead->local_ranks,
-                            overhead->control_risk_seconds,
-                            overhead->profile_control_risk_ratio);
-            peak_log_report("[peak] local profile+control risk overhead ratio: %.9f\n",
-                            overhead->profile_control_risk_ratio);
-            peak_log_report("[peak] local control risk overhead ratio: %.9f\n",
-                            overhead->control_risk_ratio);
-            peak_log_report("[peak] heartbeat management overhead: cpu_seconds=%.9f ratio=%.9f\n",
-                            overhead->management_seconds,
-                            overhead->management_ratio);
+            peak_log_info("[peak] local profile+control overhead: profile_seconds=%.9f control_seconds=%.9f profile_ratio=%.9f control_ratio=%.9f ratio=%.9f\n",
+                          overhead->profile_seconds,
+                          overhead->control_seconds,
+                          overhead->profile_ratio,
+                          overhead->control_ratio,
+                          overhead->ratio);
+            peak_log_info("[peak] local profile+local-rank-control risk: profile_seconds=%.9f raw_control_seconds=%.9f local_ranks=%u risk_control_seconds=%.9f ratio=%.9f\n",
+                          overhead->profile_seconds,
+                          overhead->control_seconds,
+                          overhead->local_ranks,
+                          overhead->control_risk_seconds,
+                          overhead->profile_control_risk_ratio);
+            peak_log_info("[peak] local profile+control risk overhead ratio: %.9f\n",
+                          overhead->profile_control_risk_ratio);
+            peak_log_info("[peak] local control risk overhead ratio: %.9f\n",
+                          overhead->control_risk_ratio);
+            peak_log_info("[peak] heartbeat management overhead: cpu_seconds=%.9f ratio=%.9f\n",
+                          overhead->management_seconds,
+                          overhead->management_ratio);
         }
     }
     if (summary.stop_window_owner_rank >= 0) {
-        peak_log_report("[peak] owner/local control stop-window overhead: owner_rank=%d windows=%llu wall_seconds=%.9f ratio=%.9f\n",
-                        summary.stop_window_owner_rank,
-                        (unsigned long long)summary.stop_window_count,
-                        summary.stop_window_seconds,
-                        summary.stop_window_ratio);
+        peak_log_info("[peak] owner/local control stop-window overhead: owner_rank=%d windows=%llu wall_seconds=%.9f ratio=%.9f\n",
+                      summary.stop_window_owner_rank,
+                      (unsigned long long)summary.stop_window_count,
+                      summary.stop_window_seconds,
+                      summary.stop_window_ratio);
     } else {
-        peak_log_report("[peak] %s control stop-window overhead: windows=%llu wall_seconds=%.9f ratio=%.9f\n",
-                        rank_count > 1 ? "rank-0/local" : "local",
-                        (unsigned long long)summary.stop_window_count,
-                        summary.stop_window_seconds,
-                        summary.stop_window_ratio);
+        peak_log_info("[peak] %s control stop-window overhead: windows=%llu wall_seconds=%.9f ratio=%.9f\n",
+                      rank_count > 1 ? "rank-0/local" : "local",
+                      (unsigned long long)summary.stop_window_count,
+                      summary.stop_window_seconds,
+                      summary.stop_window_ratio);
     }
-    peak_log_report("[peak] %s failed control windows: windows=%llu snapshot_valid=%d\n",
-                    rank_count > 1 ? "aggregate" : "local",
-                    (unsigned long long)summary.failed_stop_window_count,
-                    overhead->accounting_valid ? 1 : 0);
-    peak_log_report("[peak] %s final transition coverage: detached_targets=%zu reattached_targets=%zu revisited_targets=%zu\n",
-                    rank_count > 1 ? "aggregate" : "local",
-                    summary.detached_targets,
-                    summary.reattached_targets,
-                    summary.revisited_targets);
+    peak_log_info("[peak] %s failed control windows: windows=%llu snapshot_valid=%d\n",
+                  rank_count > 1 ? "aggregate" : "local",
+                  (unsigned long long)summary.failed_stop_window_count,
+                  overhead->accounting_valid ? 1 : 0);
+    peak_log_info("[peak] %s final transition coverage: detached_targets=%zu reattached_targets=%zu revisited_targets=%zu\n",
+                  rank_count > 1 ? "aggregate" : "local",
+                  summary.detached_targets,
+                  summary.reattached_targets,
+                  summary.revisited_targets);
 
-    peak_report_formatter_print_text_section("Function call statistics",
-                                             row_separator);
+    peak_report_formatter_print_text_section(
+        "Function call statistics", row_separator, PEAK_VERBOSITY_REPORT);
     peak_log_report("Detailed function statistics (call): counts and per-call timing in seconds\n");
     peak_log_report("|%*s|%*s|%*s|%*s|%*s|%*s|\n",
                     max_function_width,
@@ -1348,10 +1355,10 @@ peak_report_formatter_write_text(
                     rank_count,
                     rank_count == 1 ? "" : "s");
     peak_log_report("Markers: * ever detached; ** ever reattached after detachment.\n");
-    peak_log_report("Revisited targets are summarized in Controller accounting.\n");
+    peak_log_info("Revisited targets are summarized in Controller accounting.\n");
 
-    peak_report_formatter_print_text_section("Function timing statistics",
-                                             row_separator);
+    peak_report_formatter_print_text_section(
+        "Function timing statistics", row_separator, PEAK_VERBOSITY_REPORT);
     peak_log_report("Detailed function statistics (thread): aggregate timing in seconds\n");
     peak_log_report("|%*s|%*s|%*s|%*s|%*s|%*s|\n",
                     max_function_width,
