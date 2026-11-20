@@ -250,7 +250,10 @@ demangled signatures, then qualified function names such as `namespace::func`.
 A bare function name such as `func` requires `PEAK_ENABLE_CXX_SYMBOL_SCAN=1`
 for C++ name matching. A selector with more than one candidate at its best
 matching level is left unattached and produces a warning. Set
-`PEAK_VERBOSITY=info` to see the candidates. Reports retain the module spelling from a
+`PEAK_VERBOSITY=info` to see the candidates. The final text report also warns
+about explicit selectors with no hook installed in the process writing the
+report. For an MPI aggregate this warning describes the reporting process.
+Reports retain the module spelling from a
 module-qualified selector, for example
 `/opt/lib/libfoo.so!namespace::Class::func(int, double)`, so equal signatures
 from different DSOs remain distinguishable. At startup, the selector is checked

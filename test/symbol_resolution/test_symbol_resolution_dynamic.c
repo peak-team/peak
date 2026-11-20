@@ -129,6 +129,9 @@ main(int argc, char** argv)
         printf("owned_module_lookup=%d\n", owned_module_lookup_available());
         return 0;
     }
+    if (argc == 2 && strcmp(argv[1], "startup-no-calls") == 0) {
+        return 0;
+    }
     if (argc != 2 ||
         (strcmp(argv[1], "unique") != 0 && strcmp(argv[1], "ambiguous") != 0 &&
          strcmp(argv[1], "mixed") != 0 && strcmp(argv[1], "local") != 0 &&

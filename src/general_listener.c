@@ -8842,6 +8842,36 @@ peak_general_listener_report_format_options(
     return options;
 }
 
+static void
+peak_general_listener_report_uninstrumented_selectors(void)
+{
+    gchar* examples[4] = { NULL };
+    size_t count = 0;
+
+    for (size_t i = 0; i < peak_hook_address_count; i++) {
+        gchar* selector = peak_hook_strings[i];
+
+        if ((hook_address[i] != NULL && array_listener[i] != NULL) ||
+            !peak_symbol_should_use_cpp_map(selector)) {
+            continue;
+        }
+        if (count < G_N_ELEMENTS(examples) - 1) {
+            examples[count] = selector;
+        }
+        count++;
+        peak_log_info("[peak] no hook for selector '%s' in the process writing this report\n",
+                      selector);
+    }
+    if (count > 0) {
+        gchar* sample = g_strjoinv(", ", examples);
+
+        peak_log_warn("[peak] %zu explicit symbol selector%s had no installed hook in the process writing this report: %s%s. Use PEAK_VERBOSITY=info for details\n",
+                      count, count == 1 ? "" : "s", sample,
+                      count < G_N_ELEMENTS(examples) ? "" : ", …");
+        g_free(sample);
+    }
+}
+
 static gboolean
 peak_general_listener_write_report(PeakReportSnapshot* snapshot,
                                    gboolean sanitize,
@@ -8869,6 +8899,9 @@ peak_general_listener_write_report(PeakReportSnapshot* snapshot,
         csv_succeeded = peak_report_formatter_write_csv(snapshot);
     }
     text_succeeded = peak_report_formatter_write_text(snapshot, &options);
+    if (options.print_text) {
+        peak_general_listener_report_uninstrumented_selectors();
+    }
     peak_general_listener_release_report_names();
     return csv_succeeded && text_succeeded;
 }

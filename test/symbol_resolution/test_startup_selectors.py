@@ -63,6 +63,23 @@ def main():
                          "startup-invalid")
     assert "startup_invalid_selector_ok" in stdout
     assert stderr.count("invalid target selector; refusing to attach") == 1
+
+    missed = "peak_test::missing_qualified_target"
+    _, stderr = run(program, module_a, missed, "startup-no-calls")
+    assert "Instrumented targets: 0" in stderr
+    assert stderr.count("had no installed hook in the process writing this report") == 1
+    assert missed in stderr
+
+    unused = "peak_test::legacy_short_unique"
+    missed_again = "peak_test::other_missing_target"
+    _, stderr = run(program, module_a, f"{unused},{missed},{missed_again},missing_c_target",
+                    "startup-no-calls")
+    assert "Instrumented targets: 1" in stderr
+    assert "Recorded calls: 0" in stderr
+    warning, = [line for line in stderr.splitlines() if "had no installed hook" in line]
+    assert "2 explicit symbol selectors" in warning
+    assert missed in warning and missed_again in warning
+    assert unused not in warning and "missing_c_target" not in warning
     print("startup_selectors_test_ok")
 
 
