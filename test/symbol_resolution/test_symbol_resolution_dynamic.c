@@ -90,6 +90,17 @@ test_first_provider(void)
     return 0;
 }
 
+static gboolean
+owned_module_lookup_available(void)
+{
+#if defined(__linux__) && defined(GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION) && \
+    GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION >= 5
+    return gum_interceptor_peak_deferred_module_sync_available();
+#else
+    return FALSE;
+#endif
+}
+
 int
 main(int argc, char** argv)
 {
@@ -108,10 +119,15 @@ main(int argc, char** argv)
     int selector_unrelated_first;
     int legacy;
     int legacy_disabled;
+    int owner_unavailable;
     PeakDlopenSelectorDiagnostics selector_diagnostics;
 
     if (argc == 2 && strcmp(argv[1], "first-provider") == 0) {
         return test_first_provider();
+    }
+    if (argc == 2 && strcmp(argv[1], "check-owned-module-lookup") == 0) {
+        printf("owned_module_lookup=%d\n", owned_module_lookup_available());
+        return 0;
     }
     if (argc != 2 ||
         (strcmp(argv[1], "unique") != 0 && strcmp(argv[1], "ambiguous") != 0 &&
@@ -122,6 +138,7 @@ main(int argc, char** argv)
          strcmp(argv[1], "legacy") != 0 &&
          strcmp(argv[1], "legacy-disabled") != 0 &&
          strcmp(argv[1], "ambiguous-sequential") != 0 &&
+         strcmp(argv[1], "owned-module-unavailable") != 0 &&
          strcmp(argv[1], "exact-instance") != 0 &&
          strcmp(argv[1], "env-snapshot") != 0 &&
          strcmp(argv[1], "startup-unique") != 0 &&
@@ -242,8 +259,20 @@ main(int argc, char** argv)
         puts("startup_plain_c_fast_path_ok");
         return 0;
     }
+    owner_unavailable = strcmp(argv[1], "owned-module-unavailable") == 0;
+    if (owner_unavailable) {
+#if defined(__linux__) && defined(GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION) && \
+    GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION >= 5
+        gum_interceptor_peak_quiesce_deferred_module_sync();
+#endif
+        if (owned_module_lookup_available()) {
+            fprintf(stderr, "not ok - owned-module lookup was still active\n");
+            return 1;
+        }
+    }
     ambiguous = strcmp(argv[1], "ambiguous") == 0;
-    ambiguous_sequential = strcmp(argv[1], "ambiguous-sequential") == 0;
+    ambiguous_sequential = owner_unavailable ||
+        strcmp(argv[1], "ambiguous-sequential") == 0;
     ambiguous |= ambiguous_sequential;
     exact_instance = strcmp(argv[1], "exact-instance") == 0;
     mixed = strcmp(argv[1], "mixed") == 0;
@@ -462,7 +491,8 @@ main(int argc, char** argv)
         }
     }
     dlopen_interceptor_test_set_manual_drain(FALSE);
-    puts(ambiguous ? "dynamic_ambiguous_terminal_ok" :
+    puts(owner_unavailable ? "dynamic_owned_module_unavailable_ok" :
+         ambiguous ? "dynamic_ambiguous_terminal_ok" :
          mixed ? "dynamic_mixed_targets_ok" :
          exact_instance ? "dynamic_exact_instance_ok" :
          selector_env_snapshot ? "dynamic_selector_env_snapshot_ok" :
