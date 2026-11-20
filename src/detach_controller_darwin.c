@@ -451,12 +451,19 @@ peak_darwin_resume_threads(PeakDetachStatus* status_out)
         thread_act_t thread = peak_darwin_held.threads[i - 1];
         kern_return_t kr = thread_resume(thread);
 
-        if (kr != KERN_SUCCESS && kr != KERN_INVALID_ARGUMENT) {
-            peak_darwin_note_failure("thread-resume-failed",
-                                     (long)thread,
-                                     0,
-                                     (uintptr_t)kr);
-            resumed = FALSE;
+        if (kr != KERN_SUCCESS) {
+            mach_port_type_t type = 0;
+            /* We own this name until deallocation. A dead name proves the
+             * thread endpoint vanished; a failed RPC alone proves nothing. */
+            kern_return_t type_kr = mach_port_type(mach_task_self(), thread,
+                                                  &type);
+            if (type_kr != KERN_SUCCESS || !(type & MACH_PORT_TYPE_DEAD_NAME)) {
+                peak_darwin_note_failure("thread-resume-failed",
+                                         (long)thread,
+                                         (uintptr_t)type_kr,
+                                         (uintptr_t)kr);
+                resumed = FALSE;
+            }
         }
         (void)mach_port_deallocate(mach_task_self(), thread);
         peak_darwin_held.threads[i - 1] = MACH_PORT_NULL;
@@ -1150,7 +1157,9 @@ peak_detach_controller_finish_hook_mutation(const PeakDetachRequest* request,
             finished = FALSE;
         }
         if (!peak_darwin_resume_threads(&status)) {
-            finished = FALSE;
+            /* Cleanup may need locks held by a peer that failed to resume. */
+            peak_detach_controller_abort_after_failed_finish(
+                "Darwin mutation resume", status);
         }
         peak_darwin_dispose_writable_pages();
         if (peak_darwin_held.staged_mutation)
@@ -1203,9 +1212,25 @@ peak_detach_controller_abort_after_failed_finish(const char* context,
     static const char message[] =
         "[peak] fatal Darwin detach finish failure; terminating to avoid running with suspended threads\n";
 
-    (void)context;
-    (void)status;
+    const char* reason = peak_darwin_failure.reason;
+    const char* status_name = peak_detach_controller_status_string(status);
+    static const char digits[] = "0123456789abcdef";
+    char aux[] = " (detail=0x00000000)\n";
+    uint32_t code = (uint32_t)peak_darwin_failure.aux;
+
+    for (size_t i = 19; i > 11; i--) {
+        aux[i - 1] = digits[code & 15];
+        code >>= 4;
+    }
     (void)write(STDERR_FILENO, message, sizeof(message) - 1);
+    if (context != NULL) {
+        (void)write(STDERR_FILENO, context, strlen(context));
+        (void)write(STDERR_FILENO, ": ", 2);
+    }
+    (void)write(STDERR_FILENO, status_name, strlen(status_name));
+    (void)write(STDERR_FILENO, ": ", 2);
+    (void)write(STDERR_FILENO, reason, strlen(reason));
+    (void)write(STDERR_FILENO, aux, sizeof(aux) - 1);
     _exit(128);
 }
 

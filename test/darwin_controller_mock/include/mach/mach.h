@@ -17,6 +17,10 @@ typedef int vm_prot_t;
 #define VM_INHERIT_COPY 1
 kern_return_t mach_vm_protect(unsigned int, mach_vm_address_t, size_t, int, int);
 kern_return_t mach_vm_remap(unsigned int, mach_vm_address_t*, size_t, uintptr_t, int, unsigned int, mach_vm_address_t, int, vm_prot_t*, vm_prot_t*, int);
+typedef unsigned int mach_port_type_t;
+#define MACH_PORT_TYPE_DEAD_NAME (1U << 20)
+#define MACH_SEND_INVALID_DEST 0x10000003
+kern_return_t mach_port_type(unsigned int, unsigned int, mach_port_type_t*);
 #define MACH_PORT_NULL 0
 #define MACH_PORT_VALID(x) ((x) != 0)
 #define KERN_SUCCESS 0

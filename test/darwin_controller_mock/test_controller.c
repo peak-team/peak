@@ -14,6 +14,7 @@ static int prepare_result;
 static gboolean clone_mode, other_page_change, map_failure, writable_source;
 static unsigned int allocations;
 static int region_mode;
+static gboolean resume_peer_dead, resume_peer_live_failure;
 static gboolean peer_held[PEAK_DARWIN_MAX_THREADS];
 unsigned int mach_task_self(void) { return 1; }
 thread_act_t mach_thread_self(void) { return 1; }
@@ -38,7 +39,18 @@ kern_return_t thread_suspend(thread_act_t t) {
     assert(!peer_held[t]); peer_held[t] = TRUE; suspended++; return 0;
 }
 kern_return_t thread_resume(thread_act_t t) {
-    assert(peer_held[t]); peer_held[t] = FALSE; resumed++; return 0;
+    assert(peer_held[t]);
+    if (t == 3 && resume_peer_live_failure) return KERN_INVALID_ARGUMENT;
+    peer_held[t] = FALSE;
+    resumed++;
+    return t == 3 && resume_peer_dead ? MACH_SEND_INVALID_DEST : KERN_SUCCESS;
+}
+kern_return_t mach_port_type(unsigned int task, unsigned int t,
+                             mach_port_type_t* type) {
+    (void)task;
+    assert(t == 3);
+    *type = resume_peer_dead ? MACH_PORT_TYPE_DEAD_NAME : 0;
+    return KERN_SUCCESS;
 }
 kern_return_t thread_get_state(thread_act_t t, int flavor, thread_state_t out,
                                mach_msg_type_number_t* count) {
@@ -146,6 +158,7 @@ static void reset(void) {
     snapshots = suspended = resumed = staged = finished = cancelled = 0;
     bad_pc = bad_bytes = bad_identity = endless = FALSE;
     prepare_result = GUM_ATTACH_OK;
+    resume_peer_dead = resume_peer_live_failure = FALSE;
     clone_mode = other_page_change = map_failure = writable_source = FALSE;
     assert(allocations == 0);
     peak_detach_controller_note_thread_creation_gate_installed(FALSE);
@@ -160,6 +173,17 @@ int main(void) {
     assert(memcmp(entry, active, 4) == 0 && finished == 0);
     assert(peak_detach_controller_finish_hook_mutation(&request, &status));
     assert(resumed == 2 && finished == 1);
+    reset(); resume_peer_dead = TRUE;
+    assert(peak_detach_controller_prepare_pthread_bootstrap(&request, &status));
+    assert(peak_detach_controller_finish_hook_mutation(&request, &status));
+    assert(resumed == 2 && finished == 1);
+    reset(); resume_peer_live_failure = TRUE;
+    peak_darwin_held.threads[0] = 3;
+    peak_darwin_held.thread_count = 1;
+    peer_held[3] = TRUE;
+    assert(!peak_darwin_resume_threads(&status));
+    assert(status == PEAK_DETACH_STATUS_ERROR && peer_held[3]);
+    assert(strcmp(peak_darwin_failure.reason, "thread-resume-failed") == 0);
     reset(); clone_mode = TRUE;
     assert(peak_detach_controller_prepare_pthread_bootstrap(&request, &status));
     assert(memcmp(entry, active, 4) == 0);
