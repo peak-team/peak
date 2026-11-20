@@ -1716,7 +1716,17 @@ _gum_function_context_begin_invocation(
     gpointer * caller_ret_addr,
     gpointer * next_hop)
 {
-#if defined(__linux__)
+#ifdef PEAK_GUM_DYNAMIC_TLS
+    gpointer previous_guard = gum_tls_key_get_value(peak_gum_interceptor_guard_key);
+    if (previous_guard == function_ctx->interceptor)
+        return _gum_function_context_begin_invocation_peak_original(function_ctx, cpu_context, caller_ret_addr, next_hop);
+    /* Resolving the attach DSO's TLS block on an existing thread may enter
+     * malloc. Its nested trampoline must bypass PEAK before touching TLS. */
+    gum_tls_key_set_value(peak_gum_interceptor_guard_key, function_ctx->interceptor);
+    guint unwind_depth = *(volatile guint *) &peak_uw_internal;
+    peak_gum_metadata_guard_leave(previous_guard);
+    if (unwind_depth != 0)
+#elif defined(__linux__)
     /* Lazy Gum context allocation may itself invoke intercepted libc code.
      * Honor Gum's guard before PEAK's reaping or depth snapshots touch it. */
     if (peak_uw_internal != 0 ||
