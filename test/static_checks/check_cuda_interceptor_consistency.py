@@ -51,20 +51,6 @@ MULTI_DEVICE_CUDA_WRAPPERS = {
         "original_cu_launch_cooperative_kernel_multiple_device",
 }
 
-GENERAL_LISTENER_CUDA_TARGETS = [
-    "cudaLaunchKernel",
-    "cudaLaunchCooperativeKernel",
-    "cudaLaunchCooperativeKernelMultiDevice",
-    "cudaLaunchKernelEx",
-    "cudaLaunchKernelExC",
-    "cuLaunchKernel",
-    "cuLaunchCooperativeKernel",
-    "cuLaunchCooperativeKernelMultiDevice",
-    "cuLaunchKernelEx",
-    "cudaGraphLaunch",
-    "cuGraphLaunch",
-]
-
 GENERAL_LISTENER_CUDA_WRAPPER_LOOKUPS = [
     ("cudaLaunchKernel", "peak_cuda_launch_kernel"),
     ("cudaLaunchCooperativeKernel", "peak_cuda_launch_cooperative_kernel"),
@@ -319,20 +305,35 @@ def main():
         require(re.search(rf"PEAK_CUDA_WRAPPER_EXPORT[^\n;]*\b{wrapper}\s*\(", cuda),
                 f"CUDA wrapper must be exported for gum_find_function: {wrapper}")
 
-    for target in GENERAL_LISTENER_CUDA_TARGETS:
-        require(f'strcmp(peak_hook_strings[i], "{target}") == 0' in general,
-                f"missing general-listener CUDA target: {target}")
-
+    support_table = re.search(
+        r"static const PeakSupportTarget peak_support_targets\[\] = \{(.*?)\n\};",
+        general,
+        re.DOTALL,
+    )
+    require(support_table is not None,
+            "general listener must keep its support-target mapping table")
+    entries = re.findall(
+        r'\{\s*"([^"]+)"\s*,\s*(?:NULL|"([^"]+)")\s*,\s*'
+        r"(PEAK_SUPPORT_TARGET_[A-Z_]+)\s*\}",
+        support_table.group(1),
+    )
     for target, wrapper in GENERAL_LISTENER_CUDA_WRAPPER_LOOKUPS:
-        branch_start = general.find(
-            f'strcmp(peak_hook_strings[i], "{target}") == 0')
-        require(branch_start != -1,
-                f"missing general-listener CUDA target: {target}")
-        next_branch = general.find("} else if", branch_start + 1)
-        branch = general[branch_start:next_branch]
-        require(f'peak_general_listener_find_function("{wrapper}")' in branch,
-                f"general-listener target {target} must use the helper"
-                f" wrapper lookup for {wrapper}")
+        matching = [(entry_wrapper, action)
+                    for name, entry_wrapper, action in entries
+                    if name == target]
+        require(matching == [(wrapper, "PEAK_SUPPORT_TARGET_WRAPPER")],
+                f"support table must map {target} to wrapper action {wrapper}")
+
+    dispatch = function_body(general, "peak_general_listener_attach")
+    support_lookup = function_body(general, "peak_general_listener_support_target")
+    require("support->action == PEAK_SUPPORT_TARGET_WRAPPER" in dispatch and
+            "peak_general_listener_find_function(support->wrapper)" in dispatch,
+            "support wrapper entries must resolve through the Frida-native helper")
+    require("const char* name = qualified_name != NULL ? qualified_name + 1 : selector;"
+            in support_lookup and
+            "candidate->address != peak_general_listener_find_function(name)"
+            in support_lookup,
+            "module-qualified support names must resolve to the matching global wrapper target")
 
     require(cuda.count("PeakCudaInflightGuard in_flight;") == 10 and
             cuda.count("if (!in_flight.entered())") == 10,

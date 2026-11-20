@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "internal/general_listener/attach_policy.h"
 
 #include "internal/general_listener/runtime_config.h"
@@ -6,8 +7,13 @@
 
 #include <dirent.h>
 #include <errno.h>
-#if defined(__APPLE__)
 #include <pthread.h>
+#include <string.h>
+#if defined(__linux__)
+#include <dlfcn.h>
+#include <link.h>
+#include <sys/auxv.h>
+extern struct r_debug _r_debug __attribute__((weak));
 #endif
 
 #if defined(__APPLE__) && \
@@ -21,6 +27,26 @@ GUM_API gpointer gum_arm64_reader_try_get_relative_jump_target(
 #define g_printerr(...) peak_log_warn(__VA_ARGS__)
 
 static gsize peak_attach_policy_initialized = 0;
+#if defined(__linux__)
+static GArray* peak_elf_loader_ranges;
+
+static int
+peak_collect_loader_ranges(struct dl_phdr_info* info, size_t size, void* data)
+{
+    GumAddress base = *(GumAddress*)data;
+    (void)size;
+    if ((GumAddress)info->dlpi_addr != base)
+        return 0;
+    for (size_t i = 0; i < info->dlpi_phnum; i++) {
+        const ElfW(Phdr)* header = &info->dlpi_phdr[i];
+        if (header->p_type == PT_LOAD && (header->p_flags & PF_X)) {
+            GumMemoryRange range = {base + header->p_vaddr, header->p_memsz};
+            g_array_append_val(peak_elf_loader_ranges, range);
+        }
+    }
+    return 1;
+}
+#endif
 static gboolean peak_allow_unsafe_gum_prologue = FALSE;
 static PeakUnsafeGumProloguePolicy peak_unsafe_gum_prologue_policy =
     PEAK_UNSAFE_GUM_PROLOGUE_POLICY_DEFAULT;
@@ -29,6 +55,18 @@ static void
 peak_general_listener_init_attach_policy_once(void)
 {
     gboolean policy_valid = FALSE;
+
+#if defined(__linux__)
+    GumAddress loader_base = getauxval(AT_BASE);
+    /* Direct loader invocation has no PT_INTERP, but the ELF rendezvous still
+     * identifies the actual loader without mistaking the main executable. */
+    if (loader_base == 0 && &_r_debug != NULL)
+        loader_base = _r_debug.r_ldbase;
+    /* Gum's module extent can span anonymous mappings between ELF segments. */
+    peak_elf_loader_ranges = g_array_new(FALSE, FALSE, sizeof(GumMemoryRange));
+    if (loader_base != 0)
+        dl_iterate_phdr(peak_collect_loader_ranges, &loader_base);
+#endif
 
     peak_allow_unsafe_gum_prologue =
         peak_general_listener_env_value_truthy(
@@ -65,6 +103,43 @@ peak_general_listener_attach_target_is_supported(const char* symbol_name,
     const char* reason = NULL;
 
     peak_general_listener_init_attach_policy();
+
+#if defined(__linux__)
+    /* Gum reads errno and its TLS guard before invoking listener recursion
+     * guards. Hooking these primitives recurses inside Gum itself. Compare
+     * entry addresses so libc aliases receive the same protection. */
+    if (address == (gpointer)__errno_location ||
+        address == (gpointer)pthread_getspecific ||
+        address == (gpointer)pthread_setspecific) {
+        peak_log_info("[peak] skipping Gum attach for hook %s: errno/TLS accessor is required by the interceptor; target will remain unprofiled\n",
+                      symbol_name != NULL ? symbol_name : "<unknown>");
+        return FALSE;
+    }
+    /* PEAK's ownership wrappers require exclusive replacement of these
+     * entries. An ordinary target listener would prevent that replacement.
+     * The internal dlopen support listener calls this policy with its literal
+     * name; ordinary startup dlopen targets are already skipped by the caller. */
+    if (address == (gpointer)dlclose ||
+        address == (gpointer)pthread_join ||
+        address == (gpointer)pthread_detach ||
+        (address == (gpointer)dlopen &&
+         (symbol_name == NULL || strcmp(symbol_name, "dlopen") != 0))) {
+        peak_log_info("[peak] skipping Gum attach for hook %s: target is owned by a profiler support wrapper; target will remain unprofiled\n",
+                      symbol_name != NULL ? symbol_name : "<unknown>");
+        return FALSE;
+    }
+    /* The ELF loader has private resolver calling conventions that cannot
+     * be intercepted with ordinary function entry hooks. */
+    for (guint i = 0; i < peak_elf_loader_ranges->len; i++) {
+        const GumMemoryRange* range = &g_array_index(
+            peak_elf_loader_ranges, GumMemoryRange, i);
+        if (GUM_MEMORY_RANGE_INCLUDES(range, (GumAddress)address)) {
+            peak_log_info("[peak] skipping Gum attach for hook %s: target belongs to ELF loader infrastructure; target will remain unprofiled\n",
+                          symbol_name != NULL ? symbol_name : "<unknown>");
+            return FALSE;
+        }
+    }
+#endif
 
 #if defined(__APPLE__) && \
     (defined(__arm64__) || defined(__aarch64__))

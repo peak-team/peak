@@ -1197,6 +1197,7 @@ if(BUILD_TESTING)
                     --timeout 90
                     --overhead-ratio 0.10
                     --global-overhead-ratio 0.10
+                    --global-reattach-factor 0.99
                     --detach-count 1
                     --trace-prefix ${PROJECT_BINARY_DIR}/test/detach_runtime/signal-wait-stress-trace
                     --require-reattach

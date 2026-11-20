@@ -284,10 +284,7 @@ void gum_interceptor_peak_unwind_thread_joined(guint64 cookie,
     peak_uw_owner_free(o);
   }
 }
-gboolean gum_interceptor_peak_unwind_reap_threads(void) {
-  /* Prompt cleanup of any eligible Frida GPrivate context. This is progress,
-   * not a barrier; PEAK never reads or mutates the associated Gum stack. */
-  (void)_frida_g_thread_garbage_collect();
+static gboolean peak_uw_reap_dead_threads(void) {
   PeakUwThread *dead = NULL;
   g_mutex_lock(&peak_uw_owners_lock);
   for (PeakUwThread **p = &peak_uw_owners; *p;) {
@@ -311,6 +308,12 @@ gboolean gum_interceptor_peak_unwind_reap_threads(void) {
     peak_uw_owner_free(o);
   }
   return work;
+}
+gboolean gum_interceptor_peak_unwind_reap_threads(void) {
+  /* Only external reclaimers may run deferred GLib cleanup: interception can
+   * begin while the caller already holds allocator or GLib cleanup locks. */
+  (void)_frida_g_thread_garbage_collect();
+  return peak_uw_reap_dead_threads();
 }
 void gum_interceptor_peak_unwind_diagnostics(guint64 *owners, guint64 *blocks,
                                              guint64 *active) {
@@ -336,7 +339,7 @@ static gboolean peak_uw_owner_ensure(void) {
   pthread_once(&peak_uw_once, peak_uw_key_init);
   if (!peak_uw_key_ready)
     return FALSE;
-  (void)gum_interceptor_peak_unwind_reap_threads();
+  (void)peak_uw_reap_dead_threads();
   PeakUwThread *o = g_try_malloc0(sizeof(*o));
   if (!o)
     return FALSE;
@@ -357,7 +360,7 @@ static gboolean peak_uw_owner_ensure(void) {
   peak_uw_thread = o;
   return TRUE;
 }
-static void peak_uw_bind_gum_context(void) {
+static void peak_uw_bind_gum_context(gpointer interceptor) {
   PeakGumInterceptorThreadContext17 *context;
 
   if (peak_uw_thread == NULL ||
@@ -367,12 +370,14 @@ static void peak_uw_bind_gum_context(void) {
    * owners lock across it: our wrapped notify also takes that lock before
    * freeing an old context. The wrapper clears every stale pointer before
    * allocator reuse, and the returned current-thread context remains live. */
+  gpointer metadata_guard = peak_gum_metadata_guard_enter(interceptor);
   context = peak_gum_get_interceptor_thread_context();
   g_mutex_lock(&peak_uw_owners_lock);
   if (__atomic_load_n(&peak_uw_thread->gum_context, __ATOMIC_RELAXED) == NULL)
     __atomic_store_n(&peak_uw_thread->gum_context, context,
                      __ATOMIC_RELAXED);
   g_mutex_unlock(&peak_uw_owners_lock);
+  peak_gum_metadata_guard_leave(metadata_guard);
 }
 static void peak_uw_release(PeakUwFrame **link);
 typedef struct {
@@ -435,7 +440,7 @@ static _Unwind_Reason_Code peak_uw_walk_frame(struct _Unwind_Context *context,
 }
 gboolean gum_interceptor_peak_unwind_reconcile_current_thread(void) {
   PeakUwThread *owner = peak_uw_thread;
-  PeakGumInvocationStack17 *gum_stack = peak_gum_invocation_stack();
+  PeakGumInvocationStack17 *gum_stack = peak_gum_invocation_stack(NULL);
   guint gum_count = gum_stack ? gum_stack->len : 0;
   if ((!owner || !owner->active) && gum_count == 0)
     return TRUE;
@@ -533,20 +538,28 @@ static void peak_uw_release(PeakUwFrame **link) {
   if (peak_uw_thread->active == NULL)
     peak_uw_cache_clear(peak_uw_thread);
 }
-static void peak_uw_reap(gpointer *slot) {
+static void peak_uw_reap(gpointer interceptor, gpointer *slot) {
   if (!peak_uw_thread)
     return;
   ++peak_uw_thread->reap_epoch;
+  gpointer metadata_guard = NULL;
+  gboolean guarded = FALSE;
   while (peak_uw_thread->active) {
     PeakUwFrame *f = peak_uw_thread->active;
     if ((guint8 *)f->slot > (guint8 *)slot ||
         (f->slot == slot && *slot == f->pc + 1))
       break;
+    if (!guarded) {
+      metadata_guard = peak_gum_metadata_guard_enter(interceptor);
+      guarded = TRUE;
+    }
     f->reaped_epoch = peak_uw_thread->reap_epoch;
     f->reaped_context = f->context;
     f->reaped_slot = f->slot;
     peak_uw_release(&peak_uw_thread->active);
   }
+  if (guarded)
+    peak_gum_metadata_guard_leave(metadata_guard);
 }
 gboolean gum_interceptor_peak_unwind_frame_is_live(gpointer identity,
                                                    gpointer slot) {
@@ -565,15 +578,17 @@ gboolean gum_interceptor_peak_unwind_frame_is_live(gpointer identity,
     }
   return TRUE;
 }
-static PeakUwFrame *peak_uw_prepare(void) {
+static PeakUwFrame *peak_uw_prepare(gpointer interceptor) {
   if (!peak_uw_thread || !peak_uw_thread->free) {
     int saved_errno = errno, old_cancel;
+    gpointer metadata_guard = peak_gum_metadata_guard_enter(interceptor);
     peak_uw_internal++;
     pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &old_cancel);
     gboolean ok =
         peak_uw_owner_ensure() && (peak_uw_thread->free || peak_uw_grow());
     peak_uw_internal--;
     pthread_setcancelstate(old_cancel, NULL);
+    peak_gum_metadata_guard_leave(metadata_guard);
     errno = saved_errno;
     if (!ok)
       return NULL;
@@ -638,10 +653,10 @@ gboolean gum_interceptor_peak_unwind_reconcile_current_thread(void) {
 }
 typedef void PeakUwFrame;
 static guint peak_uw_internal;
-static PeakUwFrame *peak_uw_prepare(void) { return NULL; }
-static void peak_uw_bind_gum_context(void) {}
+static PeakUwFrame *peak_uw_prepare(gpointer interceptor) { (void)interceptor; return NULL; }
+static void peak_uw_bind_gum_context(gpointer interceptor) { (void)interceptor; }
 static void peak_uw_cancel(PeakUwFrame *f) { (void)f; }
-static void peak_uw_reap(gpointer *slot) { (void)slot; }
+static void peak_uw_reap(gpointer interceptor, gpointer *slot) { (void)interceptor; (void)slot; }
 static void peak_uw_enter(PeakUwFrame *f, gpointer ctx, gpointer *slot,
                           gpointer original, gboolean observed,
                           gboolean generic) {
