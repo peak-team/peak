@@ -24,7 +24,6 @@ static _Atomic uint64_t open_ns, completed_ns, last_end_ns;
 static _Atomic pid_t clock_owner;
 static _Thread_local pid_t writer_pid;
 static _Thread_local unsigned wrapper_depth;
-static _Thread_local bool saw_remote;
 static _Thread_local int world_rank;
 static double clock_epoch;
 
@@ -147,7 +146,7 @@ remote_peer(MPI_Comm comm, int peer)
     static void resolve_pmpi_##Name(void)                                     \
     { next_pmpi_##Name = (Name##Fn)dlsym(RTLD_NEXT, "PMPI_" #Name); }
 
-#define ACTIVE_WRAPPER(Prefix, prefix, Name, Parameters, Arguments, Eligible, Measure) \
+#define ACTIVE_WRAPPER(Prefix, prefix, Name, Parameters, Arguments, Eligible) \
     ACTIVE_CLOCK_API int Prefix##_##Name Parameters                           \
     {                                                                        \
         pthread_once(&prefix##_once_##Name, resolve_##prefix##_##Name);       \
@@ -157,77 +156,68 @@ remote_peer(MPI_Comm comm, int peer)
         if (!writer_pid)                                                     \
             return next Arguments;                                           \
         bool eligible = wrapper_depth++ == 0 && (Eligible);                  \
-        if (eligible) {                                                      \
-            saw_remote = true;                                               \
-            if (Measure)                                                     \
-                open_interval();                                             \
-        }                                                                    \
+        if (eligible)                                                        \
+            open_interval();                                                 \
         int result = next Arguments;                                         \
-        if (eligible && Measure)                                             \
+        if (eligible)                                                        \
             close_interval();                                                \
         --wrapper_depth;                                                     \
         return result;                                                       \
     }
 
-#define ACTIVE_CALL(Name, Parameters, Arguments, Eligible, Measure)          \
+#define ACTIVE_CALL(Name, Parameters, Arguments, Eligible)                   \
     ACTIVE_SYMBOLS(Name, Parameters)                                         \
-    ACTIVE_WRAPPER(MPI, mpi, Name, Parameters, Arguments, Eligible, Measure) \
-    ACTIVE_WRAPPER(PMPI, pmpi, Name, Parameters, Arguments, Eligible, Measure)
+    ACTIVE_WRAPPER(MPI, mpi, Name, Parameters, Arguments, Eligible)          \
+    ACTIVE_WRAPPER(PMPI, pmpi, Name, Parameters, Arguments, Eligible)
 
 ACTIVE_CALL(Send, (const void* buffer, int count, MPI_Datatype type, int dest,
                    int tag, MPI_Comm comm),
-            (buffer, count, type, dest, tag, comm), remote_peer(comm, dest), true)
+            (buffer, count, type, dest, tag, comm), remote_peer(comm, dest))
 ACTIVE_CALL(Ssend, (const void* buffer, int count, MPI_Datatype type, int dest,
                     int tag, MPI_Comm comm),
-            (buffer, count, type, dest, tag, comm), remote_peer(comm, dest), true)
+            (buffer, count, type, dest, tag, comm), remote_peer(comm, dest))
 ACTIVE_CALL(Recv, (void* buffer, int count, MPI_Datatype type, int source,
                    int tag, MPI_Comm comm, MPI_Status* status),
             (buffer, count, type, source, tag, comm, status),
-            remote_peer(comm, source), true)
+            remote_peer(comm, source))
 ACTIVE_CALL(Sendrecv, (const void* send_buffer, int send_count, MPI_Datatype send_type,
                        int dest, int send_tag, void* recv_buffer, int recv_count,
                        MPI_Datatype recv_type, int source, int recv_tag,
                        MPI_Comm comm, MPI_Status* status),
             (send_buffer, send_count, send_type, dest, send_tag, recv_buffer,
              recv_count, recv_type, source, recv_tag, comm, status),
-            remote_peer(comm, dest) || remote_peer(comm, source), true)
+            remote_peer(comm, dest) || remote_peer(comm, source))
 
-ACTIVE_CALL(Isend, (const void* buffer, int count, MPI_Datatype type, int dest,
-                    int tag, MPI_Comm comm, MPI_Request* request),
-            (buffer, count, type, dest, tag, comm, request),
-            remote_peer(comm, dest), false)
-ACTIVE_CALL(Irecv, (void* buffer, int count, MPI_Datatype type, int source,
-                    int tag, MPI_Comm comm, MPI_Request* request),
-            (buffer, count, type, source, tag, comm, request),
-            remote_peer(comm, source), false)
+/* Requests can originate from MPI APIs outside this wrapper set. Avoid
+ * requiring any earlier call or walking request arrays on the hot path. */
 ACTIVE_CALL(Wait, (MPI_Request* request, MPI_Status* status), (request, status),
-            saw_remote && request && *request != MPI_REQUEST_NULL, true)
+            request && *request != MPI_REQUEST_NULL)
 ACTIVE_CALL(Waitall, (int count, MPI_Request requests[], MPI_Status statuses[]),
-            (count, requests, statuses), saw_remote && count > 0 && requests, true)
+            (count, requests, statuses), count > 0 && requests)
 ACTIVE_CALL(Waitany, (int count, MPI_Request requests[], int* index, MPI_Status* status),
-            (count, requests, index, status), saw_remote && count > 0 && requests, true)
+            (count, requests, index, status), count > 0 && requests)
 ACTIVE_CALL(Waitsome, (int count, MPI_Request requests[], int* outcount,
                        int indices[], MPI_Status statuses[]),
             (count, requests, outcount, indices, statuses),
-            saw_remote && count > 0 && requests, true)
+            count > 0 && requests)
 
-ACTIVE_CALL(Barrier, (MPI_Comm comm), (comm), network_comm(comm), true)
+ACTIVE_CALL(Barrier, (MPI_Comm comm), (comm), network_comm(comm))
 ACTIVE_CALL(Bcast, (void* buffer, int count, MPI_Datatype type, int root, MPI_Comm comm),
-            (buffer, count, type, root, comm), network_comm(comm), true)
+            (buffer, count, type, root, comm), network_comm(comm))
 ACTIVE_CALL(Reduce, (const void* send_buffer, void* recv_buffer, int count,
                      MPI_Datatype type, MPI_Op op, int root, MPI_Comm comm),
-            (send_buffer, recv_buffer, count, type, op, root, comm), network_comm(comm), true)
+            (send_buffer, recv_buffer, count, type, op, root, comm), network_comm(comm))
 ACTIVE_CALL(Allreduce, (const void* send_buffer, void* recv_buffer, int count,
                         MPI_Datatype type, MPI_Op op, MPI_Comm comm),
-            (send_buffer, recv_buffer, count, type, op, comm), network_comm(comm), true)
+            (send_buffer, recv_buffer, count, type, op, comm), network_comm(comm))
 ACTIVE_CALL(Allgather, (const void* send_buffer, int send_count, MPI_Datatype send_type,
                         void* recv_buffer, int recv_count, MPI_Datatype recv_type,
                         MPI_Comm comm),
             (send_buffer, send_count, send_type, recv_buffer, recv_count, recv_type, comm),
-            network_comm(comm), true)
+            network_comm(comm))
 ACTIVE_CALL(Alltoall, (const void* send_buffer, int send_count, MPI_Datatype send_type,
                        void* recv_buffer, int recv_count, MPI_Datatype recv_type,
                        MPI_Comm comm),
             (send_buffer, send_count, send_type, recv_buffer, recv_count, recv_type, comm),
-            network_comm(comm), true)
+            network_comm(comm))
 

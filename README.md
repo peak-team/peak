@@ -398,13 +398,27 @@ full output and teardown behavior.
 | `PEAK_HB_EMA_A` | Growth-rate EMA alpha in `(0, 1]`. Default: `0.3`. |
 
 The active clock is a rank-local sampling heuristic. It measures wall time
-inside selected blocking MPI calls on the initializing thread. This time can
-include MPI computation, and other application threads can still run. For
-communicators other than WORLD it treats a non-SELF communication call as
-potentially remote. Nonempty waits after an observed communication can
-include local or inactive requests. Uninterposed calls and unsupported
-thread modes retain the ordinary local budget. The policy does not synchronize
-ranks or establish an application slowdown bound.
+inside selected blocking MPI calls on the initializing thread of a
+multi-rank job with `MPI_THREAD_SINGLE` or `MPI_THREAD_FUNNELED`. Covered
+MPI and PMPI entry points are `Send`, `Ssend`, `Recv`, `Sendrecv`,
+`Barrier`, `Bcast`, `Reduce`, `Allreduce`, `Allgather`, `Alltoall`,
+`Wait`, `Waitall`, `Waitany`, and `Waitsome`. Point-to-point operations
+must have a potentially remote peer. Collective calls are measured for
+communicators other than `MPI_COMM_NULL` and `MPI_COMM_SELF`.
+
+`Wait` requires a non-null request. The array forms require a non-null
+array with positive count and can include local, null, or inactive requests.
+A wait can contribute even when its request came from an unwrapped API.
+Time in `Test*`, unlisted MPI APIs, and calls that bypass interposition
+continues to count toward the otherwise applicable wall-time budget.
+Unsupported MPI thread modes use the ordinary local policy.
+
+MPI call residence can include computation, and other application threads
+can still run. The budget calculation treats all estimated profiling cost
+and measured control STOP time as potentially overlapping MPI residence and
+adds them back before capping the budget time at elapsed wall time. This is
+a local sampling adjustment without rank synchronization or a guarantee
+on whole-job slowdown.
 
 PEAK creates the heartbeat helper only when at least one CPU target is
 requested. GPU-only, memory-only, and JIT-only workloads do not start it.

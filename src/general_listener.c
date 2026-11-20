@@ -5347,7 +5347,7 @@ void* peak_heartbeat_monitor(void* arg) {
     double previous_active_cost = 0.0;
     double reported_active_elapsed = 0.0;
     double reported_active_blocked = 0.0;
-    double reported_active_target = 0.0;
+    double last_active_budget = -1.0;
 #endif
     size_t heartbeat_capacity = peak_hook_address_count;
     double min_detach_observation_time =
@@ -5545,12 +5545,12 @@ void* peak_heartbeat_monitor(void* arg) {
                 previous_active_cost = cost;
                 reported_active_elapsed = total_execution_time;
                 reported_active_blocked = blocked;
-                reported_active_target = lifetime_target;
+                last_active_budget = lifetime.budget;
             } else {
                 /* A raced snapshot cannot grant fresh lifetime headroom.
                  * Recent hook rates still cover just one heartbeat interval. */
-                if (reported_active_elapsed > 0.0)
-                    lifetime_target = reported_active_target;
+                lifetime_target = peak_mpi_active_clock_carried_ratio(
+                    global_target_ratio, total_execution_time, last_active_budget);
                 previous_active_blocked = -1.0;
             }
         }
@@ -6056,7 +6056,9 @@ cleanup:
         peak_log_debug("[peak mpi active clock] pid=%ld elapsed=%.9g blocked=%.9g "
                        "lifetime_target=%.9g configured_target=%.9g\n",
                        (long)getpid(), reported_active_elapsed, reported_active_blocked,
-                       reported_active_target, (double)global_target_ratio);
+                       peak_mpi_active_clock_carried_ratio(
+                           global_target_ratio, reported_active_elapsed, last_active_budget),
+                       (double)global_target_ratio);
     }
 #endif
     pthread_mutex_lock(&lock);

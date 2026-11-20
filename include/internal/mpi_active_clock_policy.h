@@ -33,6 +33,18 @@ static inline PeakMpiActiveClockPolicy peak_mpi_active_clock_policy(
     return decision;
 }
 
+/* A missed snapshot carries the preceding allowance in seconds. A negative
+ * budget denotes the absence of any valid clock observation. */
+static inline double peak_mpi_active_clock_carried_ratio(
+    double q, double elapsed, double last_budget)
+{
+    if (!(q > 0.0 && q <= 1.0) || !isfinite(last_budget) || last_budget < 0.0)
+        return q;
+    if (!isfinite(elapsed) || elapsed <= 0.0)
+        return 0.0;
+    return fmin(q, last_budget / elapsed);
+}
+
 /* Charge the rank's actual or forecast control windows at raw cost. The
  * caller separately admits the original wall-clock and local-rank risk. */
 static inline int peak_mpi_active_clock_reattach_debit(

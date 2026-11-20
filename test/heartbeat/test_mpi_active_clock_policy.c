@@ -53,6 +53,33 @@ static void test_reattach_raw_budget(void)
     assert(equal(shortfall, 0.001));
 }
 
+static void test_missed_clock_snapshot(void)
+{
+    const double q = 0.1;
+    assert(equal(peak_mpi_active_clock_carried_ratio(q, 9.0, -1.0), q));
+
+    PeakMpiActiveClockPolicy observed =
+        peak_mpi_active_clock_policy(q, 10.0, 9.0, 0.05);
+    assert(equal(observed.budget, 0.105));
+    double first_miss = peak_mpi_active_clock_carried_ratio(q, 11.0, observed.budget);
+    double second_miss = peak_mpi_active_clock_carried_ratio(q, 12.0, observed.budget);
+    assert(equal(first_miss * 11.0, observed.budget));
+    assert(equal(second_miss * 12.0, observed.budget));
+    assert(second_miss < first_miss && first_miss < observed.ratio);
+
+    PeakMpiActiveClockPolicy recovered =
+        peak_mpi_active_clock_policy(q, 13.0, 11.0, 0.05);
+    assert(equal(recovered.budget, 0.205));
+    assert(equal(peak_mpi_active_clock_carried_ratio(q, 14.0, recovered.budget)
+                     * 14.0, recovered.budget));
+
+    assert(peak_mpi_active_clock_carried_ratio(q, 11.0, 0.0) == 0.0);
+    assert(peak_mpi_active_clock_carried_ratio(q, 0.0, observed.budget) == 0.0);
+    assert(peak_mpi_active_clock_carried_ratio(q, NAN, observed.budget) == 0.0);
+    assert(equal(peak_mpi_active_clock_carried_ratio(q, 11.0, INFINITY), q));
+    assert(equal(peak_mpi_active_clock_carried_ratio(2.0, 11.0, 0.0), 2.0));
+}
+
 int main(void)
 {
     expect(20.0, 0.0, 0.0, 0.1, 2.0, 0);
@@ -77,4 +104,5 @@ int main(void)
     expect(0.0, 0.0, 0.0, 0.1, 0.0, 0);
     expect(NAN, 0.0, 0.0, 0.1, 0.0, 0);
     test_reattach_raw_budget();
+    test_missed_clock_snapshot();
 }
