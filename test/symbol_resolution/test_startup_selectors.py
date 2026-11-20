@@ -15,9 +15,8 @@ def run(program, preload, target, mode, legacy=False):
         "PEAK_ENABLE_PER_TARGET_HEARTBEAT": "0",
         "PEAK_ENABLE_GLOBAL_HEARTBEAT": "0",
         "PEAK_ENABLE_REATTACH": "0",
+        "PEAK_ENABLE_CXX_SYMBOL_SCAN": "1" if legacy else "0",
     })
-    if legacy:
-        env["PEAK_ENABLE_CXX_SYMBOL_SCAN"] = "1"
     try:
         completed = subprocess.run([program, mode], env=env,
                                    capture_output=True, text=True, timeout=20)
@@ -33,7 +32,8 @@ def main():
     selector = "peak_test::Widget::func(int,double)"
     for target in (f"{module_a}!{selector}",
                    f"{module_a}!_ZN9peak_test6Widget4funcEid",
-                   f"{module_a}!peak_test::Widget::operator!() const"):
+                   f"{module_a}!peak_test::Widget::operator!() const",
+                   "peak_test::legacy_short_unique"):
         stdout, _ = run(program, module_a, target, "startup-unique")
         assert "startup_unique_selector_ok" in stdout
 
@@ -56,8 +56,7 @@ def main():
                          "startup-ambiguous")
     assert "startup_ambiguous_terminal_ok" in stdout
     assert stderr.count("ambiguous target selector; refusing to attach") == 1
-    assert stderr.count(f"module={module_a}") == 1
-    assert stderr.count(f"module={module_b}") == 1
+    assert "(2 candidates)" in stderr
 
     stdout, stderr = run(program, module_a,
                          "peak_symbol_fixture_invoke+0X10",

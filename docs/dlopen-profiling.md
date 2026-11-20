@@ -151,12 +151,12 @@ owner therefore completes without a static lookup or retry, leaving the target
 unresolved for a later provider and releasing the queued reference. Handle-scoped
 dynamic hits still take the existing exact-owner path. The namespace ownership
 tests exercise this lower-level behavior through explicit queue admission; they
-do not extend public `dlopen()` discovery to `dlmopen()`. A dynamic
-C++ selector instead requires a slash-containing `path!symbol` scope. After
-the resolver proves that the candidate belongs to this exact `link_map`, PEAK
-attaches the resolved address directly, including local symbols that `dlsym()`
-cannot export. Basename and unqualified C++ selectors are refused dynamically,
-so their result cannot depend on controller drain order.
+do not extend public `dlopen()` discovery to `dlmopen()`. With Linux owned-module
+lookup enabled, a C++ selector without a module path searches only the module
+owned by that request. The resolver proves the candidate belongs to that exact
+`link_map` before attaching the address, including local symbols that
+`dlsym()` cannot export. A slash-containing `path!symbol` limits matching to
+that module path and works on builds without owned-module lookup.
 
 Resolved addresses are deduplicated and attached in bounded strict ATTACH
 batches. Symbol lookup does not hold the general-listener mutex. Listener
@@ -332,21 +332,21 @@ retry may still be dropped if PEAK cannot preserve its request handle.
 
 Unresolved plain C symbols do not trigger Gum's global C++ scan. The
 asynchronous `dlopen` path uses exact-name `dlsym()` when their DSO appears.
-C++ dynamic selectors must use a slash-containing `path!symbol` scope. PEAK
-resolves that path-qualified selector with the startup resolver, proves the
-candidate belongs to the request's exact loader instance, and attaches the
-candidate address directly; this also supports local (non-`dlsym`-exported)
-symbols. Basename and unqualified C++ selectors are refused dynamically so
-their result cannot depend on loader/controller-drain order. The resolver never
-loads a module. An unrelated `dlopen()` does not synchronize or scan symbols
-for a path-qualified selector; the selector's module must first match that
-request. `PEAK_ENABLE_CXX_SYMBOL_SCAN=1` permits startup legacy fallback after
-an ordinary exact lookup misses. In the dynamic path it permits legacy matching
-only for an explicit slash-containing `path!symbol`; an ordinary raw miss uses
-only exact-name static/local fallback, without enabling C++ overload matching.
-If no owned candidate exists, it stays unresolved for a later DSO. Once a matching DSO request arrives,
-the resolver enumerates symbols only in modules applicable to that selector.
-The report name retains the module spelling supplied in `path!symbol`.
+C++ selectors use the same match tiers as at startup. The resolver never
+loads a module. A module-qualified selector is considered only for matching
+`dlopen()` requests. With owned-module lookup, a selector without a module path
+can stay pending across unrelated opens and attaches to the first uniquely
+matching module processed by the controller. Multiple best candidates in that
+module produce a warning and end resolution for the selector. Use a full
+signature or exact mangled name to select an overload, and use `path!symbol`
+to select a particular provider. The report name retains any module scope
+spelled in the selector.
+
+A namespace or type qualifier, as in `namespace::function`, makes C++ name
+matching available by default. `PEAK_ENABLE_CXX_SYMBOL_SCAN=1` enables legacy
+matching of bare function names at startup and in dynamic `module!symbol`
+selectors. An ordinary dynamic raw-name miss uses exact-name static fallback
+within the opened module.
 
 ## Supported Boundary
 

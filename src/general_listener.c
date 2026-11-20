@@ -7524,14 +7524,13 @@ peak_general_listener_use_selector_resolution(
         *demangled_name = peak_target_resolver_format_display_name(
             selector, candidate->demangled);
     } else if (result == PEAK_TARGET_RESOLVE_AMBIGUOUS) {
-        g_printerr("[peak] ambiguous target selector; refusing to attach\n");
-        g_printerr("selector=%s candidates=%" G_GSIZE_FORMAT "\n",
-                   selector != NULL ? selector : "<null>",
-                   (gsize)resolution->candidates->len);
+        peak_log_warn("[peak] ambiguous target selector; refusing to attach '%s' (%u candidates). Use a full signature or exact mangled name with module!symbol\n",
+                      selector != NULL ? selector : "<null>",
+                      resolution->candidates->len);
         for (gsize i = 0; i < resolution->candidates->len; i++) {
             const PeakTargetSymbolCandidate* candidate =
                 g_ptr_array_index(resolution->candidates, i);
-            g_printerr(
+            peak_log_info(
                 "address=%p module=%s mangled=%s demangled=%s\n",
                 candidate->address,
                 candidate->module,

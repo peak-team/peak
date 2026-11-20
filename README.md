@@ -245,13 +245,20 @@ PEAK_TARGET='/opt/lib/libfoo.so!namespace::Class::func(int,double),libfoo.so!_ZN
 matches every loaded DSO with that basename; a path is matched exactly or
 canonically when both paths can be resolved. PEAK attaches function listeners
 only at resolved function entries; arbitrary instruction offsets are not a
-supported target syntax. PEAK first considers exact symbol names, then exact full
-demangled signatures, then legacy C++ short names. A selector with more than
-one candidate at its best matching level is not attached; PEAK prints every
-candidate instead of choosing one. Reports retain the module spelling from a
+supported target syntax. PEAK first considers exact symbol names, then full
+demangled signatures, then qualified function names such as `namespace::func`.
+A bare function name such as `func` requires `PEAK_ENABLE_CXX_SYMBOL_SCAN=1`
+for C++ name matching. A selector with more than one candidate at its best
+matching level is left unattached and produces a warning. Set
+`PEAK_VERBOSITY=info` to see the candidates. Reports retain the module spelling from a
 module-qualified selector, for example
 `/opt/lib/libfoo.so!namespace::Class::func(int, double)`, so equal signatures
-from different DSOs remain distinguishable.
+from different DSOs remain distinguishable. At startup, the selector is checked
+across loaded DSOs. On Linux with owned-module lookup enabled, an unscoped or
+basename-scoped C++ selector can also attach when a later `dlopen()` provides
+a unique match. The first matching module processed by PEAK gets the hook.
+Specify a `path!symbol` selector to target a particular library regardless of
+the order in which libraries are opened.
 
 Use the installed inspection command before profiling when selecting an
 overload or checking several DSOs:
@@ -280,7 +287,7 @@ in detail.
 | `PEAK_TARGET_GROUP` | Comma-separated built-in groups: `FFTW`, `PBLAS`, `ScaLAPACK`, `LAPACK`, and `BLAS`. |
 | `PEAK_TARGET_FILE` | File containing one complete CPU target name or C++ selector per line; this avoids comma-list quoting concerns for complex signatures. |
 | `PEAK_PROFILE_INTERPRETERS` | Allow normally skipped interpreter processes to initialize PEAK. |
-| `PEAK_ENABLE_CXX_SYMBOL_SCAN` | At startup, permit legacy C++ short-name matching only after an ordinary exact lookup misses. After `dlopen()`, legacy matching is available only through an absolute or slash-containing `path!symbol` selector; an unqualified C miss remains unresolved for later DSOs. |
+| `PEAK_ENABLE_CXX_SYMBOL_SCAN` | Permit legacy lookup of bare C++ function names at startup after an ordinary exact lookup misses, or in explicit `module!symbol` selectors during `dlopen()`. Names containing a C++ namespace or type qualifier are eligible for C++ matching by default. |
 | `PEAK_STATSLOG_PATH` | CSV output prefix. Default: `./peak_statslog`. |
 | `PEAK_STATSLOG_TEMPLATE` | Complete statistics-CSV pathname template. Supports `{jobid}`, `{stepid}`, `{host}`, `{rank}`, `{pid}`, and `{session}`; for example `{jobid}/{stepid}/{host}/peak-{rank}-{pid}-{session}.csv`. Missing parent directories are created for an explicit template. A template without `.csv` is valid; an exec checkpoint appends `-execN.csv` to it, while the final report uses the literal rendered name. The default adds all identity fields plus `.csv` to the prefix. |
 | `PEAK_MEMLOG_TEMPLATE` | Complete memory-log CSV pathname template; it supports the same fields. |

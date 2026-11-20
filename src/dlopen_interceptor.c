@@ -105,6 +105,7 @@ typedef struct {
     char* demangled;
     gboolean selector_applicable;
     gboolean ordinary_symbol_fallback;
+    gboolean owned_selector;
     gboolean terminal;
 } PeakDlopenResolvedTarget;
 
@@ -2778,26 +2779,42 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
                            resolved_targets[i].name);
                 continue;
             }
-            /* Ordinary raw-name misses use the exact owned-module batch.
-             * For C++ selectors, only a dlopen of the explicitly named
-             * DSO can trigger a scan. A valid startup selector can lack
-             * that scope, so report the late-load limit at INFO. */
-            if (selector_module == NULL ||
-                strchr(selector_module, G_DIR_SEPARATOR) == NULL) {
-                peak_log_info("[peak] dynamic C++ selector requires path-qualified module!symbol scope; refusing to attach: %s\n",
-                              resolved_targets[i].name);
+            if (request->filename == NULL ||
+                !peak_target_resolver_module_matches(selector_module,
+                                                      request->filename)) {
                 g_free(selector_module);
-                resolved_targets[i].terminal = TRUE;
                 continue;
             }
-            if (request->filename != NULL &&
-                peak_target_resolver_module_matches(selector_module,
-                                                    request->filename)) {
-                resolved_targets[i].selector_applicable = TRUE;
-                needs_selector_resolution = TRUE;
-                needs_explicit_selector_resolution = TRUE;
-            }
+            const gboolean path_qualified = selector_module != NULL &&
+                strchr(selector_module, G_DIR_SEPARATOR) != NULL;
             g_free(selector_module);
+            if (path_qualified) {
+                needs_explicit_selector_resolution = TRUE;
+            } else {
+                /* Keep the symbol scan in the exact retained DSO. Gum's
+                 * Linux registry cannot enumerate isolated namespaces. */
+#if defined(__linux__) && defined(GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION) && \
+    GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION >= 5
+                Lmid_t namespace_id;
+
+                if (dlinfo(request->handle, RTLD_DI_LMID, &namespace_id) != 0 ||
+                    namespace_id != LM_ID_BASE) {
+                    continue;
+                }
+                if (request->module_token != NULL &&
+                    gum_interceptor_peak_deferred_module_sync_available()) {
+                    resolved_targets[i].owned_selector = TRUE;
+                }
+#endif
+                if (!resolved_targets[i].owned_selector) {
+                    peak_log_warn("[peak] cannot resolve late-loaded target '%s' without path-qualified module!symbol scope on this build\n",
+                                  resolved_targets[i].name);
+                    resolved_targets[i].terminal = TRUE;
+                    continue;
+                }
+            }
+            resolved_targets[i].selector_applicable = TRUE;
+            needs_selector_resolution = TRUE;
         }
     }
 
@@ -2810,12 +2827,15 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
             if (!resolved_targets[i].selector_applicable) {
                 continue;
             }
+            const gboolean restrict_to_owner =
+                resolved_targets[i].ordinary_symbol_fallback ||
+                resolved_targets[i].owned_selector;
             selector_resolutions[i] = (PeakTargetResolveRequest){
                 .selector = resolved_targets[i].name,
-                .module_path = resolved_targets[i].ordinary_symbol_fallback ? request->filename : NULL,
+                .module_path = restrict_to_owner ? request->filename : NULL,
                 .allow_legacy_short = !resolved_targets[i].ordinary_symbol_fallback && configured_cxx_symbol_scan_enabled,
                 .ordinary_first_match = resolved_targets[i].ordinary_symbol_fallback,
-                .owned_module = resolved_targets[i].ordinary_symbol_fallback ? request->module_token : NULL,
+                .owned_module = restrict_to_owner ? request->module_token : NULL,
             };
         }
     }
@@ -2854,7 +2874,8 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
     GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION >= 5
             /* A visible owner rejected by the path filter completes this request.
              * It leaves the target unresolved for a future eligible provider. */
-            if (resolved_targets[i].ordinary_symbol_fallback &&
+            if ((resolved_targets[i].ordinary_symbol_fallback ||
+                 resolved_targets[i].owned_selector) &&
                 !selector_resolutions[i].module_seen &&
                 !selector_resolutions[i].owned_module_seen &&
                 gum_interceptor_peak_deferred_module_sync_available())
@@ -2877,17 +2898,17 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
                     }
                 }
             } else if (result == PEAK_TARGET_RESOLVE_AMBIGUOUS) {
-                g_printerr("[peak] ambiguous dynamic target selector; refusing to attach\n");
-                g_printerr("selector=%s candidates=%" G_GSIZE_FORMAT "\n",
-                           resolved_targets[i].name,
-                           (gsize)resolution->candidates->len);
+                peak_log_warn("[peak] ambiguous dynamic target selector '%s' (%u candidates in %s); use a full signature or exact mangled name with module!symbol\n",
+                              resolved_targets[i].name,
+                              resolution->candidates->len,
+                              request->filename);
                 for (gsize candidate_index = 0;
                      candidate_index < resolution->candidates->len;
                      candidate_index++) {
                     const PeakTargetSymbolCandidate* candidate =
                         g_ptr_array_index(resolution->candidates,
                                           candidate_index);
-                    g_printerr(
+                    peak_log_info(
                         "address=%p module=%s mangled=%s demangled=%s\n",
                         candidate->address,
                         candidate->module,

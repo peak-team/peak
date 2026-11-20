@@ -41,6 +41,55 @@ enqueue_and_drain_fixture(const char* path, void* handle)
     return 1;
 }
 
+static int
+test_first_provider(void)
+{
+    void* unrelated;
+    void* first;
+    void* second;
+    PeakTargetResolverDiagnostics resolver_diagnostics;
+
+    dlopen_interceptor_test_set_manual_drain(TRUE);
+    peak_target_resolver_reset_diagnostics();
+    if (!load_fixture(PEAK_TEST_SYMBOL_MODULE_MISSING, &unrelated) ||
+        !enqueue_and_drain_fixture(PEAK_TEST_SYMBOL_MODULE_MISSING, unrelated)) {
+        return 1;
+    }
+    peak_target_resolver_get_diagnostics(&resolver_diagnostics);
+    if (resolver_diagnostics.module_symbol_enumerations != 1) {
+        fprintf(stderr, "not ok - unqualified miss did not stay in the opened DSO\n");
+        return 1;
+    }
+    if (!load_fixture(PEAK_TEST_SYMBOL_MODULE_A, &first) ||
+        !enqueue_and_drain_fixture(PEAK_TEST_SYMBOL_MODULE_A, first) ||
+        !load_fixture(PEAK_TEST_SYMBOL_MODULE_B, &second) ||
+        !enqueue_and_drain_fixture(PEAK_TEST_SYMBOL_MODULE_B, second)) {
+        return 1;
+    }
+    widget_func_fn first_function = (widget_func_fn)dlsym(
+        first, "_ZN9peak_test6Widget4funcEid");
+    widget_func_fn second_function = (widget_func_fn)dlsym(
+        second, "_ZN9peak_test6Widget4funcEid");
+    if (first_function == NULL || second_function == NULL ||
+        first_function == second_function) {
+        fprintf(stderr, "not ok - fixture providers did not expose distinct functions\n");
+        return 1;
+    }
+    (void)second_function(1, 2.0);
+    if (peak_general_listener_test_call_count(0) != 0) {
+        fprintf(stderr, "not ok - late second provider received the hook\n");
+        return 1;
+    }
+    (void)first_function(1, 2.0);
+    if (peak_general_listener_test_call_count(0) != 1) {
+        fprintf(stderr, "not ok - first provider did not receive the hook\n");
+        return 1;
+    }
+    dlopen_interceptor_test_set_manual_drain(FALSE);
+    puts("dynamic_first_provider_ok");
+    return 0;
+}
+
 int
 main(int argc, char** argv)
 {
@@ -61,6 +110,9 @@ main(int argc, char** argv)
     int legacy_disabled;
     PeakDlopenSelectorDiagnostics selector_diagnostics;
 
+    if (argc == 2 && strcmp(argv[1], "first-provider") == 0) {
+        return test_first_provider();
+    }
     if (argc != 2 ||
         (strcmp(argv[1], "unique") != 0 && strcmp(argv[1], "ambiguous") != 0 &&
          strcmp(argv[1], "mixed") != 0 && strcmp(argv[1], "local") != 0 &&
