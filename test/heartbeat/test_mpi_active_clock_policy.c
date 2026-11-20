@@ -67,6 +67,10 @@ static void test_missed_clock_snapshot(void)
     assert(equal(second_miss * 12.0, observed.budget));
     assert(second_miss < first_miss && first_miss < observed.ratio);
 
+    double remaining = second_miss * 12.0;
+    assert(peak_mpi_active_clock_reattach_debit(&remaining, 0.05, 0.0, 0));
+    assert(!peak_mpi_active_clock_reattach_debit(&remaining, 0.06, 0.0, 0));
+
     PeakMpiActiveClockPolicy recovered =
         peak_mpi_active_clock_policy(q, 13.0, 11.0, 0.05);
     assert(equal(recovered.budget, 0.205));

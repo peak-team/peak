@@ -2484,6 +2484,18 @@ if(BUILD_TESTING)
         endif()
         string(JOIN " " _PEAK_MPIEXEC_PREFLAGS_STRING ${MPIEXEC_PREFLAGS})
         string(JOIN " " _PEAK_MPIEXEC_POSTFLAGS_STRING ${MPIEXEC_POSTFLAGS})
+        if(TARGET test_mpi_active_clock AND _PEAK_MPI_TEST_NPROCS EQUAL 2)
+            add_test(NAME test_mpi_active_clock
+                COMMAND ${Python3_EXECUTABLE}
+                        ${PROJECT_SOURCE_DIR}/test/dgemm_mpi/run_mpi_active_clock_check.py
+                        --mpiexec ${MPIEXEC_EXECUTABLE}
+                        --nproc-flag=${MPIEXEC_NUMPROC_FLAG}
+                        --exe $<TARGET_FILE:test_mpi_active_clock>
+                        --libpeak $<TARGET_FILE:peak>
+                        "--preflags=${_PEAK_MPIEXEC_PREFLAGS_STRING}"
+                        "--postflags=${_PEAK_MPIEXEC_POSTFLAGS_STRING}")
+            set_tests_properties(test_mpi_active_clock PROPERTIES TIMEOUT 35 PROCESSORS 2)
+        endif()
         if(_PEAK_MPI_REPORT_TRANSPORT_AVAILABLE)
             add_test(NAME test_mpi_report_transport
                 COMMAND ${MPIEXEC_EXECUTABLE}
