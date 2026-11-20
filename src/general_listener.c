@@ -7465,6 +7465,9 @@ peak_general_overhead_bootstrapping()
     const guint n_tests = 1000;
     const guint calls_per_test = 32;
     double* time = g_new(double, n_tests * 2);
+    /* A patched entry can run code that is invisible to LTO. Use the same
+     * indirect call in both samples so the optimizer must allow side effects. */
+    void (*volatile calibrate)(void) = peak_general_overhead_dummy_func;
 #ifdef PEAK_ATTACH_RUNTIME
     peak_calibration_listener = listener_bootstrapping;
     peak_calibration_callbacks = 0;
@@ -7473,7 +7476,7 @@ peak_general_overhead_bootstrapping()
     for (guint i = 0; i < n_tests; i++) {
         time[n_tests + i] = peak_second();
         for (guint call = 0; call < calls_per_test; call++) {
-            peak_general_overhead_dummy_func();
+            calibrate();
         }
         time[n_tests + i] =
             (peak_second() - time[n_tests + i]) / calls_per_test;
@@ -7536,7 +7539,7 @@ peak_general_overhead_bootstrapping()
     for (guint i = 0; i < n_tests; i++) {
         time[i] = peak_second();
         for (guint call = 0; call < calls_per_test; call++) {
-            peak_general_overhead_dummy_func();
+            calibrate();
         }
         time[i] = (peak_second() - time[i]) / calls_per_test;
     }

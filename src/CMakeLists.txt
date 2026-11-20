@@ -273,6 +273,19 @@ if(PEAK_BUILD_ATTACH)
     if(PEAK_CUDA_ENABLED)
         list(APPEND _peak_attach_sources cuda_interceptor.cpp cuda_profiler_state.cpp)
     endif()
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        # Resolve the overlay symbols before searching the provider archive.
+        # Its preload member uses initial-exec TLS, which relies on startup
+        # allocation and can fail when a process already has running threads.
+        add_library(peak_attach_gum_overlay OBJECT
+            ${PROJECT_SOURCE_DIR}/cmake/peak-gum/gum_peak_pc_api.c)
+        set_target_properties(peak_attach_gum_overlay PROPERTIES
+            POSITION_INDEPENDENT_CODE ON
+            C_STANDARD 11)
+        target_compile_definitions(peak_attach_gum_overlay PRIVATE PEAK_GUM_DYNAMIC_TLS=1)
+        target_include_directories(peak_attach_gum_overlay PRIVATE ${FRIDA_GUM_INCLUDE_DIRS})
+        list(APPEND _peak_attach_sources $<TARGET_OBJECTS:peak_attach_gum_overlay>)
+    endif()
     add_library(peak_attach_agent SHARED ${_peak_attach_sources})
     set_target_properties(peak_attach_agent PROPERTIES OUTPUT_NAME "peak-attach")
     if(TARGET peak_detach_helper)

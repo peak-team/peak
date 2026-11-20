@@ -43,6 +43,12 @@ add_test(NAME test_attach_runtime_calibration
 set_tests_properties(test_attach_runtime_calibration PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    if(CMAKE_READELF)
+        add_test(NAME test_attach_dynamic_tls COMMAND
+            ${CMAKE_READELF} -d $<TARGET_FILE:peak_attach_agent>)
+        set_tests_properties(test_attach_dynamic_tls PROPERTIES
+            FAIL_REGULAR_EXPRESSION "STATIC_TLS" TIMEOUT 10)
+    endif()
     add_test(NAME test_attach_memory
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/run_attach.py
             --cli $<TARGET_FILE:peak_attach> --agent $<TARGET_FILE:peak_attach_agent>

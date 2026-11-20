@@ -22,6 +22,12 @@
 #include <unistd.h>
 #include "frida-gum.h"
 
+#ifdef PEAK_GUM_DYNAMIC_TLS
+# define PEAK_GUM_TLS_MODEL __attribute__((tls_model("global-dynamic")))
+#else
+# define PEAK_GUM_TLS_MODEL __attribute__((tls_model("initial-exec")))
+#endif
+
 guint
 gum_interceptor_peak_entry_range_revision(void)
 {
@@ -1097,8 +1103,7 @@ G_STATIC_ASSERT(sizeof(PeakGumArm64FunctionContextData17) <=
 #endif
 
 static _Thread_local PeakGumInvocationStack17 *
-    peak_gum_cached_invocation_stack
-        __attribute__((tls_model("initial-exec")));
+    peak_gum_cached_invocation_stack PEAK_GUM_TLS_MODEL;
 
 static gboolean
 peak_gum_pointer_in_range(gpointer pointer, gpointer start, gsize size)
