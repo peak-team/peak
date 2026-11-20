@@ -51,7 +51,6 @@ def check_shutdown_order(repo_root):
 def check_late_attach_support_windows(repo_root):
     pthread = read_source(repo_root, "src/pthread_listener.c")
     memory = read_source(repo_root, "src/malloc_interceptor.c")
-    mpi = read_source(repo_root, "src/mpi_interceptor.c")
     cuda = read_source(repo_root, "src/cuda_interceptor.cpp")
     controller = read_source(repo_root, "src/detach_controller.c")
     support = extract_function(pthread, "pthread_listener_attach_support")
@@ -125,11 +124,10 @@ def check_late_attach_support_windows(repo_root):
             "#undef PEAK_MALLOC_REPLACE_FAST" in memory,
             "late memory attach must prepare every allocator atomically, finish "
             "all exits and use guarded standard replacements for dynamic TLS")
-    mpi_attach = extract_function(mpi, "mpi_interceptor_attach")
-    require(0 <= mpi_attach.find("peak_detach_controller_prepare_hook_mutation") <
-            mpi_attach.find("gum_interceptor_begin_transaction") <
-            mpi_attach.find("peak_detach_controller_finish_hook_mutation"),
-            "late MPI finalization replacement must use a strict mutation window")
+    src_cmake = read_source(repo_root, "src/CMakeLists.txt")
+    require(re.search(r"list\(REMOVE_ITEM _peak_attach_sources[^)]*mpi_interceptor\.c\)",
+                      src_cmake) is not None,
+            "late attach must bypass MPI init and finalize interception")
     for name in ("peak_cuda_replace_fast", "peak_cuda_attach_capture_entry"):
         body = extract_function(cuda, name)
         require(0 <= body.find("peak_detach_controller_prepare_hook_mutation") <
@@ -2428,7 +2426,7 @@ def check_stop_window_accounting_sidecar(repo_root):
                 r'%s: target entry redirects to another address',
                 general_attach_supported) is not None and
             re.search(
-                r'peak_log_warn\(\s*"\[peak\] skipping Gum attach for hook '
+                r'peak_log_warn\(\s*"\[peak\] skipping profiling target '
                 r'%s: this entry is reserved for the filesystem-stat safety guard',
                 general_attach_supported) is not None and
             "peak_filesystem_stat_guard_owns_address(address)" in general_attach_supported and
@@ -2452,6 +2450,17 @@ def check_stop_window_accounting_sidecar(repo_root):
             "prepared != count" in initial_batch and
             "peak_general_listener_initial_attach_one(" in initial_batch,
             "initial attach must preserve the single-thread proof or guard every target")
+    require(initial_one.index("request.attach_options = &plan.options") <
+            initial_one.index("peak_detach_controller_prepare_hook_mutation(") and
+            "mutation_request.attach_options = &startup_plans[startup_count].options"
+            in general_listener_attach,
+            "initial staged attach must preserve options through preparation")
+    require("if (!peak_general_listener_initial_mutation_is_staged())" in initial_one and
+            re.search(
+                r"if \(peak_general_listener_initial_mutation_is_staged\(\)\) "
+                r"\{[^}]+\} else \{\s+gum_interceptor_begin_transaction",
+                initial_batch) is not None,
+            "initial staged attach must skip ordinary Gum transactions")
     require("startup_attach_can_skip_stop" in overhead_bootstrap and
             overhead_bootstrap.count(
                 "peak_general_listener_startup_attach_can_skip_stop()"

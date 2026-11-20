@@ -1226,9 +1226,10 @@ peak_target_resolution_finalize(PeakTargetResolution* resolution)
                                              : PEAK_TARGET_RESOLVE_AMBIGUOUS;
 }
 
-void
-peak_target_resolver_resolve_many(PeakTargetResolveRequest* requests,
-                                  size_t count)
+static void
+peak_target_resolver_resolve_batch(PeakTargetResolveRequest* requests,
+                                  size_t count,
+                                  GPtrArray* modules)
 {
     PeakTargetSelector* selectors;
     PeakTargetCollectContext* contexts;
@@ -1343,7 +1344,13 @@ peak_target_resolver_resolve_many(PeakTargetResolveRequest* requests,
         return;
     }
     PEAK_RESOLVER_DIAG_ADD(module_passes, 1);
-    gum_process_enumerate_modules(peak_target_collect_batch_module, &batch);
+    if (modules == NULL) {
+        gum_process_enumerate_modules(peak_target_collect_batch_module, &batch);
+    } else {
+        for (guint i = 0; i < modules->len; i++) {
+            peak_target_collect_batch_module(g_ptr_array_index(modules, i), &batch);
+        }
+    }
     for (size_t i = 0; i < count; i++) {
         if (contexts[i].selector != NULL) {
             requests[i].result = peak_target_resolution_finalize(
@@ -1359,6 +1366,21 @@ peak_target_resolver_resolve_many(PeakTargetResolveRequest* requests,
     g_free(contexts);
     g_free(selectors);
 }
+
+void
+peak_target_resolver_resolve_many(PeakTargetResolveRequest* requests, size_t count)
+{
+    peak_target_resolver_resolve_batch(requests, count, NULL);
+}
+
+#ifdef PEAK_ATTACH_RUNTIME
+void
+peak_target_resolver_resolve_many_in_modules(PeakTargetResolveRequest* requests,
+                                           size_t count, GPtrArray* modules)
+{
+    peak_target_resolver_resolve_batch(requests, count, modules);
+}
+#endif
 
 PeakTargetResolveResult
 peak_target_resolver_resolve(const char* selector_text,

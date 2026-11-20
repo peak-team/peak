@@ -162,15 +162,16 @@ def main():
                                    "peak_general_listener_find_function")
     require(generic_lookup.count("gum_find_function(symbol)") == 2,
             "generic target lookup must keep Gum dynamic-binary resolution")
-    require(generic_lookup.count("dlsym(RTLD_DEFAULT, symbol)") == 1,
-            "generic target lookup must keep the Darwin loader fallback")
-    darwin_fallback = re.search(
-        r"#if defined\(__APPLE__\)(.*?)#else(.*?)#endif",
-        generic_lookup,
-        re.DOTALL)
-    require(darwin_fallback is not None,
-            "Darwin loader fallback must remain Apple-only")
-    apple_lookup, non_apple_lookup = darwin_fallback.groups()
+    lookup_modes = re.search(
+        r"#if defined\(PEAK_ATTACH_RUNTIME\)(.*?)"
+        r"#elif defined\(__APPLE__\)(.*?)#else(.*?)#endif",
+        generic_lookup, re.DOTALL)
+    require(lookup_modes is not None,
+            "attach export lookup and preload platform lookups must remain separate")
+    attach_lookup, apple_lookup, non_apple_lookup = lookup_modes.groups()
+    require("return dlsym(RTLD_DEFAULT, symbol);" in attach_lookup and
+            "gum_find_function(" not in attach_lookup,
+            "attach must avoid unpinned global Gum symbol enumeration")
     require_order(apple_lookup,
                   "address = gum_find_function(symbol);",
                   "if (address == NULL)",
@@ -206,7 +207,7 @@ def main():
     require('gum_find_function("' not in general,
             "general listener special cases must use the Frida-native lookup helper")
     require('#include "general_listener.h"' not in cuda and
-            'extern "C" gpointer peak_general_listener_find_function('
+            'extern "C" gpointer peak_general_listener_find_cuda_function('
             'const char* symbol);' in cuda,
             "CUDA must avoid C-only general-listener declarations and keep its C lookup ABI")
     for relpath in c_api_headers:
@@ -295,7 +296,7 @@ def main():
 
     for hook in CUDA_HOOKS:
         require(re.search(
-                    rf'peak_general_listener_find_function\(\s*"{hook}"\s*\)',
+                    rf'peak_general_listener_find_cuda_function\(\s*"{hook}"\s*\)',
                     cuda) is not None,
                 f"missing Frida-native support CUDA hook lookup: {hook}")
 
@@ -1281,7 +1282,7 @@ def main():
         "gboolean installed = peak_cuda_install_capture_hook(",
     )
     require("driver_typed_replacements_are_isolated\n"
-            "        ? (gpointer*) peak_general_listener_find_function("
+            "        ? (gpointer*) peak_general_listener_find_cuda_function("
             in attach,
             "a failed Driver ABI-isolation census must suppress typed launch "
             "replacements and generic Driver capture listeners")

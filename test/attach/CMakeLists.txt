@@ -36,6 +36,11 @@ add_test(NAME test_attach_runtime
         ${_peak_attach_injection_options})
 set_tests_properties(test_attach_cli PROPERTIES TIMEOUT 30)
 set_tests_properties(test_attach_runtime PROPERTIES TIMEOUT 100 SKIP_RETURN_CODE 77)
+add_test(NAME test_attach_runtime_calibration
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/run_attach.py
+        --cli $<TARGET_FILE:peak_attach> --agent $<TARGET_FILE:peak_attach_agent>
+        --fixture $<TARGET_FILE:test_attach_fixture> --mode calibration)
+set_tests_properties(test_attach_runtime_calibration PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_test(NAME test_attach_memory
@@ -95,4 +100,62 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(test_attach_gum_linux_staged_arm64_writer PRIVATE ${_peak_attach_runtime_libraries})
     add_test(NAME test_attach_gum_linux_staged_arm64_writer COMMAND test_attach_gum_linux_staged_arm64_writer)
     set_tests_properties(test_attach_gum_linux_staged_arm64_writer PROPERTIES TIMEOUT 20)
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    find_program(_peak_attach_readelf readelf)
+    if(_peak_attach_readelf)
+        add_library(test_attach_collector_targets SHARED collector_targets.c)
+        target_link_options(test_attach_collector_targets PRIVATE -nostdlib)
+        add_executable(test_attach_collector_fixture collector_fixture.cpp)
+        target_link_libraries(test_attach_collector_fixture PRIVATE
+            test_attach_collector_targets Threads::Threads)
+        add_test(NAME test_attach_collector
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/run_collector.py
+                ${PROJECT_SOURCE_DIR}/tools/peak-collect-targets
+                $<TARGET_FILE:test_attach_collector_fixture>
+                $<TARGET_FILE:test_attach_collector_targets>
+                $<TARGET_FILE:peak_attach>
+                $<TARGET_FILE:peak_attach_agent>)
+        set_tests_properties(test_attach_collector PROPERTIES TIMEOUT 55 SKIP_RETURN_CODE 77)
+    endif()
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND MPI_C_FOUND AND MPIEXEC_EXECUTABLE)
+    add_executable(test_attach_mpi_fixture mpi_fixture.c)
+    set_target_properties(test_attach_mpi_fixture PROPERTIES ENABLE_EXPORTS TRUE)
+    target_link_libraries(test_attach_mpi_fixture PRIVATE MPI::MPI_C)
+    foreach(_case IN ITEMS baseline partial all partial_local all_local)
+        set(_local)
+        if(_case STREQUAL "baseline")
+            set(_rank_count 0)
+        elseif(_case MATCHES "^partial")
+            set(_rank_count 1)
+        else()
+            set(_rank_count 2)
+        endif()
+        if(_case MATCHES "_local$")
+            set(_local --local)
+        endif()
+        add_test(NAME test_attach_mpi_${_case}
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/run_mpi.py
+                --cli $<TARGET_FILE:peak_attach>
+                --agent $<TARGET_FILE:peak_attach_agent>
+                --ranks ${_rank_count} ${_local}
+                -- ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2
+                    ${MPIEXEC_PREFLAGS} $<TARGET_FILE:test_attach_mpi_fixture>
+                    ${MPIEXEC_POSTFLAGS})
+        set_tests_properties(test_attach_mpi_${_case} PROPERTIES TIMEOUT 65 PROCESSORS 2)
+    endforeach()
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_library(test_attach_module_target MODULE module_target.c)
+    add_executable(test_attach_module_fixture module_fixture.c)
+    target_link_libraries(test_attach_module_fixture PRIVATE ${CMAKE_DL_LIBS})
+    add_test(NAME test_attach_startup_module
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/run_module.py
+            $<TARGET_FILE:peak_attach> $<TARGET_FILE:peak_attach_agent>
+            $<TARGET_FILE:test_attach_module_fixture> $<TARGET_FILE:test_attach_module_target>)
+    set_tests_properties(test_attach_startup_module PROPERTIES TIMEOUT 45)
 endif()

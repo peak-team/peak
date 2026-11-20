@@ -123,7 +123,7 @@ jobs:
       run: |
         set -o pipefail
         ctest --test-dir build --output-on-failure -V \
-          -R '^test_attach_(cli|config|runtime|transport)$' 2>&1 | tee build/attach-ctest.log
+          -R '^test_attach_(cli|config|runtime|runtime_calibration|transport)$' 2>&1 | tee build/attach-ctest.log
         if grep -Fq 'Skipped' build/attach-ctest.log; then
           echo 'Attach runtime coverage was skipped; native injection is required.' >&2
           exit 1

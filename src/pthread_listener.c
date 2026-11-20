@@ -1130,7 +1130,8 @@ void
 pthread_listener_calibration_begin(void)
 {
 #ifdef PEAK_ATTACH_RUNTIME
-    pthread_calibration_slot_allowed = TRUE;
+    pthread_calibration_slot_allowed =
+        pthread_thread_excluded && !pthread_slot_identity.valid;
 #endif
 }
 
@@ -1138,8 +1139,22 @@ void
 pthread_listener_calibration_end(void)
 {
 #ifdef PEAK_ATTACH_RUNTIME
+    gboolean borrowed_slot = pthread_calibration_slot_allowed &&
+        pthread_slot_identity.valid;
     pthread_calibration_slot_allowed = FALSE;
-    pthread_listener_exclude_current_thread();
+    if (!borrowed_slot) {
+        return;
+    }
+    /* Only the private calibration listener can use this slot. Drop its
+     * thread state and TLS identity before returning it to the registry. */
+    uint64_t generation = pthread_slot_identity.generation;
+    peak_general_listener_release_current_thread_state();
+    pthread_slot_identity.valid = FALSE;
+    if (pthread_slot_key_created) {
+        (void)pthread_setspecific(pthread_slot_key, NULL);
+    }
+    (void)peak_pthread_slot_registry_compare_remove(&pthread_slot_registry,
+        pthread_self(), generation, true);
 #endif
 }
 

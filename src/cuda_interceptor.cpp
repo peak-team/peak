@@ -36,7 +36,7 @@ extern "C" {
 #define PEAK_CUDA_DRIVER_LAUNCH_EX 1
 #endif
 
-extern "C" gpointer peak_general_listener_find_function(const char* symbol);
+extern "C" gpointer peak_general_listener_find_cuda_function(const char* symbol);
 extern "C" void peak_general_listener_exclude_current_thread(void);
 extern "C" void peak_general_listener_fast_ignore_current_thread(void);
 extern "C" void peak_general_listener_fast_unignore_current_thread(void);
@@ -3005,7 +3005,7 @@ peak_cuda_driver_typed_replacements_are_isolated()
     PeakCudaResolvedEntry timed[G_N_ELEMENTS(timed_symbols)] = {};
     size_t timed_count = 0;
     for (const char* symbol : timed_symbols) {
-        gpointer address = peak_general_listener_find_function(symbol);
+        gpointer address = peak_general_listener_find_cuda_function(symbol);
         if (address == NULL) {
             continue;
         }
@@ -3040,7 +3040,7 @@ peak_cuda_driver_typed_replacements_are_isolated()
 
     auto non_timed_entry_is_isolated =
         [&](const char* symbol) -> gboolean {
-            gpointer address = peak_general_listener_find_function(symbol);
+            gpointer address = peak_general_listener_find_cuda_function(symbol);
             if (address == NULL) {
                 return TRUE;
             }
@@ -3162,7 +3162,7 @@ peak_cuda_install_capture_hook(PeakCudaCaptureHookIndex index,
     const PeakCudaCaptureHookDescriptor* descriptor =
         &peak_cuda_capture_descriptors[index];
     gpointer* target = static_cast<gpointer*>(
-        peak_general_listener_find_function(descriptor->symbol));
+        peak_general_listener_find_cuda_function(descriptor->symbol));
     *present = target != NULL;
     if (target == NULL) {
         return FALSE;
@@ -3572,7 +3572,7 @@ extern "C" int cuda_interceptor_attach()
 #endif
 
     hook_cuda_launch =
-        (gpointer*) peak_general_listener_find_function("cudaLaunchKernel");
+        (gpointer*) peak_general_listener_find_cuda_function("cudaLaunchKernel");
     if (hook_cuda_launch) {
         hook_replace_check = peak_cuda_replace_fast(
             hook_cuda_launch,
@@ -3588,7 +3588,7 @@ extern "C" int cuda_interceptor_attach()
     }
 
     hook_cuda_launch_cooperative =
-        (gpointer*) peak_general_listener_find_function("cudaLaunchCooperativeKernel");
+        (gpointer*) peak_general_listener_find_cuda_function("cudaLaunchCooperativeKernel");
     if (hook_cuda_launch_cooperative) {
         hook_replace_check = peak_cuda_replace_fast(
             hook_cuda_launch_cooperative,
@@ -3605,7 +3605,7 @@ extern "C" int cuda_interceptor_attach()
     }
 
     hook_cuda_launch_cooperative_multiple_device =
-        (gpointer*) peak_general_listener_find_function("cudaLaunchCooperativeKernelMultiDevice");
+        (gpointer*) peak_general_listener_find_cuda_function("cudaLaunchCooperativeKernelMultiDevice");
     if (hook_cuda_launch_cooperative_multiple_device) {
         hook_replace_check = peak_cuda_replace_fast(
             hook_cuda_launch_cooperative_multiple_device,
@@ -3623,7 +3623,7 @@ extern "C" int cuda_interceptor_attach()
 
 #if defined(PEAK_CUDA_RUNTIME_LAUNCH_EX)
     hook_cuda_launch_exc =
-        (gpointer*) peak_general_listener_find_function("cudaLaunchKernelExC");
+        (gpointer*) peak_general_listener_find_cuda_function("cudaLaunchKernelExC");
     if (hook_cuda_launch_exc) {
         hook_replace_check = peak_cuda_replace_fast(
             hook_cuda_launch_exc,
@@ -3640,7 +3640,7 @@ extern "C" int cuda_interceptor_attach()
 #endif
 
     hook_cu_launch = driver_typed_replacements_are_isolated
-        ? (gpointer*) peak_general_listener_find_function("cuLaunchKernel")
+        ? (gpointer*) peak_general_listener_find_cuda_function("cuLaunchKernel")
         : NULL;
     if (hook_cu_launch) {
         hook_replace_check = peak_cuda_replace_fast(
@@ -3657,7 +3657,7 @@ extern "C" int cuda_interceptor_attach()
     }
 
     hook_cu_launch_cooperative = driver_typed_replacements_are_isolated
-        ? (gpointer*) peak_general_listener_find_function(
+        ? (gpointer*) peak_general_listener_find_cuda_function(
             "cuLaunchCooperativeKernel")
         : NULL;
     if (hook_cu_launch_cooperative) {
@@ -3677,7 +3677,7 @@ extern "C" int cuda_interceptor_attach()
 
     hook_cu_launch_cooperative_multiple_device =
         driver_typed_replacements_are_isolated
-            ? (gpointer*) peak_general_listener_find_function(
+            ? (gpointer*) peak_general_listener_find_cuda_function(
                 "cuLaunchCooperativeKernelMultiDevice")
             : NULL;
     if (hook_cu_launch_cooperative_multiple_device) {
@@ -3697,7 +3697,7 @@ extern "C" int cuda_interceptor_attach()
 
 #if defined(PEAK_CUDA_DRIVER_LAUNCH_EX)
     hook_cu_launch_ex = driver_typed_replacements_are_isolated
-        ? (gpointer*) peak_general_listener_find_function("cuLaunchKernelEx")
+        ? (gpointer*) peak_general_listener_find_cuda_function("cuLaunchKernelEx")
         : NULL;
     if (hook_cu_launch_ex) {
         hook_replace_check = peak_cuda_replace_fast(
@@ -3715,7 +3715,7 @@ extern "C" int cuda_interceptor_attach()
 #endif
 
     hook_cuda_graph_launch =
-        (gpointer*) peak_general_listener_find_function("cudaGraphLaunch");
+        (gpointer*) peak_general_listener_find_cuda_function("cudaGraphLaunch");
     if (hook_cuda_graph_launch) {
         hook_replace_check = peak_cuda_replace_fast(
             hook_cuda_graph_launch,
@@ -3731,7 +3731,7 @@ extern "C" int cuda_interceptor_attach()
     }
 
     hook_cu_graph_launch = driver_typed_replacements_are_isolated
-        ? (gpointer*) peak_general_listener_find_function("cuGraphLaunch")
+        ? (gpointer*) peak_general_listener_find_cuda_function("cuGraphLaunch")
         : NULL;
     if (hook_cu_graph_launch) {
         hook_replace_check = peak_cuda_replace_fast(

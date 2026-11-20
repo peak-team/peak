@@ -256,7 +256,7 @@ if(PEAK_BUILD_ATTACH)
         endif()
     endforeach()
     list(REMOVE_ITEM _peak_attach_sources signal_policy.c signal_policy_stub.c
-        exec_raw_syscall_trampoline.S)
+        exec_raw_syscall_trampoline.S mpi_interceptor.c)
     list(APPEND _peak_attach_sources signal_policy_stub.c
         attach/agent.c
         attach/runtime_config.c

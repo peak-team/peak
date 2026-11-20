@@ -1184,6 +1184,7 @@ peak_output_aggregation_mode_from_value(const char* name,
     return PEAK_OUTPUT_AGGREGATION_LOCAL;
 }
 
+#ifndef PEAK_ATTACH_RUNTIME
 static gboolean
 peak_mpi_real_finalize_config_allowed(void)
 {
@@ -1194,6 +1195,8 @@ peak_mpi_real_finalize_config_allowed(void)
     }
     return TRUE;
 }
+
+#endif
 
 static PeakOutputAggregationMode
 peak_output_aggregation_mode(void)
@@ -1215,7 +1218,11 @@ peak_output_aggregation_mode(void)
             TRUE);
     }
 
+#ifdef PEAK_ATTACH_RUNTIME
+    return PEAK_OUTPUT_AGGREGATION_LOCAL;
+#else
     return PEAK_OUTPUT_AGGREGATION_MPI;
+#endif
 }
 
 #endif
@@ -1352,7 +1359,7 @@ peak_activate_runtime(void)
     ) {
         peak_detach_controller_warmup_backend();
     }
-#ifdef HAVE_MPI
+#if defined(HAVE_MPI) && !defined(PEAK_ATTACH_RUNTIME)
     if (found_MPI && mpi_interceptor_attach() != 0) {
         if (peak_requested_output_aggregation ==
             PEAK_OUTPUT_AGGREGATION_MPI) {
@@ -1559,7 +1566,7 @@ peak_activate_runtime(void)
     peak_runtime_activation_publish(PEAK_RUNTIME_ACTIVATION_ACTIVE);
 }
 
-#ifdef HAVE_MPI
+#if defined(HAVE_MPI) && !defined(PEAK_ATTACH_RUNTIME)
 PEAK_API void
 peak_mpi_init_completed(int result)
 {
@@ -1817,7 +1824,7 @@ void peak_init()
     peak_activate_runtime();
 }
 
-#ifdef HAVE_MPI
+#if defined(HAVE_MPI) && !defined(PEAK_ATTACH_RUNTIME)
 static int
 peak_mpi_runtime_allows_collectives(void)
 {
@@ -1836,7 +1843,7 @@ peak_fini_impl(void)
 {
     double peak_runtime_start_time = peak_main_time;
 
-#ifdef HAVE_MPI
+#if defined(HAVE_MPI) && !defined(PEAK_ATTACH_RUNTIME)
     int mpi_finalize_path =
         found_MPI && mpi_interceptor_finalize_path_active();
     if (mpi_finalize_path) {
@@ -1881,7 +1888,7 @@ peak_fini_impl(void)
     }
 #if !defined(__APPLE__)
     if (
-#ifdef HAVE_MPI
+#if defined(HAVE_MPI) && !defined(PEAK_ATTACH_RUNTIME)
         !mpi_finalize_path &&
 #endif
         peak_memory_profile) {
@@ -1895,7 +1902,7 @@ peak_fini_impl(void)
      * dlclose guard, ownership thread, or queue was installed.
      */
 #else
-#ifdef HAVE_MPI
+#if defined(HAVE_MPI) && !defined(PEAK_ATTACH_RUNTIME)
     if (mpi_finalize_path) {
         /*
          * PMPI_Finalize may load DSOs after PEAK writes its report. Keep the
@@ -1914,7 +1921,7 @@ peak_fini_impl(void)
         g_printerr("[peak] Skipping remaining PEAK teardown because dlopen listener teardown was not proven safe\n");
         return;
     }
-#ifdef HAVE_MPI
+#if defined(HAVE_MPI) && !defined(PEAK_ATTACH_RUNTIME)
     uint64_t published_exit_status =
         atomic_load_explicit(&peak_exit_status, memory_order_acquire);
     int exit_status_known =
@@ -2235,12 +2242,23 @@ peak_fini_impl(void)
         return;
     }
 #else
+#ifdef HAVE_MPI
+    /* A PID attachment makes no guarantees about participation by peer ranks. */
+    (void)peak_general_listener_print_with_mpi_job_policy(
+        PEAK_OUTPUT_AGGREGATION_LOCAL, found_MPI != 0, NULL);
+#else
     (void)peak_general_listener_print(0, NULL);
+#endif
     #ifdef HAVE_CUDA
     if (peak_requested_work.gpu) {
     cuda_interceptor_print_with_mpi_job_policy(
-        PEAK_OUTPUT_AGGREGATION_LOCAL, FALSE);
-    cuda_interceptor_dettach();
+        PEAK_OUTPUT_AGGREGATION_LOCAL,
+#ifdef HAVE_MPI
+        found_MPI != 0);
+#else
+        FALSE);
+#endif
+        cuda_interceptor_dettach();
     }
     #endif
 #endif
@@ -2641,9 +2659,9 @@ peak_attach_runtime_start(char **message)
             *message = g_strdup("cannot determine the existing MPI runtime lifecycle");
             return 0;
         }
-        if (finalized && peak_output_aggregation_mode() !=
-                         PEAK_OUTPUT_AGGREGATION_LOCAL) {
-            *message = g_strdup("MPI aggregation cannot be attached after MPI_Finalize; select PEAK_OUTPUT_AGGREGATION=local");
+        if (initialized && peak_output_aggregation_mode() !=
+                           PEAK_OUTPUT_AGGREGATION_LOCAL) {
+            *message = g_strdup("live MPI attach produces independent rank-local reports; select PEAK_OUTPUT_AGGREGATION=local");
             return 0;
         }
         if (!initialized &&
@@ -2710,8 +2728,11 @@ peak_attach_runtime_start(char **message)
         return 0;
     }
 #ifdef HAVE_MPI
-    if (found_MPI)
-        peak_log_info("[peak] late attach reports have unknown application exit status because startup exit interposition was not installed\n");
+    if (found_MPI) {
+        peak_log_info("[peak] late MPI attach uses rank-local reporting and whole-wall heartbeat timing\n");
+        if (parse_env_to_bool("PEAK_MPI_ACTIVE_CLOCK"))
+            peak_log_warn("[peak] PEAK_MPI_ACTIVE_CLOCK is unavailable for live MPI attach\n");
+    }
 #endif
     if (peak_requested_work.cpu) {
 #if !defined(PEAK_HAVE_GUM_DARWIN_PATCH_API)

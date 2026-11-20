@@ -83,6 +83,14 @@ int dlopen_interceptor_attach(void);
  */
 void dlopen_interceptor_enable_dynamic_attach(void);
 
+#ifdef PEAK_ATTACH_RUNTIME
+/* Keep the image containing a resolved startup target mapped until exit. */
+gboolean dlopen_interceptor_pin_startup_target(gpointer address,
+                                                const char* expected_path,
+                                                void** handle_out);
+void dlopen_interceptor_finish_startup_pin(void* handle, gboolean installed);
+#endif
+
 /** @} */
 
 /** @name Queue processing and shutdown

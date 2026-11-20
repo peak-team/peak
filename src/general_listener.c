@@ -39,7 +39,7 @@ peak_general_listener_initial_mutation_is_staged(void)
 #endif
 }
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(PEAK_ATTACH_RUNTIME)
 #include <dlfcn.h>
 #endif
 #include <errno.h>
@@ -1277,7 +1277,9 @@ peak_general_listener_find_function(const char* symbol)
         return NULL;
     }
 
-#if defined(__APPLE__)
+#if defined(PEAK_ATTACH_RUNTIME)
+    return dlsym(RTLD_DEFAULT, symbol);
+#elif defined(__APPLE__)
     gpointer address;
 
     address = gum_find_function(symbol);
@@ -7828,6 +7830,91 @@ peak_general_listener_support_target(const char* selector,
     return NULL;
 }
 
+#ifdef PEAK_ATTACH_RUNTIME
+static gboolean
+peak_general_listener_collect_startup_module(GumModule* module, gpointer data)
+{
+    g_ptr_array_add(data, g_object_ref(module));
+    return TRUE;
+}
+
+static void
+peak_general_listener_resolve_pinned_startup(PeakTargetResolveRequest* resolutions,
+                                             size_t count,
+                                             GPtrArray* snapshot_pins)
+{
+    GPtrArray* images = g_ptr_array_new_with_free_func(g_object_unref);
+    GPtrArray* pinned_images = g_ptr_array_new();
+    gum_process_enumerate_modules(peak_general_listener_collect_startup_module,
+                                  images);
+    for (guint i = 0; i < images->len; ++i) {
+        GumModule* module = g_ptr_array_index(images, i);
+        void* handle;
+        if (dlopen_interceptor_pin_startup_target(
+                GSIZE_TO_POINTER(gum_module_get_range(module)->base_address),
+                gum_module_get_path(module), &handle)) {
+            g_ptr_array_add(pinned_images, module);
+            g_ptr_array_add(snapshot_pins, handle);
+        }
+    }
+    peak_target_resolver_resolve_many_in_modules(resolutions, count,
+                                                pinned_images);
+    g_ptr_array_unref(pinned_images);
+    g_ptr_array_unref(images);
+}
+
+static void
+peak_general_listener_release_snapshot_pins(GPtrArray* snapshot_pins)
+{
+    for (guint i = 0; i < snapshot_pins->len; ++i) {
+        dlopen_interceptor_finish_startup_pin(
+            g_ptr_array_index(snapshot_pins, i), FALSE);
+    }
+    g_ptr_array_unref(snapshot_pins);
+}
+#endif
+
+/* CUDA supports static runtime symbols and RTLD_LOCAL providers. */
+__attribute__((visibility("hidden"))) gpointer
+peak_general_listener_find_cuda_function(const char* symbol)
+{
+    gpointer address = peak_general_listener_find_function(symbol);
+#ifdef PEAK_ATTACH_RUNTIME
+    const char* owner_path = NULL;
+    PeakTargetResolveRequest request = {
+        .selector = symbol,
+        .ordinary_first_match = TRUE,
+    };
+    GPtrArray* snapshot_pins = NULL;
+    void* handle;
+    if (address == NULL) {
+        snapshot_pins = g_ptr_array_new();
+        peak_general_listener_resolve_pinned_startup(&request, 1, snapshot_pins);
+        if (request.result == PEAK_TARGET_RESOLVE_UNIQUE) {
+            PeakTargetSymbolCandidate* candidate =
+                g_ptr_array_index(request.resolution.candidates, 0);
+            address = candidate->address;
+            owner_path = candidate->module;
+        }
+    }
+    if (address != NULL) {
+        if (dlopen_interceptor_pin_startup_target(address, owner_path, &handle)) {
+            const gboolean valid = owner_path != NULL ||
+                peak_general_listener_find_function(symbol) == address;
+            dlopen_interceptor_finish_startup_pin(handle, valid);
+            if (!valid)
+                address = NULL;
+        } else {
+            address = NULL;
+        }
+    }
+    peak_target_resolution_clear(&request.resolution);
+    if (snapshot_pins != NULL)
+        peak_general_listener_release_snapshot_pins(snapshot_pins);
+#endif
+    return address;
+}
+
 void
 peak_general_listener_attach()
 {
@@ -7906,6 +7993,13 @@ peak_general_listener_attach()
     gboolean startup_legacy_cxx_fallback =
         peak_env_truthy_general(g_getenv("PEAK_ENABLE_CXX_SYMBOL_SCAN"));
     gboolean startup_has_selector_resolution = FALSE;
+#ifdef PEAK_ATTACH_RUNTIME
+    /* A loader export lookup can miss local or non-exported symbols. */
+    const gboolean startup_scan_direct_misses = TRUE;
+    GPtrArray* snapshot_pins = g_ptr_array_new();
+#else
+    const gboolean startup_scan_direct_misses = startup_legacy_cxx_fallback;
+#endif
 
     if (startup_direct == NULL || startup_resolutions == NULL) {
         g_free(startup_resolutions);
@@ -7927,10 +8021,14 @@ peak_general_listener_attach()
         if (startup_resolutions != NULL &&
             (explicit_selector ||
              ((startup_direct == NULL || startup_direct[i] == NULL) &&
-              startup_legacy_cxx_fallback))) {
+              startup_scan_direct_misses))) {
             startup_resolutions[i] = (PeakTargetResolveRequest){
                 .selector = peak_hook_strings[i],
                 .allow_legacy_short = startup_legacy_cxx_fallback,
+#ifdef PEAK_ATTACH_RUNTIME
+                .ordinary_first_match = !explicit_selector &&
+                    !startup_legacy_cxx_fallback,
+#endif
             };
             startup_has_selector_resolution = TRUE;
         }
@@ -7941,12 +8039,21 @@ peak_general_listener_attach()
             &peak_general_listener_test_startup_selector_batch_count, 1,
             memory_order_relaxed);
 #endif
+#ifdef PEAK_ATTACH_RUNTIME
+        peak_general_listener_resolve_pinned_startup(startup_resolutions,
+                                                      peak_hook_address_count,
+                                                      snapshot_pins);
+#else
         peak_target_resolver_resolve_many(startup_resolutions,
                                           peak_hook_address_count);
+#endif
     }
     PeakDetachRequest startup_requests[PEAK_GENERAL_CONTROLLER_MAX_BATCH_CANDIDATES];
     PeakGumTargetAttachPlan startup_plans[PEAK_GENERAL_CONTROLLER_MAX_BATCH_CANDIDATES];
     size_t startup_count = 0;
+#ifdef PEAK_ATTACH_RUNTIME
+    void** startup_pins = g_new0(void*, peak_hook_address_count);
+#endif
 #if defined(GUM_PEAK_REDIRECT_RESOLVER_API_VERSION) && \
     defined(GUM_PEAK_MAX_PROLOGUE_SIZE)
     gboolean guarded_startup_batch = !startup_attach_can_skip_stop &&
@@ -7966,7 +8073,6 @@ peak_general_listener_attach()
         } else {
             gboolean explicit_selector =
                 peak_symbol_should_use_cpp_map(peak_hook_strings[i]);
-            gboolean legacy_cxx_fallback = startup_legacy_cxx_fallback;
             gpointer ptr = startup_direct != NULL
                 ? startup_direct[i]
                 : peak_general_listener_find_function(peak_hook_strings[i]);
@@ -7977,7 +8083,7 @@ peak_general_listener_attach()
                 free(demangled);
             } else {
                 if (startup_resolutions != NULL &&
-                    (explicit_selector || legacy_cxx_fallback)) {
+                    (explicit_selector || startup_scan_direct_misses)) {
                     gboolean terminal = FALSE;
                     hook_address[i] = peak_general_listener_use_selector_resolution(
                         peak_hook_strings[i], startup_resolutions[i].result,
@@ -7997,6 +8103,34 @@ peak_general_listener_attach()
         }
         if (hook_address[i]) {
             gpointer resolved_hook_address = hook_address[i];
+#ifdef PEAK_ATTACH_RUNTIME
+            PeakTargetResolveRequest* selector = startup_resolutions != NULL ?
+                &startup_resolutions[i] : NULL;
+            PeakTargetSymbolCandidate* candidate =
+                selector != NULL && selector->result == PEAK_TARGET_RESOLVE_UNIQUE &&
+                    selector->resolution.candidates != NULL ?
+                g_ptr_array_index(selector->resolution.candidates, 0) : NULL;
+            if (candidate != NULL && candidate->address != resolved_hook_address)
+                candidate = NULL;
+            const char* expected_path = candidate != NULL ? candidate->module : NULL;
+            gboolean valid = dlopen_interceptor_pin_startup_target(resolved_hook_address,
+                expected_path, &startup_pins[i]);
+            if (valid && startup_pins[i] != NULL && candidate == NULL) {
+                valid = peak_general_listener_find_function(
+                    support != NULL ? support->wrapper : peak_hook_strings[i]) ==
+                    resolved_hook_address;
+            }
+            if (!valid) {
+                peak_log_debug("[peak] startup target owner unavailable for %s at %p\n",
+                               peak_hook_strings[i], resolved_hook_address);
+                dlopen_interceptor_finish_startup_pin(startup_pins[i], FALSE);
+                startup_pins[i] = NULL;
+                hook_address[i] = NULL;
+                g_clear_pointer(&peak_demangled_strings[i], g_free);
+                peak_dynamic_attach_needed = TRUE;
+                continue;
+            }
+#endif
             PeakGumTargetAttachPlan attach_plan;
             gboolean use_batch = FALSE;
 #if defined(GUM_PEAK_REDIRECT_RESOLVER_API_VERSION) && \
@@ -8089,6 +8223,14 @@ peak_general_listener_attach()
     peak_general_listener_initial_attach_batch(
         startup_requests, startup_plans, startup_count,
         startup_attach_can_skip_stop);
+#ifdef PEAK_ATTACH_RUNTIME
+    for (size_t i = 0; i < peak_hook_address_count; i++) {
+        dlopen_interceptor_finish_startup_pin(startup_pins[i],
+                                              array_listener[i] != NULL);
+    }
+    g_free(startup_pins);
+    peak_general_listener_release_snapshot_pins(snapshot_pins);
+#endif
     for (size_t i = 0; startup_resolutions != NULL &&
                        i < peak_hook_address_count; i++) {
         peak_target_resolution_clear(&startup_resolutions[i].resolution);

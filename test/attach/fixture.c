@@ -6,6 +6,7 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
 #ifdef __linux__
@@ -94,7 +95,8 @@ static void *filesystem_worker(void *unused) {
 }
 static void stop(int sig) { (void)sig; running = 0; }
 int main(int argc, char **argv) {
-    if (argc != 2) return 2;
+    int single_thread = argc == 3 && strcmp(argv[2], "--single-thread") == 0;
+    if (argc != 2 && !single_thread) return 2;
 #ifdef __linux__
     /* Permit this test's sibling injector under Yama without changing policy. */
     if (prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0) != 0) {
@@ -104,10 +106,12 @@ int main(int argc, char **argv) {
     signal(SIGTERM, stop); signal(SIGINT, stop);
     fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK);
     pthread_t filesystem_thread;
-    if (pthread_create(&filesystem_thread, NULL, filesystem_worker, NULL)) return 2;
     pthread_t workers[3];
-    for (int i = 0; i < 3; ++i)
-        if (pthread_create(&workers[i], NULL, worker, NULL)) return 2;
+    if (!single_thread) {
+        if (pthread_create(&filesystem_thread, NULL, filesystem_worker, NULL)) return 2;
+        for (int i = 0; i < 3; ++i)
+            if (pthread_create(&workers[i], NULL, worker, NULL)) return 2;
+    }
     while (running) {
         char command;
         if (read(STDIN_FILENO, &command, 1) == 1) {
@@ -129,18 +133,23 @@ int main(int argc, char **argv) {
                 fflush(stdout);
             }
         }
+        if (single_thread) peak_attach_existing_target();
         FILE *f = fopen(argv[1], "w");
         if (!f) return 2;
         fprintf(f, "%lu\n", atomic_load_explicit(&progress, memory_order_relaxed));
         fclose(f);
-        pthread_t thread;
-        if (pthread_create(&thread, NULL, short_worker, NULL)) return 2;
-        pthread_join(thread, NULL);
+        if (!single_thread) {
+            pthread_t thread;
+            if (pthread_create(&thread, NULL, short_worker, NULL)) return 2;
+            pthread_join(thread, NULL);
+        }
         struct timespec delay = {0, 20000000}; nanosleep(&delay, NULL);
     }
     running = 0;
-    for (int i = 0; i < 3; ++i) pthread_join(workers[i], NULL);
-    pthread_join(filesystem_thread, NULL);
+    if (!single_thread) {
+        for (int i = 0; i < 3; ++i) pthread_join(workers[i], NULL);
+        pthread_join(filesystem_thread, NULL);
+    }
     printf("statfs_errors=%lu\nstatfs_guarded_calls=%lu\nstatfs_bootstrap_eintr=%lu\n",
            atomic_load(&statfs_errors), atomic_load(&statfs_guarded_calls),
            atomic_load(&statfs_bootstrap_eintr));

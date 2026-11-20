@@ -165,7 +165,7 @@ parser.add_argument("--cli", type=Path, required=True)
 parser.add_argument("--agent", type=Path)
 parser.add_argument("--fixture", type=Path)
 parser.add_argument("--require-injection", action="store_true")
-parser.add_argument("--mode", choices=("cli", "runtime", "memory"), required=True)
+parser.add_argument("--mode", choices=("cli", "runtime", "memory", "calibration"), required=True)
 args = parser.parse_args()
 env = {k: v for k, v in os.environ.items()
        if not k.startswith(("PEAK_", "FLAME_"))
@@ -191,7 +191,10 @@ else:
         root = Path(directory)
         progress = root / "progress"
         log = (root / "fixture.log").open("w+")
-        target = subprocess.Popen([str(args.fixture.resolve()), str(progress)],
+        fixture_command = [str(args.fixture.resolve()), str(progress)]
+        if args.mode == "calibration":
+            fixture_command.append("--single-thread")
+        target = subprocess.Popen(fixture_command,
                                   env=env, stdin=subprocess.PIPE, stdout=log, stderr=log,
                                   start_new_session=True)
         target.peak_started_at = time.time()
@@ -203,6 +206,30 @@ else:
             alive(target, progress, root / "fixture.log")
             agent_options = ["--agent", str(args.agent.resolve())] if args.agent else []
             base = [cli, str(target.pid)] + agent_options
+            if args.mode == "calibration":
+                env.update(PEAK_MAX_NUM_THREADS="1", PEAK_HEARTBEAT_INTERVAL="0.05",
+                           PEAK_VERBOSITY="info", PEAK_OUTPUT_AGGREGATION="local")
+                prefix = root / "calibration"
+                code, output = run(base + ["--target", "peak_attach_existing_target",
+                                          "--output", str(prefix)], env)
+                assert code == 0, (output, fixture_evidence(target, root / "fixture.log"))
+                before = counter(progress)
+                wait_for(lambda: counter(progress) > before + 10, 3)
+                target.stdin.write(b"Q")
+                target.stdin.flush()
+                assert target.wait(timeout=8) == 0
+                logs = (root / "fixture.log").read_text()
+                assert "attach overhead calibration: callbacks=32000 excluded=1" in logs, logs
+                paths = list(root.glob("calibration*.csv"))
+                assert len(paths) == 1, paths
+                with paths[0].open() as stream:
+                    rows = [row for row in csv.DictReader(stream)
+                            if row.get("function") == "peak_attach_existing_target"]
+                assert rows and sum(int(row["count"]) for row in rows) > 0, rows
+                assert all(int(row["dropped_calls"]) == int(row["dropped_threads"]) == 0
+                           for row in rows), rows
+                print("attach_calibration_ok")
+                raise SystemExit(0)
             env.update(PEAK_HEARTBEAT_INTERVAL="0.05", PEAK_VERBOSITY="info",
                        PEAK_ENABLE_PER_TARGET_HEARTBEAT="1",
                        PEAK_ENABLE_GLOBAL_HEARTBEAT="1", PEAK_ENABLE_REATTACH="1",

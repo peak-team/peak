@@ -74,6 +74,12 @@ is captured when the command runs; it does not change the target's environment.
 PEAK's existing overhead controller may physically detach and reattach
 selected hooks while the attached runtime remains resident.
 
+PEAK keeps loader references for libraries that own successfully installed CPU
+hooks. A library can therefore remain mapped until process exit after the
+application closes its handle. On Linux, PEAK also checks currently loaded
+libraries once when dynamic attach opens, so a load completed during startup
+can satisfy a pending selector.
+
 Attach attempts are serialized. Protocol or configuration errors and other
 preflight rejections, such as an invalid selector, unsupported exec option,
 incompatible MPI state, or no requested profiling work, leave the process
@@ -103,8 +109,16 @@ Attach does not support `PEAK_EXEC_CHAIN` or `PEAK_EXEC_CHECKPOINT`; those
 features depend on loader interposition installed before the target starts.
 Automatic discovery of new dynamic libraries and the associated runtime
 `dlopen` attach queue are also unavailable on macOS. Linux CPU and memory
-attach have runtime coverage. CUDA and MPI attach paths currently have
-build-time coverage only, not end-to-end runtime validation.
+attach have runtime coverage. CUDA attach currently has build-time coverage.
+
+An attached MPI rank publishes its own local report. Attach any subset of
+ranks after `MPI_Init_thread` has completed with `MPI_THREAD_MULTIPLE`.
+Rank-local output is the default and can also be selected with
+`PEAK_OUTPUT_AGGREGATION=local`. Attach rejects MPI and socket aggregation for
+MPI ranks because those modes require all ranks to participate. Each attached
+rank follows the application's normal MPI finalization and prints its PEAK
+report at process exit. The heartbeat uses whole-wall timing. `PEAK_MPI_ACTIVE_CLOCK` requires
+startup interposition and a different MPI thread level.
 
 ## Permissions and platform details
 
