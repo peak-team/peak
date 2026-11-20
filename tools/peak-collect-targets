@@ -579,7 +579,7 @@ def main():
         raise CollectionError('interrupted by signal ' + str(signum))
     signal.signal(signal.SIGTERM, interrupted)
     signal.signal(signal.SIGINT, interrupted)
-    parser = argparse.ArgumentParser(description='Collect Linux ELF function selectors for PEAK_TARGET_FILE.',
+    parser = argparse.ArgumentParser(description='Build a PEAK_TARGET_FILE for a Linux executable or Python script.',
         epilog='Reads .symtab and .dynsym using readelf; stripped symbols and generated/JIT code cannot be recovered. '
         'Python static discovery follows filesystem imports and bundled shared libraries, but cannot infer arbitrary '
         'dynamic imports, ctypes paths, or conditional runtime paths. $LIB/$PLATFORM loader search entries require '
@@ -675,7 +675,7 @@ def main():
               file=sys.stderr)
         return 0
     except (CollectionError, OSError, ValueError, subprocess.TimeoutExpired) as error:
-        print('peak-collect-symbols: error: ' + str(error), file=sys.stderr)
+        print('peak-collect-targets: error: ' + str(error), file=sys.stderr)
         return 1
 
 

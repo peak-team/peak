@@ -226,7 +226,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 add_test(NAME test_peak_collect_symbols
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/test_collect_symbols.py
-            --collector ${PROJECT_SOURCE_DIR}/tools/peak-collect-symbols
+            --collector ${PROJECT_SOURCE_DIR}/tools/peak-collect-targets
             --cc ${CMAKE_C_COMPILER}
             --cxx ${CMAKE_CXX_COMPILER}
             --strip ${CMAKE_STRIP}

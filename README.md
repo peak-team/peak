@@ -234,14 +234,12 @@ profile/control/risk diagnostics are currently text-only. `PEAK_TARGET`,
 
 ### Collecting targets from a program
 
-On Linux, `peak-collect-symbols` writes a sorted, deduplicated
-`PEAK_TARGET_FILE`-compatible selector list. It reads ELF symbol tables and
-includes symbols from the target and its transitive shared libraries. Install
-Python 3 and `readelf` from binutils first. For a native executable, collect
-the list and pass it to PEAK:
+On Linux, `peak-collect-targets` finds functions in your program and its shared
+libraries and writes a target file for PEAK. Set `PEAK_TARGET_FILE` to that file
+when you run the program. Install Python 3 and `readelf` from binutils first.
 
 ```bash
-peak-collect-symbols ./target_application -o peak-targets.txt
+peak-collect-targets ./target_application -o peak-targets.txt
 PEAK_TARGET_FILE=peak-targets.txt \
 LD_PRELOAD=/path/to/libpeak.so \
 ./target_application
@@ -263,7 +261,7 @@ Because independent modules' load order is unknown, static discovery may
 include alternative dependency libraries for those modules.
 
 ```bash
-peak-collect-symbols app.py --python /path/to/python -o peak-targets.txt
+peak-collect-targets app.py --python /path/to/python -o peak-targets.txt
 PEAK_PROFILE_INTERPRETERS=1 \
 PEAK_TARGET_FILE=peak-targets.txt \
 LD_PRELOAD=/path/to/libpeak.so \
@@ -283,7 +281,7 @@ interpreter's baseline mappings and cannot discover libraries used only on
 other code paths. Script output is sent to stderr.
 
 ```bash
-peak-collect-symbols app.py --python /path/to/python --run-python \
+peak-collect-targets app.py --python /path/to/python --run-python \
   --timeout 30 -o peak-targets.txt -- script-arg1 -v
 ```
 
