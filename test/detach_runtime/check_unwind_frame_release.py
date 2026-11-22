@@ -28,7 +28,7 @@ def fn(s,name):
 models={'candidate':new,'late-clear-flag':new}
 results=[]
 for name,s in models.items():
- structs=s[s.index('typedef struct PeakUwFrame'):s.index('/* These existing fields')]
+ structs=s[s.index('typedef struct PeakUwFrame'):s.index('/* Keep the unwind state')]
  enter=fn(s,'peak_uw_enter');release=fn(s,'peak_uw_release')
  release=release.replace('  peak_uw_thread->free = f;','  peak_uw_thread->free = f;\n  boundary_hook();')
  if name=='late-clear-flag':

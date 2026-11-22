@@ -147,6 +147,10 @@ static size_t dynamic_attach_queue_length = 0;
 static GPtrArray* dynamic_attach_retained_handles = NULL;
 static GHashTable* dlopen_completed_fftw_modules = NULL;
 static __thread gboolean dynamic_attach_drain_reentrant = FALSE;
+#if defined(PEAK_ATTACH_RUNTIME) && defined(__linux__)
+static gboolean startup_reconcile_collecting;
+static GArray* startup_reconcile_requests;
+#endif
 static __thread gboolean dynamic_attach_internal_dlclose = FALSE;
 static unsigned long long dynamic_attach_enqueue_count = 0;
 static unsigned long long dynamic_attach_drain_count = 0;
@@ -1212,6 +1216,80 @@ dlopen_interceptor_retain_dynamic_handle(
     pthread_mutex_unlock(&dynamic_attach_gate_mutex);
 }
 
+#ifdef PEAK_ATTACH_RUNTIME
+gboolean
+dlopen_interceptor_pin_startup_target(gpointer address,
+                                       const char* expected_path,
+                                       void** handle_out)
+{
+    *handle_out = NULL;
+    GumModule* module = gum_process_find_module_by_address(
+        GUM_ADDRESS(gum_strip_code_pointer(address)));
+    if (module == NULL) {
+        return FALSE;
+    }
+    GumAddress base = gum_module_get_range(module)->base_address;
+    const char* path = gum_module_get_path(module);
+    if (expected_path != NULL &&
+        !peak_target_resolver_module_matches(expected_path, path)) {
+        g_object_unref(module);
+        return FALSE;
+    }
+    GumModule* main = gum_process_get_main_module();
+    if (main != NULL && base == gum_module_get_range(main)->base_address) {
+        g_object_unref(module);
+        return TRUE;
+    }
+
+    void* handle = path != NULL ? dlopen(path, RTLD_LAZY | RTLD_NOLOAD) : NULL;
+    gboolean matches = FALSE;
+    if (handle != NULL) {
+        Dl_info info;
+#if defined(__linux__)
+        struct link_map* actual = NULL;
+        struct link_map* retained = NULL;
+        matches = dladdr1(gum_strip_code_pointer(address), &info,
+                          (void**)&actual, RTLD_DL_LINKMAP) != 0 &&
+            dlinfo(handle, RTLD_DI_LINKMAP, &retained) == 0 &&
+            actual == retained &&
+            GUM_ADDRESS(info.dli_fbase) == base;
+#else
+        matches = dladdr(gum_strip_code_pointer(address), &info) != 0 &&
+            GUM_ADDRESS(info.dli_fbase) == base &&
+            info.dli_fname != NULL && strcmp(info.dli_fname, path) == 0;
+#endif
+    }
+    g_object_unref(module);
+    if (matches) {
+        *handle_out = handle;
+    } else if (handle != NULL) {
+        (void)dlopen_interceptor_internal_dlclose(handle);
+    }
+    return matches;
+}
+
+void
+dlopen_interceptor_finish_startup_pin(void* handle, gboolean installed)
+{
+    if (handle == NULL) {
+        return;
+    }
+    /* Startup finishes before the dynamic loader controller starts. */
+    if (installed &&
+        (dynamic_attach_retained_handles == NULL ||
+         !g_ptr_array_find(dynamic_attach_retained_handles, handle, NULL))) {
+        PeakDlopenDynamicAttachRequest request = {
+            .handle = handle,
+            .handle_owned = TRUE,
+        };
+        dlopen_interceptor_retain_dynamic_handle(&request, FALSE);
+    } else {
+        (void)dlopen_interceptor_internal_dlclose(handle);
+    }
+}
+
+#endif
+
 static gboolean
 dlopen_interceptor_loaded_module_identity(void* handle,
                                           const char* fallback_filename,
@@ -1661,14 +1739,19 @@ static gboolean
 dlopen_interceptor_begin_dynamic_attach_drain(size_t* initial_queue_length)
 {
     pthread_mutex_lock(&dynamic_attach_gate_mutex);
+    gboolean ready = dynamic_attach_queue_length != 0 &&
+        (dynamic_attach_queue[dynamic_attach_queue_head].state ==
+             PEAK_DLOPEN_REQUEST_READY ||
+         dynamic_attach_queue[dynamic_attach_queue_head].state ==
+             PEAK_DLOPEN_REQUEST_PIN_FAILED);
+#if defined(PEAK_ATTACH_RUNTIME) && defined(__linux__)
+    ready = !startup_reconcile_collecting &&
+        (ready || startup_reconcile_requests != NULL);
+#endif
     if (dynamic_attach_state != PEAK_DLOPEN_CONTROLLER_OPEN ||
         dynamic_attach_drain_active ||
         active_dlopen_callback_count != 0 ||
-        dynamic_attach_queue_length == 0 ||
-        (dynamic_attach_queue[dynamic_attach_queue_head].state !=
-             PEAK_DLOPEN_REQUEST_READY &&
-         dynamic_attach_queue[dynamic_attach_queue_head].state !=
-             PEAK_DLOPEN_REQUEST_PIN_FAILED)) {
+        !ready) {
         pthread_mutex_unlock(&dynamic_attach_gate_mutex);
         return FALSE;
     }
@@ -1771,6 +1854,19 @@ dlopen_interceptor_discard_dynamic_attach_queue(void)
     while (dlopen_interceptor_pop_dynamic_attach_request(&request)) {
         dlopen_interceptor_release_dynamic_attach_request(&request);
     }
+#if defined(PEAK_ATTACH_RUNTIME) && defined(__linux__)
+    pthread_mutex_lock(&dynamic_attach_gate_mutex);
+    GArray* requests = startup_reconcile_requests;
+    startup_reconcile_requests = NULL;
+    pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+    if (requests != NULL) {
+        for (guint i = 0; i < requests->len; i++) {
+            dlopen_interceptor_release_dynamic_attach_request(
+                &g_array_index(requests, PeakDlopenDynamicAttachRequest, i));
+        }
+        g_array_unref(requests);
+    }
+#endif
 }
 
 static uint64_t
@@ -2422,6 +2518,7 @@ dlopen_interceptor_initialize_attach_candidate(
         .interceptor = target_interceptor,
         .listener = candidate->listener,
         .operation = PEAK_DETACH_OPERATION_ATTACH,
+        .attach_options = &candidate->attach_plan.options,
         .blocked_pc_start = candidate->attach_plan.mutation_guard_size > 0
             ? candidate->attach_plan.mutation_address
             : NULL,
@@ -2502,14 +2599,15 @@ dlopen_interceptor_attach_candidate_scalar(
         return;
     }
 
-    gum_interceptor_begin_transaction(mutation_request->interceptor);
+    gboolean staged = peak_detach_controller_current_mutation_uses_physical_patch();
+    if (!staged) gum_interceptor_begin_transaction(mutation_request->interceptor);
     GumAttachReturn attach_status =
         peak_general_listener_gum_attach_target(
             mutation_request->interceptor,
             mutation_request->function_address,
             candidate->listener,
             &candidate->attach_plan);
-    gum_interceptor_end_transaction(mutation_request->interceptor);
+    if (!staged) gum_interceptor_end_transaction(mutation_request->interceptor);
     if (!peak_detach_controller_finish_hook_mutation(mutation_request,
                                                      &detach_status)) {
         peak_detach_controller_abort_after_failed_finish(
@@ -2553,7 +2651,8 @@ dlopen_interceptor_attach_candidate_batch(
         &detach_status);
 
     if (prepared_count > 0) {
-        gum_interceptor_begin_transaction(mutation_requests[0].interceptor);
+        gboolean staged = peak_detach_controller_current_mutation_uses_physical_patch();
+        if (!staged) gum_interceptor_begin_transaction(mutation_requests[0].interceptor);
         for (size_t i = 0; i < candidate_count; i++) {
             if (!batch_results[i].prepared) {
                 continue;
@@ -2565,7 +2664,7 @@ dlopen_interceptor_attach_candidate_batch(
                     candidates[i].listener,
                     &candidates[i].attach_plan);
         }
-        gum_interceptor_end_transaction(mutation_requests[0].interceptor);
+        if (!staged) gum_interceptor_end_transaction(mutation_requests[0].interceptor);
         if (!peak_detach_controller_finish_hook_mutation_batch(
                 &detach_status)) {
             peak_detach_controller_abort_after_failed_finish(
@@ -3266,6 +3365,100 @@ publish_resolved_targets:
     return PEAK_DLOPEN_ATTACH_DONE;
 }
 
+#if defined(PEAK_ATTACH_RUNTIME) && defined(__linux__)
+typedef struct {
+    ElfW(Addr) load_address;
+    char path[];
+} PeakStartupModule;
+
+static int
+dlopen_interceptor_snapshot_startup_module(struct dl_phdr_info* info,
+                                           size_t size, void* data)
+{
+    (void)size;
+    const char* path = info->dlpi_name;
+    if (path == NULL || path[0] == '\0') {
+        return 0;
+    }
+    size_t path_size = strlen(path) + 1;
+    PeakStartupModule* entry = g_malloc(sizeof(*entry) + path_size);
+    entry->load_address = info->dlpi_addr;
+    memcpy(entry->path, path, path_size);
+    g_ptr_array_add(data, entry);
+    return 0;
+}
+
+static GArray*
+dlopen_interceptor_collect_startup_requests(void)
+{
+    GArray* requests = g_array_new(FALSE, FALSE,
+                                   sizeof(PeakDlopenDynamicAttachRequest));
+    GPtrArray* modules = g_ptr_array_new_with_free_func(g_free);
+    GHashTable* seen = g_hash_table_new(g_direct_hash, g_direct_equal);
+    dl_iterate_phdr(dlopen_interceptor_snapshot_startup_module, modules);
+    for (guint i = 0; i < modules->len; i++) {
+        const PeakStartupModule* module = g_ptr_array_index(modules, i);
+        PeakDlopenDynamicAttachRequest request = {
+            .binding_flags = RTLD_LAZY,
+            .scope = PEAK_DLOPEN_ATTACH_ALL,
+            .state = PEAK_DLOPEN_REQUEST_READY,
+            .handle_owned = TRUE,
+        };
+        gum_interceptor_ignore_current_thread(dlopen_interceptor);
+        request.handle = dlopen(module->path, RTLD_LAZY | RTLD_NOLOAD);
+        gum_interceptor_unignore_current_thread(dlopen_interceptor);
+        if (request.handle == NULL) {
+            continue;
+        }
+        long namespace_id;
+        if (dlopen_interceptor_loaded_module_identity(
+                request.handle, module->path, &request.filename,
+                &request.module_token, &namespace_id) &&
+            namespace_id == LM_ID_BASE &&
+            ((struct link_map*)request.module_token)->l_addr == module->load_address &&
+            g_hash_table_add(seen, request.module_token)) {
+            g_array_append_val(requests, request);
+        } else {
+            dlopen_interceptor_release_dynamic_attach_request(&request);
+        }
+    }
+    g_hash_table_unref(seen);
+    g_ptr_array_unref(modules);
+    return requests;
+}
+
+static void
+dlopen_interceptor_reconcile_startup_modules(GPtrArray* handles_to_close)
+{
+    pthread_mutex_lock(&dynamic_attach_gate_mutex);
+    GArray* requests = startup_reconcile_requests;
+    startup_reconcile_requests = NULL;
+    pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+    if (requests == NULL) {
+        return;
+    }
+
+    /* Use the owned-request resolver without reserving a queue slot for every
+     * image observed in the snapshot. Only a deferred retry needs a slot. */
+    for (guint i = 0; i < requests->len; i++) {
+        PeakDlopenDynamicAttachRequest* request =
+            &g_array_index(requests, PeakDlopenDynamicAttachRequest, i);
+        PeakDlopenAttachResult result =
+            dlopen_interceptor_attach_from_request(request, handles_to_close);
+        if (result == PEAK_DLOPEN_ATTACH_RETRY &&
+            dlopen_interceptor_requeue_dynamic_attach_request(request)) {
+            continue;
+        }
+        void* handle_to_close =
+            dlopen_interceptor_release_dynamic_attach_request_metadata(request);
+        if (handle_to_close != NULL) {
+            g_ptr_array_add(handles_to_close, handle_to_close);
+        }
+    }
+    g_array_unref(requests);
+}
+#endif
+
 static void
 dlopen_interceptor_drain_dynamic_attach_queue_with_budget(size_t max_requests)
 {
@@ -3302,6 +3495,9 @@ dlopen_interceptor_drain_dynamic_attach_queue_with_budget(size_t max_requests)
 
     handles_to_close = g_ptr_array_new();
     dynamic_attach_drain_reentrant = TRUE;
+#if defined(PEAK_ATTACH_RUNTIME) && defined(__linux__)
+    dlopen_interceptor_reconcile_startup_modules(handles_to_close);
+#endif
     while (drained < drain_limit &&
            dlopen_interceptor_pop_dynamic_attach_request(&request)) {
         PeakDlopenAttachResult result =
@@ -3363,6 +3559,9 @@ dlopen_interceptor_drain_dynamic_attach_queue(void)
 void
 dlopen_interceptor_enable_dynamic_attach(void)
 {
+#if defined(PEAK_ATTACH_RUNTIME) && defined(__linux__)
+    gboolean collect = FALSE;
+#endif
     pthread_mutex_lock(&dynamic_attach_gate_mutex);
     if (dynamic_attach_state != PEAK_DLOPEN_CONTROLLER_SHUTTING_DOWN &&
         dlopen_interceptor != NULL &&
@@ -3381,8 +3580,27 @@ dlopen_interceptor_enable_dynamic_attach(void)
                               getpid(),
                               memory_order_release);
         dynamic_attach_state = PEAK_DLOPEN_CONTROLLER_OPEN;
+#if defined(PEAK_ATTACH_RUNTIME) && defined(__linux__)
+        startup_reconcile_collecting = TRUE;
+        active_dynamic_attach_count++;
+        collect = TRUE;
+#endif
     }
     pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+#if defined(PEAK_ATTACH_RUNTIME) && defined(__linux__)
+    if (collect) {
+        /* Loader calls may run constructors already in flight. Snapshot and
+         * pin with callback admission open and no active controller drain. */
+        GArray* requests = dlopen_interceptor_collect_startup_requests();
+        pthread_mutex_lock(&dynamic_attach_gate_mutex);
+        startup_reconcile_requests = requests;
+        startup_reconcile_collecting = FALSE;
+        active_dynamic_attach_count--;
+        pthread_cond_broadcast(&dynamic_attach_gate_cond);
+        pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+        peak_general_listener_controller_wake();
+    }
+#endif
 }
 
 gboolean
@@ -3660,12 +3878,16 @@ int dlopen_interceptor_attach()
         return attach_status;
     }
 
+    if (peak_detach_controller_current_mutation_uses_physical_patch()) {
+        attach_status = GUM_ATTACH_OK;
+    } else {
     gum_interceptor_begin_transaction(dlopen_interceptor);
     attach_status = gum_interceptor_attach(dlopen_interceptor,
                                            dlopen_hook_address,
                                            dlopen_listener,
                                            NULL);
     gum_interceptor_end_transaction(dlopen_interceptor);
+    }
     if (!startup_attach_can_skip_stop &&
         !peak_detach_controller_finish_hook_mutation(&mutation_request,
                                                      &detach_status)) {
@@ -3695,7 +3917,9 @@ int dlopen_interceptor_attach()
         .function_address = dlclose_hook_address,
         .interceptor = dlopen_interceptor,
         .listener = NULL,
-        .operation = PEAK_DETACH_OPERATION_REPLACE
+        .operation = PEAK_DETACH_OPERATION_REPLACE,
+        .replacement_function = (gpointer)&dlopen_interceptor_guarded_dlclose,
+        .original_function = (gpointer*)&original_dlclose
     };
     detach_status = PEAK_DETACH_STATUS_ERROR;
     peak_gum_module_mutation_begin();
@@ -3707,6 +3931,9 @@ int dlopen_interceptor_attach()
         peak_gum_module_mutation_end();
         goto rollback_dlopen_listener;
     }
+    if (peak_detach_controller_current_mutation_uses_physical_patch()) {
+        replace_status = GUM_REPLACE_OK;
+    } else {
     gum_interceptor_begin_transaction(dlopen_interceptor);
     replace_status =
         gum_interceptor_replace_fast(
@@ -3716,6 +3943,7 @@ int dlopen_interceptor_attach()
             (gpointer*)&original_dlclose,
             NULL);
     gum_interceptor_end_transaction(dlopen_interceptor);
+    }
     if (!startup_attach_can_skip_stop &&
         !peak_detach_controller_finish_hook_mutation(&replace_request,
                                                      &detach_status)) {
@@ -3749,6 +3977,10 @@ int dlopen_interceptor_attach()
     goto rollback_dlopen_listener;
 
 rollback_dlclose_guard:
+#ifdef PEAK_ATTACH_RUNTIME
+    peak_log_warn("[peak] dlopen broker startup failed; retaining resident support hooks and metadata\n");
+    return GUM_ATTACH_WRONG_SIGNATURE;
+#endif
     replace_request.operation = PEAK_DETACH_OPERATION_REVERT;
     detach_status = PEAK_DETACH_STATUS_ERROR;
     if (!dlopen_interceptor_revert_dlclose_guard(
@@ -3762,6 +3994,10 @@ rollback_dlclose_guard:
     }
 
 rollback_dlopen_listener:
+#ifdef PEAK_ATTACH_RUNTIME
+    peak_log_warn("[peak] dynamic-loader attach failed; retaining resident listener metadata\n");
+    return GUM_ATTACH_WRONG_SIGNATURE;
+#endif
     mutation_request.operation = PEAK_DETACH_OPERATION_SHUTDOWN;
     detach_status = PEAK_DETACH_STATUS_ERROR;
     peak_gum_module_mutation_begin();
@@ -3803,6 +4039,12 @@ rollback_dlopen_listener:
 
 gboolean dlopen_interceptor_dettach()
 {
+#ifdef PEAK_ATTACH_RUNTIME
+    /* Existing threads can still own Gum invocations during process exit.
+     * Close loader admission and drain the broker, retaining reachable Gum
+     * metadata and the dlclose trampoline with the resident attach image. */
+    return dlopen_interceptor_shutdown_dynamic_attach();
+#endif
     pthread_mutex_lock(&dynamic_attach_gate_mutex);
     atomic_store_explicit(&dlopen_listener_owner_pid,
                           0,

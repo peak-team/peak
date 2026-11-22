@@ -6,6 +6,10 @@ from pathlib import Path
 
 
 def expected_guard(path: Path) -> str:
+    # This isolated mock deliberately shares a vendor header basename with the
+    # low-gap Gum fixture; its guard must remain unique in a combined test TU.
+    if path.as_posix().endswith("test/darwin_controller_mock/include/frida-gum.h"):
+        return "PEAK_DARWIN_CONTROLLER_MOCK_FRIDA_GUM_H"
     stem = re.sub(r"[^A-Za-z0-9]+", "_", path.stem).upper()
     return f"PEAK_{stem}_H"
 

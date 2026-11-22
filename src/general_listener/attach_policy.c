@@ -4,16 +4,24 @@
 #include "internal/general_listener/runtime_config.h"
 #include "internal/unsafe_gum_prologue.h"
 #include "logging.h"
+#ifdef PEAK_ATTACH_RUNTIME
+#include "internal/filesystem_stat_guard.h"
+#endif
 
 #include <dirent.h>
 #include <errno.h>
 #include <pthread.h>
+#include <stdlib.h>
 #include <string.h>
 #if defined(__linux__)
 #include <dlfcn.h>
 #include <link.h>
 #include <sys/auxv.h>
 extern struct r_debug _r_debug __attribute__((weak));
+#if defined(PEAK_ATTACH_RUNTIME) && defined(PEAK_HAVE_GUM_PEAK_PC_API) && \
+    defined(__GLIBC__)
+extern void* __libc_calloc(size_t count, size_t size) __attribute__((weak));
+#endif
 #endif
 
 #if defined(__APPLE__) && \
@@ -102,6 +110,13 @@ peak_general_listener_attach_target_is_supported(const char* symbol_name,
 {
     const char* reason = NULL;
 
+#ifdef PEAK_ATTACH_RUNTIME
+    if (peak_filesystem_stat_guard_owns_address(address)) {
+        peak_log_warn("[peak] skipping profiling target %s: this entry is reserved for the filesystem-stat safety guard\n",
+                      symbol_name != NULL ? symbol_name : "<unknown>");
+        return FALSE;
+    }
+#endif
     peak_general_listener_init_attach_policy();
 
 #if defined(__linux__)
@@ -115,6 +130,20 @@ peak_general_listener_attach_target_is_supported(const char* symbol_name,
                       symbol_name != NULL ? symbol_name : "<unknown>");
         return FALSE;
     }
+#if defined(PEAK_ATTACH_RUNTIME) && defined(PEAK_HAVE_GUM_PEAK_PC_API)
+    /* pthread_setspecific can call calloc before writing Gum's guard.
+     * Protect the resolved entry and glibc's own entry if calloc is interposed. */
+    gboolean is_calloc = address == (gpointer)calloc;
+#ifdef __GLIBC__
+    is_calloc = is_calloc || address == (gpointer)__libc_calloc;
+#endif
+    if (address != NULL && is_calloc &&
+        !peak_gum_attach_guard_is_allocation_free()) {
+        peak_log_warn("[peak] skipping Gum attach for hook %s: Gum thread guard may allocate before it is set; target will remain unprofiled\n",
+                      symbol_name != NULL ? symbol_name : "<unknown>");
+        return FALSE;
+    }
+#endif
     /* PEAK's ownership wrappers require exclusive replacement of these
      * entries. An ordinary target listener would prevent that replacement.
      * The internal dlopen support listener calls this policy with its literal

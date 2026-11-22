@@ -17,6 +17,7 @@
 #endif
 #include <sys/ptrace.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #if defined(__x86_64__) || defined(__amd64__)
 #include <sys/user.h>
@@ -1417,6 +1418,11 @@ main(int argc, char** argv)
         return 2;
     }
 
+#ifdef SYS_close_range
+    /* Also cover launchers built on libc without spawn closefrom actions. */
+    if (fd == 3)
+        (void)syscall(SYS_close_range, 4U, ~0U, 0U);
+#endif
     if (send_response((int)fd, PEAK_DETACH_HELPER_STATUS_OK, 0, 0) != 0) {
         return 1;
     }

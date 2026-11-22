@@ -11,6 +11,9 @@
 #include <errno.h>
 #include <limits.h>
 #include <pthread.h>
+#ifdef PEAK_ATTACH_RUNTIME
+#include <spawn.h>
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -48,6 +51,9 @@ static _Atomic unsigned long long
     peak_detach_accounting_stop_window_wall_ns = 0;
 static _Atomic unsigned long long peak_detach_accounting_sequence = 0;
 static _Atomic int peak_detach_mpi_process = 0;
+#ifdef PEAK_ATTACH_RUNTIME
+static __thread gboolean peak_pthread_bootstrap_active;
+#endif
 
 static unsigned long long
 peak_detach_controller_seconds_to_ns(double seconds)
@@ -217,6 +223,69 @@ static struct sigaction previous_trap_action;
 static char resolved_helper_path[PATH_MAX];
 static char** configured_helper_env = NULL;
 static pthread_once_t helper_configuration_initialized = PTHREAD_ONCE_INIT;
+#if defined(PEAK_ATTACH_RUNTIME) && defined(PEAK_HAVE_GUM_PEAK_PC_API)
+typedef struct {
+    GumPeakStagedMutation* stage;
+    GumInterceptor* interceptor;
+    gpointer address;
+    gpointer canonical;
+    gpointer* original_output;
+    guint8 active[32], original[32];
+    guint size;
+} PeakAttachStage;
+static PeakAttachStage attach_stages[PEAK_DETACH_CONTROLLER_MAX_BATCH_REQUESTS];
+static size_t attach_stage_count;
+static void* attach_deferred_candidates;
+static void* attach_deferred_snapshot;
+
+static void
+peak_attach_finish_stages(gboolean committed)
+{
+    while (attach_stage_count != 0) {
+        PeakAttachStage* stage = &attach_stages[--attach_stage_count];
+        gum_interceptor_peak_finish_staged_mutation(stage->stage, committed);
+        if (!committed && stage->original_output != NULL)
+            *stage->original_output = NULL;
+        memset(stage, 0, sizeof(*stage));
+    }
+    free(attach_deferred_candidates);
+    free(attach_deferred_snapshot);
+    attach_deferred_candidates = attach_deferred_snapshot = NULL;
+}
+
+static gboolean
+peak_attach_prepare_stages(const PeakDetachRequest* requests, size_t count)
+{
+    if (count > PEAK_DETACH_CONTROLLER_MAX_BATCH_REQUESTS || attach_stage_count != 0)
+        return FALSE;
+    for (size_t i = 0; i < count; i++) {
+        const PeakDetachRequest* request = &requests[i];
+        if (request->operation != PEAK_DETACH_OPERATION_ATTACH &&
+            request->operation != PEAK_DETACH_OPERATION_REPLACE)
+            continue;
+        PeakAttachStage* stage = &attach_stages[attach_stage_count];
+        if (!gum_interceptor_peak_prepare_staged_mutation(request->interceptor,
+                request->function_address, request->listener, request->attach_options,
+                request->replacement_function, request->original_function,
+                &stage->stage)) {
+            peak_attach_finish_stages(FALSE);
+            return FALSE;
+        }
+        attach_stage_count++;
+        stage->interceptor = request->interceptor;
+        stage->address = request->function_address;
+        stage->original_output = request->original_function;
+        if (!gum_interceptor_peak_staged_mutation_patch(stage->stage,
+                &stage->canonical, stage->active, stage->original, &stage->size) ||
+            stage->size == 0 || stage->size > sizeof(stage->active)) {
+            peak_attach_finish_stages(FALSE);
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+#endif
+
 static PeakDetachHeldMutation held_mutation = { 0 };
 static PeakDetachPhysicalPatchRecord physical_patch_records[PEAK_DETACH_MAX_PHYSICAL_PATCH_RECORDS];
 /* Coordinator-only, protected by the mutation guard. */
@@ -724,6 +793,15 @@ peak_detach_controller_init_backend_configuration_once(void)
     }
 #endif
 
+#ifdef PEAK_ATTACH_RUNTIME
+    /* A dlopen-loaded runtime cannot interpose the application's already-bound
+     * signal APIs. Never reserve a signal or fall back to that backend. */
+    if (requested_backend == PEAK_DETACH_REQUESTED_BACKEND_SIGNAL) {
+        peak_log_warn("[peak] attach runtime requires the ptrace detach helper; PEAK_DETACH_BACKEND=signal cannot protect an already-running process\n");
+    }
+    requested_backend = PEAK_DETACH_REQUESTED_BACKEND_HELPER;
+    ptrace_requires_signal = FALSE;
+#endif
     configured_requested_backend = requested_backend;
     configured_auto_ptrace_requires_signal = ptrace_requires_signal;
     configured_auto_ptrace_scope = ptrace_scope;
@@ -1269,7 +1347,39 @@ peak_detach_controller_helper_env(void)
     return configured_helper_env;
 }
 
-#ifdef PEAK_HAVE_GUM_PEAK_PC_API
+#if defined(PEAK_ATTACH_RUNTIME)
+/* A running MPI process may already have registered an atfork handler
+ * that aborts on fork, e.g. libfabric's EFA provider. Spawn only the helper
+ * executable, with no application callbacks in the new process. */
+static int
+peak_detach_controller_spawn_helper(pid_t* pid, const char* path,
+                                    char* const argv[], char* const env[],
+                                    const int sockets[2])
+{
+    posix_spawn_file_actions_t actions;
+    int error = posix_spawn_file_actions_init(&actions);
+    if (error != 0)
+        return error;
+
+    error = posix_spawn_file_actions_addclose(&actions, sockets[0]);
+    if (error == 0)
+        error = posix_spawn_file_actions_adddup2(
+            &actions, sockets[1], PEAK_DETACH_HELPER_PROTOCOL_FD);
+    if (error == 0 && sockets[1] != PEAK_DETACH_HELPER_PROTOCOL_FD)
+        error = posix_spawn_file_actions_addclose(&actions, sockets[1]);
+#if defined(__GLIBC_PREREQ)
+#if __GLIBC_PREREQ(2, 34)
+    if (error == 0)
+        error = posix_spawn_file_actions_addclosefrom_np(
+            &actions, PEAK_DETACH_HELPER_PROTOCOL_FD + 1);
+#endif
+#endif
+    if (error == 0)
+        error = posix_spawn(pid, path, &actions, NULL, argv, env);
+    posix_spawn_file_actions_destroy(&actions);
+    return error;
+}
+#elif defined(PEAK_HAVE_GUM_PEAK_PC_API)
 static void
 peak_detach_controller_child_close_inherited_fds(int protocol_fd)
 {
@@ -1352,7 +1462,11 @@ peak_detach_controller_ensure_helper(PeakDetachStatus* status_out)
         return FALSE;
     }
 
-    if (!peak_detach_controller_thread_creation_gate_installed()) {
+    if (!peak_detach_controller_thread_creation_gate_installed()
+#ifdef PEAK_ATTACH_RUNTIME
+        && !peak_pthread_bootstrap_active
+#endif
+    ) {
         if (!warned_helper_gate_unavailable) {
             warned_helper_gate_unavailable = TRUE;
             g_printerr("[peak] strict helper detach requested, but pthread_create interception is not installed; refusing helper-backed physical mutation\n");
@@ -1388,7 +1502,11 @@ peak_detach_controller_ensure_helper(PeakDetachStatus* status_out)
         return FALSE;
     }
 
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) {
+    int socket_type = SOCK_STREAM;
+#ifdef PEAK_ATTACH_RUNTIME
+    socket_type |= SOCK_CLOEXEC;
+#endif
+    if (socketpair(AF_UNIX, socket_type, 0, sockets) != 0) {
         peak_detach_controller_note_failure_detail(
             "helper-socketpair",
             0,
@@ -1403,6 +1521,14 @@ peak_detach_controller_ensure_helper(PeakDetachStatus* status_out)
     }
 
     snprintf(fd_arg, sizeof(fd_arg), "%d", PEAK_DETACH_HELPER_PROTOCOL_FD);
+#ifdef PEAK_ATTACH_RUNTIME
+    char* const helper_argv[] = { (char*)path, fd_arg, NULL };
+    int spawn_error = peak_detach_controller_spawn_helper(
+        &pid, path, helper_argv, helper_env, sockets);
+    if (spawn_error != 0) {
+        peak_detach_controller_note_failure_detail(
+            "helper-spawn", 0, (uintptr_t)spawn_error, 0);
+#else
     pid = fork();
     if (pid < 0) {
         peak_detach_controller_note_failure_detail(
@@ -1410,6 +1536,7 @@ peak_detach_controller_ensure_helper(PeakDetachStatus* status_out)
             0,
             (uintptr_t)errno,
             0);
+#endif
         peak_detach_controller_raw_close(sockets[0]);
         peak_detach_controller_raw_close(sockets[1]);
         if (status_out != NULL) {
@@ -1418,6 +1545,7 @@ peak_detach_controller_ensure_helper(PeakDetachStatus* status_out)
         return FALSE;
     }
 
+#ifndef PEAK_ATTACH_RUNTIME
     if (pid == 0) {
         char* const helper_argv[] = { (char*)path, fd_arg, NULL };
         peak_detach_controller_raw_close(sockets[0]);
@@ -1425,6 +1553,7 @@ peak_detach_controller_ensure_helper(PeakDetachStatus* status_out)
         execve(path, helper_argv, helper_env);
         _exit(127);
     }
+#endif
 
     peak_detach_controller_raw_close(sockets[1]);
     helper_fd = sockets[0];
@@ -4444,6 +4573,24 @@ peak_detach_controller_append_physical_patch(const PeakDetachRequest* request,
                                              PeakDetachHeldMutation* mutation,
                                              PeakDetachStatus* status_out)
 {
+#if defined(PEAK_ATTACH_RUNTIME)
+    for (size_t i = 0; i < attach_stage_count; i++) {
+        PeakAttachStage* stage = &attach_stages[i];
+        if (stage->interceptor != request->interceptor || stage->address != request->function_address)
+            continue;
+        if (memcmp(stage->canonical, stage->original, stage->size) != 0 ||
+            !peak_detach_controller_append_write_instruction(mutation,
+                stage->canonical, stage->active, stage->size)) {
+            if (status_out != NULL) *status_out = PEAK_DETACH_STATUS_CLASSIFY_FAILED;
+            return FALSE;
+        }
+        mutation->uses_physical_patch = TRUE;
+        mutation->mutates_entry_bytes = TRUE;
+        mutation->mutates_gum_metadata = FALSE;
+        mutation->frees_listener_state = FALSE;
+        return TRUE;
+    }
+#endif
     if (request->operation != PEAK_DETACH_OPERATION_DETACH &&
         request->operation != PEAK_DETACH_OPERATION_REATTACH &&
         request->operation != PEAK_DETACH_OPERATION_SHUTDOWN &&
@@ -4931,8 +5078,35 @@ peak_detach_controller_configure_trace_diagnostics(gboolean enabled)
 #endif
 }
 
+#ifdef PEAK_ATTACH_RUNTIME
 gboolean
-peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
+peak_detach_controller_prepare_pthread_bootstrap(
+    const PeakDetachRequest* request, PeakDetachStatus* status_out)
+{
+    /* Do not advertise a creation gate until its listener really exists. The
+     * helper repeatedly stops and verifies every peer, including creators that
+     * crossed before the snapshot. The sole running controller must not create
+     * threads until finish. ATTACH rejects live entry PCs without evacuation. */
+    if (request == NULL || request->operation != PEAK_DETACH_OPERATION_ATTACH ||
+        request->symbol_name == NULL ||
+        strcmp(request->symbol_name, "pthread_create") != 0 ||
+        peak_pthread_bootstrap_active) {
+        if (status_out != NULL) *status_out = PEAK_DETACH_STATUS_ERROR;
+        return FALSE;
+    }
+    peak_pthread_bootstrap_active = TRUE;
+    gboolean prepared = peak_detach_controller_prepare_hook_mutation(request,
+                                                                     status_out);
+    peak_pthread_bootstrap_active = FALSE;
+    if (!prepared) {
+        peak_log_warn("[peak] attach pthread bootstrap could not stop the process safely; check ptrace permissions, an existing debugger, and PEAK_DETACH_HELPER\n");
+    }
+    return prepared;
+}
+#endif
+
+gboolean
+peak_detach_controller_prepare_hook_mutation_internal(const PeakDetachRequest* request,
                                              PeakDetachStatus* status_out)
 {
     peak_detach_controller_clear_failure_detail();
@@ -5213,6 +5387,26 @@ peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
 }
 
 gboolean
+peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
+                                             PeakDetachStatus* status_out)
+{
+#if defined(PEAK_ATTACH_RUNTIME) && defined(PEAK_HAVE_GUM_PEAK_PC_API)
+    peak_detach_controller_lock_mutation_guard();
+    if (held_mutation.active || request == NULL || !peak_attach_prepare_stages(request, 1)) {
+        if (status_out) *status_out = PEAK_DETACH_STATUS_ERROR;
+        peak_detach_controller_unlock_mutation_guard();
+        return FALSE;
+    }
+#endif
+    gboolean result = peak_detach_controller_prepare_hook_mutation_internal(request, status_out);
+#if defined(PEAK_ATTACH_RUNTIME) && defined(PEAK_HAVE_GUM_PEAK_PC_API)
+    if (!result) peak_attach_finish_stages(FALSE);
+    peak_detach_controller_unlock_mutation_guard();
+#endif
+    return result;
+}
+
+gboolean
 peak_detach_controller_strict_batch_supported(void)
 {
     if (peak_detach_controller_mode() == PEAK_SAFE_DETACH_MODE_COMPATIBILITY) {
@@ -5273,7 +5467,7 @@ peak_detach_controller_warmup_backend(void)
 }
 
 gboolean
-peak_detach_controller_prepare_hook_mutation_batch(
+peak_detach_controller_prepare_hook_mutation_batch_internal(
     const PeakDetachRequest* requests,
     size_t request_count,
     PeakDetachBatchResult* results,
@@ -5379,7 +5573,11 @@ peak_detach_controller_prepare_hook_mutation_batch(
         }
         if (requests[i].operation != PEAK_DETACH_OPERATION_ATTACH &&
             requests[i].operation != PEAK_DETACH_OPERATION_DETACH &&
-            requests[i].operation != PEAK_DETACH_OPERATION_REATTACH) {
+            requests[i].operation != PEAK_DETACH_OPERATION_REATTACH
+#ifdef PEAK_ATTACH_RUNTIME
+            && requests[i].operation != PEAK_DETACH_OPERATION_REPLACE
+#endif
+        ) {
             results[i].status = PEAK_DETACH_STATUS_UNSUPPORTED;
             continue;
         }
@@ -5628,6 +5826,10 @@ peak_detach_controller_prepare_hook_mutation_batch(
         goto fail_unlocked_after_resume;
     }
 
+#ifdef PEAK_ATTACH_RUNTIME
+    if (attach_stage_count != 0 && safe_count != usable_count)
+        safe_count = 0;
+#endif
     if (safe_count == 0) {
         PeakDetachStatus resume_status = PEAK_DETACH_STATUS_ERROR;
 
@@ -5717,8 +5919,13 @@ peak_detach_controller_prepare_hook_mutation_batch(
         *status_out = PEAK_DETACH_STATUS_SAFE;
     }
     peak_detach_controller_unlock_mutation_guard();
+#ifdef PEAK_ATTACH_RUNTIME
+    attach_deferred_snapshot = physical_patch_snapshot;
+    attach_deferred_candidates = candidates;
+#else
     free(physical_patch_snapshot);
     free(candidates);
+#endif
     return TRUE;
 
 fail_all_locked:
@@ -5825,6 +6032,37 @@ peak_detach_controller_threads_are_held(void)
 #endif
 
     return active;
+}
+
+gboolean
+peak_detach_controller_prepare_hook_mutation_batch(const PeakDetachRequest* requests,
+    size_t request_count, PeakDetachBatchResult* results, size_t* prepared_count_out,
+    PeakDetachStatus* status_out)
+{
+#if defined(PEAK_ATTACH_RUNTIME) && defined(PEAK_HAVE_GUM_PEAK_PC_API)
+    peak_detach_controller_lock_mutation_guard();
+    if (held_mutation.active || requests == NULL ||
+        !peak_attach_prepare_stages(requests, request_count)) {
+        if (prepared_count_out) *prepared_count_out = 0;
+        if (results != NULL) {
+            for (size_t i = 0; i < request_count; i++) {
+                results[i].prepared = FALSE;
+                results[i].uses_physical_patch = FALSE;
+                results[i].status = PEAK_DETACH_STATUS_ERROR;
+            }
+        }
+        if (status_out) *status_out = PEAK_DETACH_STATUS_ERROR;
+        peak_detach_controller_unlock_mutation_guard();
+        return FALSE;
+    }
+#endif
+    gboolean result = peak_detach_controller_prepare_hook_mutation_batch_internal(
+        requests, request_count, results, prepared_count_out, status_out);
+#if defined(PEAK_ATTACH_RUNTIME) && defined(PEAK_HAVE_GUM_PEAK_PC_API)
+    if (!result) peak_attach_finish_stages(FALSE);
+    peak_detach_controller_unlock_mutation_guard();
+#endif
+    return result;
 }
 
 gboolean
@@ -6035,6 +6273,9 @@ peak_detach_controller_finish_hook_mutation(const PeakDetachRequest* request,
 
         peak_detach_controller_note_stop_window_finished();
         peak_detach_controller_end_thread_creation_gate();
+#ifdef PEAK_ATTACH_RUNTIME
+        peak_attach_finish_stages(TRUE);
+#endif
         held_mutation.active = FALSE;
         held_mutation.uses_physical_patch = FALSE;
         held_mutation.mutates_entry_bytes = FALSE;

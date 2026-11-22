@@ -8,6 +8,12 @@
 
 #include "frida-gum.h"
 
+#if defined(PEAK_ATTACH_RUNTIME) && defined(__linux__) && \
+    defined(PEAK_HAVE_GUM_PEAK_PC_API)
+/** Whether Gum can set its Linux attach TLS guard without allocating. */
+gboolean peak_gum_attach_guard_is_allocation_free(void);
+#endif
+
 /** Initializes the process-wide attach policy from the environment once. */
 void peak_general_listener_init_attach_policy(void);
 
@@ -18,9 +24,10 @@ void peak_general_listener_init_attach_policy(void);
  * rejects targets that stock Gum would redirect to another entry because its
  * v1 backend has no exact-entry attach. That attribution check cannot be
  * overridden. Linux also rejects loader infrastructure, interceptor errno/TLS
- * primitives, and entries reserved by profiler support wrappers. These
- * infrastructure checks cannot be overridden. Otherwise, an unsafe override
- * bypasses the minimum-prologue and relocation-safety checks.
+ * primitives, and entries reserved by profiler support wrappers. Linux live
+ * attach also skips calloc if setting the interceptor TLS guard may allocate.
+ * These infrastructure checks cannot be overridden. Otherwise, an unsafe
+ * override bypasses the minimum-prologue and relocation-safety checks.
  */
 gboolean peak_general_listener_attach_target_is_supported(
     const char* symbol_name,

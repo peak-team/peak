@@ -160,6 +160,14 @@ peak_log_initialize_output(int fail_descriptor_dup_for_test)
 static PeakVerbosity
 peak_log_verbosity(void)
 {
+#ifdef PEAK_ATTACH_RUNTIME
+    /* Rejected preflight configurations may be replaced before activation. */
+    if (!peak_attach_runtime_attempt_is_terminal()) {
+        int valid;
+
+        return peak_log_parse_verbosity(getenv(PEAK_VERBOSITY_ENV), &valid);
+    }
+#endif
     peak_log_configure();
     return (PeakVerbosity)peak_log_cached_verbosity;
 }

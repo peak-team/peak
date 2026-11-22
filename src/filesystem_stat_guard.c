@@ -2,13 +2,21 @@
 #undef _FILE_OFFSET_BITS
 #endif
 #define _GNU_SOURCE
+#ifndef _LARGEFILE64_SOURCE
 #define _LARGEFILE64_SOURCE
+#endif
 #include "internal/filesystem_stat_guard.h"
+#if defined(PEAK_ATTACH_RUNTIME) && defined(__linux__)
+#include "detach_controller.h"
+#include "internal/gum_module_mutation.h"
+#include "logging.h"
+#endif
 #include <errno.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#include <string.h>
 #include <time.h>
 #if defined(__linux__)
 #include <dlfcn.h>
@@ -110,10 +118,17 @@ static void
 resolve_functions(void)
 {
     update_control(CONTROL_RESOLVING, CONTROL_RESOLVING);
-    next_statfs = dlsym(RTLD_NEXT, "statfs");
-    next_fstatfs = dlsym(RTLD_NEXT, "fstatfs");
-    next_statfs64 = dlsym(RTLD_NEXT, "statfs64");
-    next_fstatfs64 = dlsym(RTLD_NEXT, "fstatfs64");
+#ifdef PEAK_ATTACH_RUNTIME
+    /* This DSO is loaded after libc, so RTLD_NEXT cannot find earlier libc
+     * entries. Attached wrappers have private names and cannot resolve here. */
+    void *scope = RTLD_DEFAULT;
+#else
+    void *scope = RTLD_NEXT;
+#endif
+    next_statfs = dlsym(scope, "statfs");
+    next_fstatfs = dlsym(scope, "fstatfs");
+    next_statfs64 = dlsym(scope, "statfs64");
+    next_fstatfs64 = dlsym(scope, "fstatfs64");
     /* Register before any reader admission, independently of controller init. */
     fork_safe =
         pthread_atfork(NULL, NULL, peak_filesystem_stat_guard_after_fork_child) == 0;
@@ -427,8 +442,15 @@ cleanup_region(void *data)
     leave_region(index);
     atomic_store_explicit(&tokens[index - 1], 0, memory_order_seq_cst);
 }
+#ifdef PEAK_ATTACH_RUNTIME
+#define GUARD_WRAPPER_NAME(name) peak_attach_guard_##name
+#define GUARD_WRAPPER_SCOPE static
+#else
+#define GUARD_WRAPPER_NAME(name) name
+#define GUARD_WRAPPER_SCOPE __attribute__((visibility("default")))
+#endif
 #define WRAP(name, argtype, buftype, raw)                                         \
-    __attribute__((visibility("default"))) int name(argtype arg, buftype *buf)    \
+    GUARD_WRAPPER_SCOPE int GUARD_WRAPPER_NAME(name)(argtype arg, buftype *buf)     \
     {                                                                             \
         int incoming = errno;                                                     \
         if ((atomic_load_explicit(&control, memory_order_seq_cst) &                \
@@ -457,6 +479,152 @@ WRAP(statfs, const char *, struct statfs, RAW_STATFS)
 WRAP(fstatfs, int, struct statfs, RAW_FSTATFS)
 WRAP(statfs64, const char *, struct statfs64, RAW_STATFS)
 WRAP(fstatfs64, int, struct statfs64, RAW_FSTATFS)
+
+#ifdef PEAK_ATTACH_RUNTIME
+static _Atomic(uintptr_t) guarded_entries[4];
+
+int
+peak_filesystem_stat_guard_owns_address(const void *address)
+{
+    for (size_t i = 0; i < G_N_ELEMENTS(guarded_entries); i++)
+        if ((uintptr_t) address != 0 && (uintptr_t) address ==
+            atomic_load_explicit(&guarded_entries[i], memory_order_acquire))
+            return 1;
+    return 0;
+}
+
+int
+peak_filesystem_stat_guard_attach(void)
+{
+    const char *names[] = {"statfs", "fstatfs", "statfs64", "fstatfs64"};
+    gpointer wrappers[] = {peak_attach_guard_statfs, peak_attach_guard_fstatfs,
+        peak_attach_guard_statfs64, peak_attach_guard_fstatfs64};
+    gpointer targets[4], originals[4] = {NULL};
+    size_t owners[4], unique_count = 0, prepared_count = 0;
+    gboolean installed[4] = {FALSE}, success = TRUE;
+    PeakDetachRequest requests[4] = {0};
+    PeakDetachBatchResult results[4] = {0};
+    PeakDetachStatus status = PEAK_DETACH_STATUS_ERROR;
+    GumInterceptor *guard_interceptor;
+    int saved_errno = errno;
+
+    initialize();
+    if (!atomic_load_explicit(&resolved, memory_order_acquire) || !fork_safe) {
+        errno = saved_errno;
+        return 0;
+    }
+    targets[0] = (gpointer) next_statfs;
+    targets[1] = (gpointer) next_fstatfs;
+    targets[2] = (gpointer) next_statfs64;
+    targets[3] = (gpointer) next_fstatfs64;
+    guard_interceptor = gum_interceptor_obtain();
+    /* 64-bit libc commonly exports each native/64 pair at the same entry.
+     * Replace each address once; the ABI equality above covers those aliases. */
+    for (size_t i = 0; i < G_N_ELEMENTS(targets); i++) {
+        if (targets[i] == NULL) {
+            /* Native APIs are required; optional explicit-64 aliases can be
+             * absent on non-glibc systems. Never replace a null address. */
+            if (i < 2)
+                success = FALSE;
+            owners[i] = SIZE_MAX;
+            continue;
+        }
+        size_t owner;
+        for (owner = 0; owner < unique_count; owner++)
+            if (requests[owner].function_address == targets[i])
+                break;
+        owners[i] = owner;
+        if (owner != unique_count)
+            continue;
+        requests[unique_count] = (PeakDetachRequest){
+            .hook_id = SIZE_MAX - 48 - unique_count,
+            .symbol_name = names[i],
+            .function_address = targets[i],
+            .interceptor = guard_interceptor,
+            .operation = PEAK_DETACH_OPERATION_REPLACE,
+            .replacement_function = wrappers[i],
+            .original_function = &originals[unique_count],
+        };
+        unique_count++;
+    }
+    if (!success || unique_count == 0) {
+        g_object_unref(guard_interceptor);
+        errno = saved_errno;
+        return 0;
+    }
+    /* A preexisting caller may be stopped inside the short libc syscall
+     * prologue. No hook has been installed yet, so resume a partial window and
+     * retry boundedly rather than making safe attachment depend on one sample. */
+    for (unsigned attempt = 0; ; attempt++) {
+        prepared_count = 0;
+        memset(results, 0, sizeof(results));
+        peak_gum_module_mutation_begin();
+        gboolean prepared = peak_detach_controller_prepare_hook_mutation_batch(
+            requests, unique_count, results, &prepared_count, &status);
+        if (prepared && prepared_count == unique_count)
+            break;
+        PeakDetachStatus prepare_status = status;
+        if (prepared &&
+            !peak_detach_controller_finish_hook_mutation_batch(&status))
+            peak_detach_controller_abort_after_failed_finish(
+                "filesystem-stat attach refusal", status);
+        peak_gum_module_mutation_end();
+        gboolean retryable = prepare_status == PEAK_DETACH_STATUS_SAFE ||
+            prepare_status == PEAK_DETACH_STATUS_CLASSIFY_FAILED ||
+            prepare_status == PEAK_DETACH_STATUS_TIMEOUT ||
+            prepare_status == PEAK_DETACH_STATUS_FILESYSTEM_STAT_BUSY;
+        if (!retryable || attempt == 15) {
+            peak_log_warn("[peak] filesystem-stat guards could not obtain a safe attach window (%s; prepared %zu/%zu)\n",
+                          peak_detach_controller_status_string(prepare_status),
+                          prepared_count, unique_count);
+            g_object_unref(guard_interceptor);
+            errno = saved_errno;
+            return 0;
+        }
+        g_usleep(1000);
+    }
+    gboolean staged = peak_detach_controller_current_mutation_uses_physical_patch();
+    if (!staged) gum_interceptor_begin_transaction(guard_interceptor);
+    for (size_t i = 0; i < unique_count; i++) {
+        /* Standard replacements retain Gum's recursion protection during
+         * late TLS first touch and preserve the libc call through a trampoline. */
+        installed[i] = staged || gum_interceptor_replace(guard_interceptor,
+            requests[i].function_address, requests[i].replacement_function,
+            &originals[i], NULL) == GUM_REPLACE_OK;
+        success = success && installed[i];
+    }
+    if (!success) {
+        for (size_t i = 0; i < unique_count; i++)
+            if (installed[i])
+                gum_interceptor_revert(guard_interceptor,
+                                       requests[i].function_address);
+    } else {
+        next_statfs = (int (*)(const char *, struct statfs *)) originals[owners[0]];
+        next_fstatfs = (int (*)(int, struct statfs *)) originals[owners[1]];
+        if (owners[2] != SIZE_MAX)
+            next_statfs64 = (int (*)(const char *, struct statfs64 *)) originals[owners[2]];
+        if (owners[3] != SIZE_MAX)
+            next_fstatfs64 = (int (*)(int, struct statfs64 *)) originals[owners[3]];
+    }
+    if (!staged) gum_interceptor_end_transaction(guard_interceptor);
+    if (!peak_detach_controller_finish_hook_mutation_batch(&status))
+        peak_detach_controller_abort_after_failed_finish(
+            "filesystem-stat attach finish", status);
+    peak_gum_module_mutation_end();
+    if (!success)
+        peak_log_warn("[peak] filesystem-stat replacement failed; attachment was rolled back\n");
+    else
+        for (size_t i = 0; i < G_N_ELEMENTS(targets); i++)
+            atomic_store_explicit(&guarded_entries[i], (uintptr_t) targets[i],
+                                  memory_order_release);
+    /* Gum owns the installed replacement contexts; the library and guard
+     * state remain resident until process exit. Never revert these guards
+     * before the last PEAK physical stop window has completed. */
+    g_object_unref(guard_interceptor);
+    errno = saved_errno;
+    return success;
+}
+#endif
 #else
 unsigned long
 peak_filesystem_stat_guard_deferred_stop_count(void)
@@ -487,5 +655,17 @@ peak_filesystem_stat_guard_controller_after_fork_child(void)
 void
 peak_filesystem_stat_guard_after_fork_child(void)
 {
+}
+#endif
+
+#if defined(PEAK_ATTACH_RUNTIME) && !defined(__linux__)
+int peak_filesystem_stat_guard_attach(void)
+{
+    return 1;
+}
+int peak_filesystem_stat_guard_owns_address(const void *address)
+{
+    (void) address;
+    return 0;
 }
 #endif
