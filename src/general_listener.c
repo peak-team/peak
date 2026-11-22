@@ -5589,12 +5589,14 @@ void* peak_heartbeat_monitor(void* arg) {
                 reported_active_elapsed = total_execution_time;
                 reported_active_blocked = blocked;
                 last_active_budget = lifetime.budget;
-            } else if (blocked != PEAK_MPI_CLOCK_UNAVAILABLE) {
-                /* A raced snapshot cannot grant fresh lifetime headroom.
-                 * Recent hook rates still cover just one heartbeat interval. */
-                lifetime_target = peak_mpi_active_clock_carried_ratio(
-                    global_target_ratio, total_execution_time, last_active_budget);
+            } else {
+                /* Recent hook rates cover just one heartbeat interval. */
                 previous_active_blocked = -1.0;
+                if (blocked != PEAK_MPI_CLOCK_UNAVAILABLE) {
+                    /* A raced snapshot cannot grant fresh lifetime headroom. */
+                    lifetime_target = peak_mpi_active_clock_carried_ratio(
+                        global_target_ratio, total_execution_time, last_active_budget);
+                }
             }
         }
 #endif

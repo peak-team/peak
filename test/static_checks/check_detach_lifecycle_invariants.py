@@ -2067,6 +2067,12 @@ def check_stop_window_accounting_sidecar(repo_root):
     adaptive_sleep = heartbeat[
         adaptive_sleep_start:heartbeat.find("cleanup:", adaptive_sleep_start)
     ]
+    require(re.search(
+        r"\}\s*else\s*\{[^{}]*previous_active_blocked = -1\.0;\s*"
+        r"if \(blocked != PEAK_MPI_CLOCK_UNAVAILABLE\)\s*\{[^{}]*"
+        r"peak_mpi_active_clock_carried_ratio\(",
+        heartbeat,
+    ), "invalid MPI cuts must reset recent history and carry lifetime budget on races")
     require("ratio_snapshot[i] = ratio" in heartbeat and
             "rate_snapshot[i] = recent_rate" in heartbeat and
             "attached_recent_sum += recent_rate" in heartbeat and
