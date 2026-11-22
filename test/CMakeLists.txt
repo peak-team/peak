@@ -76,6 +76,16 @@ if(BUILD_TESTING)
     add_subdirectory(attach)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
        CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+        if(PEAK_GUM_PEAK_EXACT_ATTACH_API_AVAILABLE)
+            add_executable(test_gum_cfi_record gum_cfi/test_record.c)
+            target_include_directories(test_gum_cfi_record PRIVATE
+                ${FRIDA_GUM_INCLUDE_DIRS} ${PROJECT_SOURCE_DIR}/cmake/peak-gum)
+            target_compile_options(test_gum_cfi_record PRIVATE -UNDEBUG)
+            target_link_libraries(test_gum_cfi_record PRIVATE
+                ${FRIDA_GUM_LIBRARIES} Threads::Threads ${DL_LIBRARY}
+                ${RT_LIBRARY} ${RESOLV_LIBRARY} ${M_LIBRARY})
+            add_test(NAME test_gum_cfi_record COMMAND test_gum_cfi_record)
+        endif()
         add_test(NAME test_gum_low_gap_classifier
             COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/gum_low_gap/run_classifier.py
