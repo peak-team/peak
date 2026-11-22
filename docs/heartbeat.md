@@ -443,25 +443,19 @@ sleep_us =
   clip(heartbeat_time * scale, hb_min_us, hb_max_us)
 ```
 
-With the MPI active clock enabled, wrappers timestamp at most 16 consecutive
-eligible call boundaries per heartbeat. Each boundary advances an ordinal and
-publishes whether the initializing thread is inside a selected call. The
-ordinal matters because equal inside/outside values alone do not show whether
-one or more calls occurred in between. An unchanged ordinal with the same
-state identifies an interval without an eligible boundary. When every boundary
-through the heartbeat cut has a timestamp, their timestamps estimate the
-blocked portion of that interval. These are wrapper observations, so boundary
-timing includes a small amount of wrapper and scheduling delay.
+With the MPI active clock enabled, eligible MPI boundaries read a local
+low-cost clock. Linux uses `CLOCK_MONOTONIC_COARSE` and macOS uses
+`CLOCK_MONOTONIC_RAW_APPROX`. The rank qualifies clock availability and read
+cost with short startup batches. If the observed cost exceeds 20 ns per read
+in all batches, the rank uses the ordinary wall-time policy.
 
-After the timestamp allowance is exhausted, the heartbeat estimates the
-unobserved tail from the current state. An inside state counts the tail as
-blocked. An outside state grants at most the preceding requested sleep duration
-as active time; any excess or uncertain boundary gap counts as blocked. If the
-heartbeat is late, this cap prevents an outside observation from extending
-active credit across the missed time. The estimate can miss short compute gaps
-within dense communication. Saturated windows vary the next sleep by up to
-12.5 percent, clipped to the configured minimum and maximum, to reduce phase
-locking with periodic communication.
+The MPI thread keeps cumulative residence and the open call state in one
+atomic word. A heartbeat samples the same clock so a call in progress
+contributes to the estimate. The clock is quantized and may miss gaps shorter
+than a tick. The recent detach threshold allows one tick of uncertainty,
+while lifetime budgeting and reattach use the cumulative residence estimate.
+A raced snapshot carries the preceding lifetime allowance. A permanent
+writer-side clock failure restores the ordinary wall-time policy.
 
 With a valid MPI active-clock sample, including a retained sample when a
 later read races, the rate term uses `max(ema_global_rate, 0)`. Falling
@@ -540,12 +534,8 @@ process. `elapsed` is elapsed wall time in seconds, `blocked` is estimated time 
 blocking MPI calls in seconds, and `lifetime_target` is the resulting
 rank-local overhead budget expressed as a fraction. `configured_target` is
 the configured global overhead budget before that adjustment.
-`saturated_windows` counts heartbeat observations where more than 16 eligible
-call boundaries occurred. In these windows, the recent profiling rate is
-compared with the lifetime target because one MPI state observation is too
-noisy to set a separate recent target. The estimate describes rank-local
-wrapper state and cannot identify MPI-wide dependencies or bound whole-job
-slowdown.
+The estimate describes rank-local wrapper state and cannot identify MPI-wide
+dependencies or bound whole-job slowdown.
 
 ## Environment Variables and Defaults
 

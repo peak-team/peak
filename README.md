@@ -466,7 +466,7 @@ full output and teardown behavior.
 | `PEAK_GLOBAL_OVERHEAD_RATIO` | Global profiling-overhead ratio. Default: `0.1`. |
 | `PEAK_ENABLE_PER_TARGET_HEARTBEAT` | Enable per-target heartbeat detach decisions. Default: disabled. |
 | `PEAK_ENABLE_GLOBAL_HEARTBEAT` | Enable global heartbeat detach decisions. Default: enabled; set `0` or `false` to disable. |
-| `PEAK_MPI_ACTIVE_CLOCK` | Estimate local time available to produce profiling cost by discounting eligible blocking C MPI calls. Requires the global heartbeat, CPU targets, a multi-rank MPI world, and MPI SINGLE or FUNNELED. Default: enabled; set to `0` to disable. |
+| `PEAK_MPI_ACTIVE_CLOCK` | Estimate local time available to produce profiling cost by discounting eligible blocking C MPI calls. Requires the global heartbeat, CPU targets, a multi-rank MPI world, MPI SINGLE or FUNNELED, and a supported fast local clock. Default: enabled; set to `0` to disable. |
 | `PEAK_GLOBAL_DETACH_FACTOR` | Global detach hysteresis factor. Default: `1.2`. |
 | `PEAK_GLOBAL_REATTACH_FACTOR` | Global reattach hysteresis factor. Default: `0.85`. |
 | `PEAK_ENABLE_REATTACH` | Allow physical reattach. Default: enabled, but reattach also requires a running heartbeat, a nonzero hibernation cycle, and at least one enabled heartbeat policy. |
@@ -476,8 +476,9 @@ full output and teardown behavior.
 | `PEAK_HB_EMA_A` | Growth-rate EMA alpha in `(0, 1]`. Default: `0.3`. |
 
 The active clock estimates wall time inside selected blocking MPI calls on the
-thread that initialized MPI. It times sparse calls directly and samples MPI
-residence during bursts of short calls. [Sampling details](docs/heartbeat.md#adaptive-sleep).
+thread that initialized MPI. Eligible MPI boundaries read a low-cost local
+clock, and the heartbeat reads the resulting cumulative residence estimate.
+[Sampling details](docs/heartbeat.md#adaptive-sleep).
 
 Covered MPI and PMPI entry points are `Send`, `Ssend`, `Recv`, `Sendrecv`,
 `Barrier`, `Bcast`, `Reduce`, `Allreduce`, `Allgather`, `Alltoall`,
@@ -490,7 +491,7 @@ array with positive count and can include local, null, or inactive requests.
 A wait can contribute even when its request came from an unwrapped API.
 Time in `Test*`, unlisted MPI APIs, and calls that bypass interposition
 continues to count toward the otherwise applicable wall-time budget.
-Unsupported MPI thread modes use the ordinary local policy.
+Unsupported MPI thread modes or clocks use the ordinary local policy.
 
 MPI call residence can include computation, and other application threads
 can still run. The budget calculation treats all estimated profiling cost

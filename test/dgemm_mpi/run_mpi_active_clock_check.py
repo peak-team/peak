@@ -15,7 +15,7 @@ APPLICATION = re.compile(
 )
 HEARTBEAT = re.compile(
     r"\[peak mpi active clock\] pid=(\d+) elapsed=(\S+) blocked=(\S+) "
-    r"lifetime_target=(\S+) configured_target=(\S+) saturated_windows=(\d+)"
+    r"lifetime_target=(\S+) configured_target=(\S+)"
 )
 
 
@@ -36,7 +36,7 @@ def run(args, enabled, dense=False):
         "env", f"LD_PRELOAD={args.libpeak}", args.exe, *shlex.split(args.postflags),
     ]
     if dense:
-        command.append("dense")
+        command.append("--dense")
     with tempfile.TemporaryDirectory(prefix="peak-mpi-clock-") as directory:
         with subprocess.Popen(
             command, cwd=directory, env=env, stdout=subprocess.PIPE,
@@ -57,8 +57,8 @@ def run(args, enabled, dense=False):
         raise AssertionError(f"missing application success markers\n{output}")
     if "Report scope: aggregate (2 MPI ranks)" not in output or "Recorded calls: 4" not in output:
         raise AssertionError(f"missing aggregate report or target samples\n{output}")
-    samples = {pid: (*map(float, values), int(saturated))
-               for pid, *values, saturated in HEARTBEAT.findall(output)}
+    samples = {pid: tuple(map(float, values)) for pid, *values
+               in HEARTBEAT.findall(output)}
     if enabled == "0":
         if "[peak mpi active clock]" in output:
             raise AssertionError(f"disabled clock produced heartbeat samples\n{output}")
@@ -67,13 +67,11 @@ def run(args, enabled, dense=False):
     pid, waited, second_wait, dense_time, gap, recovery = application[0]
     if set(samples) != {pid for pid, *_ in application.values()}:
         raise AssertionError(f"missing per-rank heartbeat samples\n{output}")
-    elapsed, blocked, target, configured, saturated = samples[pid]
+    elapsed, blocked, target, configured = samples[pid]
     if not (waited >= 0.1 and waited / 2 <= blocked <= elapsed
             and 0 <= target < configured):
         raise AssertionError(f"heartbeat did not discount the first Wait ({waited:.3g}s)\n{output}")
     if dense:
-        if saturated == 0:
-            raise AssertionError(f"dense MPI never exhausted the timestamp quota\n{output}")
         combined_wait = waited + second_wait
         if not (second_wait >= 0.1 and blocked >= 0.8 * combined_wait):
             raise AssertionError(f"heartbeat lost a long Wait after dense MPI\n{output}")

@@ -5382,9 +5382,6 @@ void* peak_heartbeat_monitor(void* arg) {
     double reported_active_elapsed = 0.0;
     double reported_active_blocked = 0.0;
     double last_active_budget = -1.0;
-    unsigned saturated_windows = 0;
-    unsigned expected_us = 0;
-    uint32_t mpi_sample_random = (uint32_t)getpid() | UINT32_C(1);
 #endif
     size_t heartbeat_capacity = peak_hook_address_count;
     double min_detach_observation_time =
@@ -5396,9 +5393,6 @@ void* peak_heartbeat_monitor(void* arg) {
             (unsigned int)clipd((double)heartbeat_time,
                                 (double)hb_min_us,
                                 (double)hb_max_us);
-#ifdef HAVE_MPI
-        expected_us = initial_sleep_us;
-#endif
         if (!peak_heartbeat_wait_us(initial_sleep_us)) {
             goto cleanup;
         }
@@ -5414,11 +5408,9 @@ void* peak_heartbeat_monitor(void* arg) {
         double now = peak_second();
 #ifdef HAVE_MPI
         /* Read at the wall cut, before a hook scan can outlive an MPI call. */
-        bool mpi_saturated = false;
         double blocked = enable_global_heartbeat
-            ? peak_mpi_active_clock_blocked_seconds(
-                  peak_main_time, &now, expected_us, &mpi_saturated) : -1.0;
-        saturated_windows += mpi_saturated;
+            ? peak_mpi_active_clock_blocked_seconds(peak_main_time, &now)
+            : PEAK_MPI_CLOCK_UNAVAILABLE;
 #endif
 
         pthread_mutex_lock(&lock);
@@ -5575,18 +5567,19 @@ void* peak_heartbeat_monitor(void* arg) {
                 PeakMpiActiveClockPolicy lifetime = peak_mpi_active_clock_policy(
                     global_target_ratio, total_execution_time, blocked, cost);
                 lifetime_target = lifetime.ratio;
-                if (mpi_saturated) {
-                    /* A single endpoint is too noisy to set the recent
-                     * target. Use the pooled estimate for this pressure.
-                     */
-                    recent_target = lifetime_target;
-                } else if (previous_active_blocked >= 0.0 &&
+                if (previous_active_blocked >= 0.0 &&
                     total_execution_time > previous_active_elapsed &&
                     blocked >= previous_active_blocked && cost >= previous_active_cost) {
                     double recent_elapsed = total_execution_time - previous_active_elapsed;
+                    double recent_blocked = fmin(blocked - previous_active_blocked,
+                                                 recent_elapsed);
+                    /* A quantized cut can hide short active gaps. Leave one
+                     * clock tick of margin for recent detach pressure only.
+                     */
+                    recent_blocked = fmax(0.0, recent_blocked -
+                        peak_mpi_active_clock_quantum_seconds());
                     PeakMpiActiveClockPolicy recent = peak_mpi_active_clock_policy(
-                        global_target_ratio, recent_elapsed,
-                        fmin(blocked - previous_active_blocked, recent_elapsed),
+                        global_target_ratio, recent_elapsed, recent_blocked,
                         cost - previous_active_cost);
                     recent_target = recent.ratio;
                 }
@@ -5596,7 +5589,7 @@ void* peak_heartbeat_monitor(void* arg) {
                 reported_active_elapsed = total_execution_time;
                 reported_active_blocked = blocked;
                 last_active_budget = lifetime.budget;
-            } else {
+            } else if (blocked != PEAK_MPI_CLOCK_UNAVAILABLE) {
                 /* A raced snapshot cannot grant fresh lifetime headroom.
                  * Recent hook rates still cover just one heartbeat interval. */
                 lifetime_target = peak_mpi_active_clock_carried_ratio(
@@ -6083,7 +6076,7 @@ void* peak_heartbeat_monitor(void* arg) {
         double denominator = error_denominator + hb_k_rate * ema_global_rate;
 #ifdef HAVE_MPI
         /* A falling or unordered rate cannot cancel the active-clock budget error. */
-        if (reported_active_elapsed > 0.0)
+        if (reported_active_elapsed > 0.0 && blocked != PEAK_MPI_CLOCK_UNAVAILABLE)
             denominator = fmax(fmax(1.0, error_denominator), denominator);
 #endif
         double scale = 1.0 / denominator;
@@ -6092,21 +6085,6 @@ void* peak_heartbeat_monitor(void* arg) {
                                        (double)hb_min_us,
                                        (double)hb_max_us) + 0.5);
 
-#ifdef HAVE_MPI
-        if (mpi_saturated) {
-            /* Vary only the dense-clock observation cadence to avoid
-             * repeatedly observing the same phase of a periodic MPI loop.
-             */
-            unsigned spread = (unsigned)sleep_us / 8;
-            unsigned low = MAX((unsigned)sleep_us - spread, hb_min_us);
-            unsigned high = (unsigned)MIN(sleep_us + spread, hb_max_us);
-            mpi_sample_random ^= mpi_sample_random << 13;
-            mpi_sample_random ^= mpi_sample_random >> 17;
-            mpi_sample_random ^= mpi_sample_random << 5;
-            sleep_us = low + mpi_sample_random % (high - low + 1);
-        }
-        expected_us = (unsigned)sleep_us;
-#endif
         peak_general_listener_management_cpu_checkpoint(
             &management_cpu_checkpoint_ns,
             &management_cpu_checkpoint_valid);
@@ -6119,11 +6097,11 @@ cleanup:
 #ifdef HAVE_MPI
     if (reported_active_elapsed > 0.0) {
         peak_log_debug("[peak mpi active clock] pid=%ld elapsed=%.9g blocked=%.9g "
-                       "lifetime_target=%.9g configured_target=%.9g saturated_windows=%u\n",
+                       "lifetime_target=%.9g configured_target=%.9g\n",
                        (long)getpid(), reported_active_elapsed, reported_active_blocked,
                        peak_mpi_active_clock_carried_ratio(
                            global_target_ratio, reported_active_elapsed, last_active_budget),
-                       (double)global_target_ratio, saturated_windows);
+                       (double)global_target_ratio);
     }
 #endif
     pthread_mutex_lock(&lock);

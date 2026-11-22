@@ -54,7 +54,11 @@ wait_for_sum(int rank, int use_pmpi)
 int
 main(int argc, char **argv)
 {
-    const int dense = argc > 1 && strcmp(argv[1], "dense") == 0;
+    int dense = 0;
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--dense") == 0)
+            dense = 1;
+    }
     int rank, size, provided;
     if (MPI_Init_thread(NULL, NULL, MPI_THREAD_FUNNELED, &provided) != MPI_SUCCESS) {
         return 1;

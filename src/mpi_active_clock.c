@@ -19,39 +19,68 @@
 #define ACTIVE_CLOCK_API
 #endif
 
-enum { BOUNDARIES_PER_HEARTBEAT = 16 };
+#if defined(__linux__) && defined(__GNUC__) && !defined(PEAK_ATTACH_RUNTIME)
+#define ACTIVE_CLOCK_TLS __attribute__((tls_model("initial-exec")))
+#else
+#define ACTIVE_CLOCK_TLS
+#endif
 
-typedef struct {
-    uint64_t edge;
-    uint64_t timestamp_ns;
-} Boundary;
+#if defined(__linux__) && defined(CLOCK_MONOTONIC_COARSE)
+#define ACTIVE_CLOCK_ID CLOCK_MONOTONIC_COARSE
+#elif defined(__APPLE__)
+#define ACTIVE_CLOCK_ID CLOCK_MONOTONIC_RAW_APPROX
+#endif
 
-/* The application thread publishes its latest eligible MPI boundary. Odd
- * boundaries are entries and even boundaries are exits. The grant occupies
- * a separate cache line from the state written on every boundary.
+/* The low bit marks an open MPI call. The remaining bits hold completed
+ * residence when closed and completed residence minus entry time when open.
+ * Unsigned arithmetic keeps the signed offset in the same atomic word.
+ * UINT64_MAX marks permanent failure of the selected clock.
  */
-static _Alignas(64) _Atomic uint64_t edge_limit;
-static _Alignas(64) _Atomic uint64_t published_edge;
-static Boundary boundaries[BOUNDARIES_PER_HEARTBEAT];
+static _Atomic uint64_t residence_state;
 static _Atomic pid_t clock_owner;
 enum { WRITER_INACTIVE, WRITER_IDLE, WRITER_IN_MPI };
-static _Thread_local unsigned writer_state;
-static _Thread_local int world_rank;
+static _Thread_local unsigned writer_state ACTIVE_CLOCK_TLS;
+static _Thread_local int world_rank ACTIVE_CLOCK_TLS;
 static double clock_epoch;
+static double clock_quantum;
 
-/* Owned by the heartbeat after acquiring clock_owner. */
-static uint64_t last_edge, last_cut_ns, last_limit;
-static uint64_t blocked_ns;
-
-static uint64_t
-monotonic_ns(void)
+static inline uint64_t
+clock_ns(clockid_t clock)
 {
     struct timespec now;
-    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0 ||
-        (uint64_t)now.tv_sec > UINT64_MAX / UINT64_C(1000000000) - 1)
+    if (clock_gettime(clock, &now) != 0)
         return 0;
     return (uint64_t)now.tv_sec * UINT64_C(1000000000) +
            (uint64_t)now.tv_nsec;
+}
+
+static inline uint64_t
+sample_clock_ns(void)
+{
+#ifdef ACTIVE_CLOCK_ID
+    return clock_ns(ACTIVE_CLOCK_ID);
+#else
+    return 0;
+#endif
+}
+
+static bool
+sample_clock_available(void)
+{
+    enum { BATCH_SIZE = 128, MAX_CLOCK_NS = 20 };
+    if (!sample_clock_ns())
+        return false;
+    for (unsigned attempt = 0; attempt < 3; ++attempt) {
+        uint64_t before = clock_ns(CLOCK_MONOTONIC);
+        for (unsigned i = 0; i < BATCH_SIZE; ++i) {
+            if (!sample_clock_ns())
+                return false;
+        }
+        uint64_t after = clock_ns(CLOCK_MONOTONIC);
+        if (before && after >= before && after - before <= BATCH_SIZE * MAX_CLOCK_NS)
+            return true;
+    }
+    return false;
 }
 
 void
@@ -66,104 +95,86 @@ peak_mpi_active_clock_start(double runtime_start)
     if (PMPI_Query_thread(&level) != MPI_SUCCESS ||
         (level != MPI_THREAD_SINGLE && level != MPI_THREAD_FUNNELED) ||
         PMPI_Comm_size(MPI_COMM_WORLD, &size) != MPI_SUCCESS || size <= 1 ||
-        PMPI_Comm_rank(MPI_COMM_WORLD, &world_rank) != MPI_SUCCESS)
+        PMPI_Comm_rank(MPI_COMM_WORLD, &world_rank) != MPI_SUCCESS ||
+        !sample_clock_available())
         return;
 
-    /* PEAK publishes the runtime origin before enabling MPI wrappers. */
+#ifdef ACTIVE_CLOCK_ID
+    struct timespec resolution;
+    if (clock_getres(ACTIVE_CLOCK_ID, &resolution) != 0)
+        return;
+    clock_quantum = (double)resolution.tv_sec + (double)resolution.tv_nsec * 1e-9;
+#endif
     clock_epoch = runtime_start;
-    last_cut_ns = (uint64_t)(runtime_start * 1e9);
-    last_limit = BOUNDARIES_PER_HEARTBEAT;
-    atomic_store_explicit(&edge_limit, last_limit, memory_order_relaxed);
     writer_state = WRITER_IDLE;
     atomic_store_explicit(&clock_owner, getpid(), memory_order_release);
 }
 
-static inline void
-publish_boundary(void)
+static inline uint64_t
+open_interval(void)
 {
-    uint64_t edge = atomic_load_explicit(&published_edge, memory_order_relaxed) + 1;
-    uint64_t limit = atomic_load_explicit(&edge_limit, memory_order_acquire);
-    if (edge <= limit) {
-        Boundary* boundary = &boundaries[edge % BOUNDARIES_PER_HEARTBEAT];
-        boundary->edge = edge;
-        boundary->timestamp_ns = monotonic_ns();
-    }
-    atomic_store_explicit(&published_edge, edge, memory_order_release);
+    uint64_t completed = atomic_load_explicit(&residence_state, memory_order_relaxed);
+    if (completed == UINT64_MAX)
+        return UINT64_MAX;
+    uint64_t tick = sample_clock_ns();
+    uint64_t opened = tick ? (completed - (tick << 1)) | 1 : UINT64_MAX;
+    atomic_store_explicit(&residence_state, opened, memory_order_release);
+    return opened;
+}
+
+static inline void
+close_interval(uint64_t opened)
+{
+    uint64_t tick = sample_clock_ns();
+    uint64_t completed = tick ? opened + (tick << 1) - 1 : UINT64_MAX;
+    atomic_store_explicit(&residence_state, completed, memory_order_release);
 }
 
 double
-peak_mpi_active_clock_blocked_seconds(double runtime_start, double* now,
-                                     unsigned expected_us, bool* saturated)
+peak_mpi_active_clock_quantum_seconds(void)
 {
-    *saturated = false;
+    /* The caller has acquired the clock owner in a valid observation. */
+    return clock_quantum;
+}
+
+static inline uint64_t
+residence_at(uint64_t state, uint64_t tick)
+{
+    return ((state & 1) ? state + (tick << 1) : state) >> 1;
+}
+
+double
+peak_mpi_active_clock_blocked_seconds(double runtime_start, double* now)
+{
     pid_t owner = atomic_load_explicit(&clock_owner, memory_order_acquire);
     if (!owner || owner != getpid() || runtime_start != clock_epoch)
+        return PEAK_MPI_CLOCK_UNAVAILABLE;
+    if (!isfinite(*now) || *now <= runtime_start)
         return -1.0;
 
-    /* Bound the time represented by a state observation even if the
-     * heartbeat is descheduled while taking it.
+    /* Match residence and wall cuts within a short bracket. A dense MPI
+     * loop may change the open bit without changing residence at this tick.
      */
-    uint64_t before_read_ns = (uint64_t)(*now * 1e9);
-    uint64_t edge = atomic_load_explicit(&published_edge, memory_order_acquire);
-    uint64_t cut_ns = monotonic_ns();
-    bool state_unchanged = edge ==
-        atomic_load_explicit(&published_edge, memory_order_relaxed);
-    if (cut_ns < before_read_ns || cut_ns <= last_cut_ns)
-        return -1.0;
-
-    /* The edge load publishes completed timestamp slots. The old grant
-     * permits at most one turn through the array, so the writer can only
-     * reuse any slot we read after the next grant is published below.
-     */
-    uint64_t prefix_end = edge < last_limit ? edge : last_limit;
-    uint64_t cursor_ns = last_cut_ns;
-    uint64_t cursor_edge = last_edge;
-    uint64_t window_blocked = 0;
-    for (uint64_t i = last_edge + 1; i <= prefix_end; ++i) {
-        const Boundary* boundary = &boundaries[i % BOUNDARIES_PER_HEARTBEAT];
-        uint64_t timestamp_ns = boundary->timestamp_ns;
-        /* A writer may pass a boundary under the old grant before it
-         * sees the new limit. Its slot then still contains an older tag.
-         */
-        if (boundary->edge != i || timestamp_ns == 0 || timestamp_ns > cut_ns)
-            continue;
-        if (timestamp_ns < cursor_ns)
-            timestamp_ns = cursor_ns;
-        if ((cursor_edge & 1) || i != cursor_edge + 1)
-            window_blocked += timestamp_ns - cursor_ns;
-        cursor_ns = timestamp_ns;
-        cursor_edge = i;
+    uint64_t before = (uint64_t)(*now * 1e9);
+    for (unsigned attempt = 0; attempt < 2; ++attempt) {
+        uint64_t first = atomic_load_explicit(&residence_state, memory_order_acquire);
+        uint64_t tick = sample_clock_ns();
+        uint64_t after = clock_ns(CLOCK_MONOTONIC);
+        uint64_t second = atomic_load_explicit(&residence_state, memory_order_acquire);
+        if (first == UINT64_MAX || second == UINT64_MAX)
+            return PEAK_MPI_CLOCK_UNAVAILABLE;
+        if (!tick || !after)
+            return -1.0;
+        uint64_t residence = residence_at(first, tick);
+        if (after >= before && after - before <= 100000 &&
+            residence == residence_at(second, tick)) {
+            *now = (double)(after / UINT64_C(1000000000)) +
+                   (double)(after % UINT64_C(1000000000)) * 1e-9;
+            return fmin((double)residence * 1e-9, *now - runtime_start);
+        }
+        before = after;
     }
-
-    uint64_t tail_ns = cut_ns - cursor_ns;
-    uint64_t observed_tail_ns = before_read_ns > cursor_ns
-        ? before_read_ns - cursor_ns : 0;
-    *saturated = edge > last_limit;
-    if (cursor_edge == edge) {
-        if (edge & 1)
-            window_blocked += tail_ns;
-        else if (!state_unchanged)
-            window_blocked += tail_ns - observed_tail_ns;
-    } else if (*saturated && !(edge & 1)) {
-        /* An outside sample estimates the unmeasured tail. A delayed
-         * heartbeat cannot extrapolate that sample over missed time.
-         */
-        uint64_t expected_ns = (uint64_t)expected_us * 1000;
-        window_blocked += tail_ns - (observed_tail_ns < expected_ns
-            ? observed_tail_ns : expected_ns);
-    } else {
-        window_blocked += tail_ns;
-    }
-
-    blocked_ns += window_blocked;
-    last_cut_ns = cut_ns;
-    last_edge = edge;
-    last_limit = edge + BOUNDARIES_PER_HEARTBEAT;
-    atomic_store_explicit(&edge_limit, last_limit, memory_order_release);
-
-    *now = (double)(cut_ns / UINT64_C(1000000000)) +
-           (double)(cut_ns % UINT64_C(1000000000)) * 1e-9;
-    return fmin((double)blocked_ns * 1e-9, *now - runtime_start);
+    return -1.0;
 }
 
 static bool
@@ -216,12 +227,10 @@ remote_peer(MPI_Comm comm, int peer)
         if (writer_state != WRITER_IDLE)                                      \
             return next Arguments;                                            \
         writer_state = WRITER_IN_MPI;                                         \
-        bool eligible = (Eligible);                                           \
-        if (eligible)                                                         \
-            publish_boundary();                                               \
+        uint64_t opened = (Eligible) ? open_interval() : UINT64_MAX;          \
         int result = next Arguments;                                          \
-        if (eligible)                                                         \
-            publish_boundary();                                               \
+        if (opened != UINT64_MAX)                                             \
+            close_interval(opened);                                           \
         writer_state = WRITER_IDLE;                                           \
         return result;                                                        \
     }
