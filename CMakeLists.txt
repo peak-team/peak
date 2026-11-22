@@ -271,9 +271,10 @@ if(BUILD_TESTS)
 else()
     option(BUILD_TESTING "Build tests" OFF)
 endif()
-option(PEAK_ENABLE_RUNTIME_TEST_HOOKS
-    "Compile internal hooks into the PEAK runtime for runtime integration tests"
-    ${BUILD_TESTING})
+# Derive the default on every configure, while honoring explicit overrides.
+if(NOT DEFINED PEAK_ENABLE_RUNTIME_TEST_HOOKS)
+    set(PEAK_ENABLE_RUNTIME_TEST_HOOKS "${BUILD_TESTING}")
+endif()
 option(PEAK_BUILD_BENCHMARKS "Build PEAK benchmark/stress targets" OFF)
 option(PEAK_ENABLE_TSAN_TESTS "Enable ThreadSanitizer registry test flags" OFF)
 if(PEAK_ENABLE_FORTRAN_TESTS)

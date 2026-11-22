@@ -49,7 +49,7 @@ void peak_attach_churn_target(void) {
 static void *worker(void *unused) {
     (void)unused;
     while (running) {
-        volatile unsigned char *allocation = malloc(256);
+        volatile unsigned char *allocation = calloc(1, 256);
         if (!allocation) abort();
         allocation[0] = 17;
         free((void *)allocation);
@@ -96,7 +96,13 @@ static void *filesystem_worker(void *unused) {
 static void stop(int sig) { (void)sig; running = 0; }
 int main(int argc, char **argv) {
     int single_thread = argc == 3 && strcmp(argv[2], "--single-thread") == 0;
-    if (argc != 2 && !single_thread) return 2;
+    int reserve_keys = argc == 3 && strcmp(argv[2], "--reserve-keys") == 0;
+    if (argc != 2 && !single_thread && !reserve_keys) return 2;
+    if (reserve_keys) {
+        pthread_key_t key;
+        for (int i = 0; i < 64; ++i)
+            if (pthread_key_create(&key, NULL) != 0) return 2;
+    }
 #ifdef __linux__
     /* Permit this test's sibling injector under Yama without changing policy. */
     if (prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0) != 0) {

@@ -54,6 +54,12 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
             --cli $<TARGET_FILE:peak_attach> --agent $<TARGET_FILE:peak_attach_agent>
             --fixture $<TARGET_FILE:test_attach_fixture> --mode memory)
     set_tests_properties(test_attach_memory PROPERTIES TIMEOUT 100 SKIP_RETURN_CODE 77)
+    add_test(NAME test_attach_memory_guard_high_keys
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/run_attach.py
+            --cli $<TARGET_FILE:peak_attach> --agent $<TARGET_FILE:peak_attach_agent>
+            --fixture $<TARGET_FILE:test_attach_fixture> --mode memory_failure --reserve-keys)
+    set_tests_properties(test_attach_memory_guard_high_keys PROPERTIES TIMEOUT 70 SKIP_RETURN_CODE 77)
+
 endif()
 
 add_executable(test_attach_config config.c

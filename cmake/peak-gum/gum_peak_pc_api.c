@@ -1055,6 +1055,21 @@ peak_gum_get_interceptor_thread_context(void);
 #if defined(__linux__)
 G_GNUC_INTERNAL extern GumTlsKey peak_gum_interceptor_guard_key;
 
+#ifdef PEAK_GUM_DYNAMIC_TLS
+G_GNUC_INTERNAL gboolean
+peak_gum_attach_guard_is_allocation_free(void)
+{
+#ifdef __GLIBC__
+    /* glibc embeds keys 0..31 in each pthread. pthread_setspecific()
+     * may call calloc before storing the guard for a higher key. */
+    return peak_gum_interceptor_guard_key < 32;
+#else
+    return FALSE;
+#endif
+}
+#endif
+
+
 /* Bookkeeping may allocate or lock before a new thread's Gum context has
  * been published. Use Gum's own guard so nested hooks bypass both PEAK and
  * generic listener dispatch rather than recursively allocating a context. */

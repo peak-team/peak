@@ -165,6 +165,7 @@ parser.add_argument("--cli", type=Path, required=True)
 parser.add_argument("--agent", type=Path)
 parser.add_argument("--fixture", type=Path)
 parser.add_argument("--require-injection", action="store_true")
+parser.add_argument("--reserve-keys", action="store_true")
 parser.add_argument("--mode", choices=("cli", "runtime", "memory", "calibration", "memory_failure"), required=True)
 args = parser.parse_args()
 env = {k: v for k, v in os.environ.items()
@@ -194,7 +195,8 @@ else:
         fixture_command = [str(args.fixture.resolve()), str(progress)]
         if args.mode == "calibration":
             fixture_command.append("--single-thread")
-        target = subprocess.Popen(fixture_command,
+        fixture_args = ["--reserve-keys"] if args.reserve_keys else []
+        target = subprocess.Popen(fixture_command + fixture_args,
                                   env=env, stdin=subprocess.PIPE, stdout=log, stderr=log,
                                   cwd=root if args.mode == "memory_failure" else None,
                                   start_new_session=True)
@@ -210,8 +212,11 @@ else:
             if args.mode == "memory_failure":
                 memory = dict(env, PEAK_MEMORY_PROFILE="1", PEAK_HEARTBEAT_INTERVAL="0",
                               PEAK_OUTPUT_AGGREGATION="local")
+                reason = ("Gum thread guard may allocate before it is set" if args.reserve_keys
+                          else "allocator hook installation failed")
+                expected = f"memory not enabled ({reason})"
                 code, output = run(base + ["--output", str(root / "memory-report")], memory)
-                assert code != 0 and "memory not enabled (allocator hook installation failed)" in output, output
+                assert code != 0 and expected in output, output
                 assert "could not start any requested profiling backend" in output, output
                 alive(target, progress, root / "fixture.log")
                 target.stdin.write(b"Q")
@@ -221,7 +226,7 @@ else:
                 # Once hooks may be published, use a new process for the
                 # mixed request. The original activation claim is terminal.
                 mixed_progress = root / "mixed-progress"
-                mixed = subprocess.Popen([str(args.fixture.resolve()), str(mixed_progress)],
+                mixed = subprocess.Popen([str(args.fixture.resolve()), str(mixed_progress)] + fixture_args,
                                          env=env, stdin=subprocess.PIPE, stdout=log,
                                          stderr=log, cwd=root, start_new_session=True)
                 try:
@@ -230,7 +235,7 @@ else:
                     code, output = run([cli, str(mixed.pid)] + agent_options +
                         ["--target", "peak_attach_existing_target", "--target",
                          "peak_attach_churn_target", "--output", str(prefix)], memory)
-                    assert code == 0 and "memory not enabled (allocator hook installation failed)" in output, output
+                    assert code == 0 and expected in output, output
                     assert "2 installed, 0 pending, 0 skipped" in output, output
                     alive(mixed, mixed_progress, root / "fixture.log")
                     mixed.stdin.write(b"Q")

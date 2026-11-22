@@ -133,6 +133,10 @@ features depend on loader interposition installed before the target starts.
 Automatic discovery of new dynamic libraries and the associated runtime
 `dlopen` attach queue are also unavailable on macOS. Linux CPU and memory
 attach have runtime coverage. CUDA attach currently has build-time coverage.
+Linux memory attach requires Gum to set its per-thread guard without allocating.
+If the target has already reserved enough pthread keys that setting the guard
+could allocate, PEAK refuses memory profiling before installing allocator hooks.
+The startup summary reports that refusal and any CPU hooks that were installed.
 
 For MPI jobs, start the application with `MPI_Init_thread` and ensure it
 provides `MPI_THREAD_MULTIPLE` before attaching. This condition is required

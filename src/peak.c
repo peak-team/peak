@@ -1285,6 +1285,11 @@ peak_mpi_activation_policy_post_init(void)
 static size_t peak_attach_cpu_installed;
 static size_t peak_attach_cpu_pending;
 static size_t peak_attach_cpu_total;
+#if defined(__linux__) && defined(PEAK_HAVE_GUM_PEAK_PC_API)
+extern gboolean peak_gum_attach_guard_is_allocation_free(void);
+static gboolean peak_attach_memory_guard_refused;
+#endif
+
 
 static void
 peak_attach_capture_cpu_startup(void)
@@ -1526,6 +1531,16 @@ peak_activate_runtime(void)
         args->hb_k_rate = hb_k_rate;
         args->hb_ema_a = hb_ema_a;
     }
+#if defined(PEAK_ATTACH_RUNTIME) && defined(__linux__) && defined(PEAK_HAVE_GUM_PEAK_PC_API)
+    if (peak_memory_profile && !peak_gum_attach_guard_is_allocation_free()) {
+        peak_attach_memory_guard_refused = TRUE;
+        peak_memory_profile = FALSE;
+        peak_report_capability_note_failed(PEAK_CAPABILITY_MEMORY);
+        peak_report_snapshot_note_degraded(
+            PEAK_PROFILER_DEGRADED_MEMORY_TRACKING,
+            "Gum thread guard may allocate before it is set");
+    }
+#endif
     if (peak_memory_profile) {
         PeakMallocInterceptorAttachResult memory_attach_result =
             malloc_interceptor_attach();
@@ -2846,9 +2861,14 @@ peak_attach_runtime_start(char **message)
             g_string_append_printf(summary, ". %s enabled%s", backends[i].name,
                 capabilities.partial & flag ? " (partial coverage)" : "");
         } else {
+            const char* failure = capabilities.compiled & flag
+                ? backends[i].failure : "unavailable in this build";
+#if defined(__linux__) && defined(PEAK_HAVE_GUM_PEAK_PC_API)
+            if (flag == PEAK_CAPABILITY_MEMORY && peak_attach_memory_guard_refused)
+                failure = "Gum thread guard may allocate before it is set";
+#endif
             g_string_append_printf(summary, ". %s not enabled (%s)",
-                backends[i].name, capabilities.compiled & flag
-                    ? backends[i].failure : "unavailable in this build");
+                backends[i].name, failure);
         }
     }
     const char *output_prefix = getenv("PEAK_STATSLOG_PATH");
