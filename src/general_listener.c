@@ -5573,15 +5573,10 @@ void* peak_heartbeat_monitor(void* arg) {
                     double recent_elapsed = total_execution_time - previous_active_elapsed;
                     double recent_blocked = fmin(blocked - previous_active_blocked,
                                                  recent_elapsed);
-                    /* A quantized cut can hide short active gaps. Leave one
-                     * clock tick of margin for recent detach pressure only.
-                     */
-                    recent_blocked = fmax(0.0, recent_blocked -
-                        peak_mpi_active_clock_quantum_seconds());
-                    PeakMpiActiveClockPolicy recent = peak_mpi_active_clock_policy(
+                    recent_target = peak_mpi_active_clock_recent_ratio(
                         global_target_ratio, recent_elapsed, recent_blocked,
-                        cost - previous_active_cost);
-                    recent_target = recent.ratio;
+                        cost - previous_active_cost,
+                        peak_mpi_active_clock_quantum_seconds(), lifetime_target);
                 }
                 previous_active_elapsed = total_execution_time;
                 previous_active_blocked = blocked;

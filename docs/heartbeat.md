@@ -454,7 +454,8 @@ atomic word. A heartbeat samples the same clock so a call in progress
 contributes to the estimate. The clock is quantized and may miss gaps shorter
 than a tick. Periodic calls that coincide with successive ticks can also
 overestimate residency. The sampled estimate has no per-window error bound.
-The recent detach threshold allows one tick of uncertainty,
+The recent detach threshold allows one tick of uncertainty up to the lifetime
+target,
 while lifetime budgeting and reattach use the cumulative residence estimate.
 A raced snapshot carries the preceding lifetime allowance. A failed reader
 clock uses the ordinary wall-time policy for that cut. A permanent writer-side

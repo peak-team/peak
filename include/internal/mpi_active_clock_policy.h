@@ -33,6 +33,20 @@ static inline PeakMpiActiveClockPolicy peak_mpi_active_clock_policy(
     return decision;
 }
 
+/* One tick of uncertainty can restore recent detach allowance up to
+ * the lifetime target. Observed active time can justify a higher rate.
+ */
+static inline double peak_mpi_active_clock_recent_ratio(
+    double q, double elapsed, double blocking, double possible_overlap,
+    double quantum, double lifetime_ratio)
+{
+    double measured = peak_mpi_active_clock_policy(
+        q, elapsed, blocking, possible_overlap).ratio;
+    double upper = peak_mpi_active_clock_policy(
+        q, elapsed, fmax(0.0, blocking - quantum), possible_overlap).ratio;
+    return fmax(measured, fmin(upper, lifetime_ratio));
+}
+
 /* A missed snapshot carries the preceding allowance in seconds. A negative
  * budget denotes the absence of any valid clock observation. */
 static inline double peak_mpi_active_clock_carried_ratio(

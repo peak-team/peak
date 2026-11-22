@@ -2136,7 +2136,7 @@ def check_stop_window_accounting_sidecar(repo_root):
             "and reduce until both windows fit")
     require("double recent_target = global_target_ratio" in heartbeat and
             "double lifetime_target = global_target_ratio" in heartbeat and
-            "recent_target = recent.ratio" in heartbeat and
+            "recent_target = peak_mpi_active_clock_recent_ratio(" in heartbeat and
             "lifetime_target = lifetime.ratio" in heartbeat,
             "detach window targets must default to the configured ratio and use "
             "their matching active-clock decisions")

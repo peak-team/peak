@@ -84,6 +84,28 @@ static void test_missed_clock_snapshot(void)
     assert(equal(peak_mpi_active_clock_carried_ratio(2.0, 11.0, 0.0), 2.0));
 }
 
+static void test_recent_quantum_margin(void)
+{
+    const double q = 0.1;
+    const double tick = 0.010;
+
+    /* A heartbeat with one full tick of MPI cannot grant the wall rate. */
+    assert(equal(peak_mpi_active_clock_recent_ratio(
+        q, tick, tick, 0.0, tick, 0.003), 0.003));
+    /* A 19 ms wait still leaves measured credit in a 20 ms window. */
+    assert(equal(peak_mpi_active_clock_recent_ratio(
+        q, 0.020, 0.019, 0.0, tick, 0.003), 0.005));
+    /* A recent wait after compute cannot spend more than one uncertainty tick. */
+    assert(equal(peak_mpi_active_clock_recent_ratio(
+        q, 0.020, 0.020, 0.0, tick, 0.080), 0.050));
+    /* Recent compute after a long wait restores the measured rate immediately. */
+    assert(equal(peak_mpi_active_clock_recent_ratio(
+        q, tick, 0.0, 0.0, tick, 0.003), q));
+    /* Overlapping profiling cost stays in both allowances. */
+    assert(equal(peak_mpi_active_clock_recent_ratio(
+        q, tick, tick, 0.001, tick, 0.003), 0.010));
+}
+
 int main(void)
 {
     expect(20.0, 0.0, 0.0, 0.1, 2.0, 0);
@@ -109,4 +131,5 @@ int main(void)
     expect(NAN, 0.0, 0.0, 0.1, 0.0, 0);
     test_reattach_raw_budget();
     test_missed_clock_snapshot();
+    test_recent_quantum_margin();
 }
