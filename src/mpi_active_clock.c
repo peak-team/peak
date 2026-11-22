@@ -19,13 +19,29 @@
 #define ACTIVE_CLOCK_API
 #endif
 
-static _Atomic unsigned sequence;
-static _Atomic uint64_t open_ns, completed_ns, last_end_ns;
+enum { BOUNDARIES_PER_HEARTBEAT = 16 };
+
+typedef struct {
+    uint64_t edge;
+    uint64_t timestamp_ns;
+} Boundary;
+
+/* The application thread publishes its latest eligible MPI boundary. Odd
+ * boundaries are entries and even boundaries are exits. The grant occupies
+ * a separate cache line from the state written on every boundary.
+ */
+static _Alignas(64) _Atomic uint64_t edge_limit;
+static _Alignas(64) _Atomic uint64_t published_edge;
+static Boundary boundaries[BOUNDARIES_PER_HEARTBEAT];
 static _Atomic pid_t clock_owner;
-static _Thread_local pid_t writer_pid;
-static _Thread_local unsigned wrapper_depth;
+enum { WRITER_INACTIVE, WRITER_IDLE, WRITER_IN_MPI };
+static _Thread_local unsigned writer_state;
 static _Thread_local int world_rank;
 static double clock_epoch;
+
+/* Owned by the heartbeat after acquiring clock_owner. */
+static uint64_t last_edge, last_cut_ns, last_limit;
+static uint64_t blocked_ns;
 
 static uint64_t
 monotonic_ns(void)
@@ -42,7 +58,7 @@ void
 peak_mpi_active_clock_start(double runtime_start)
 {
     const char* enabled = getenv("PEAK_MPI_ACTIVE_CLOCK");
-    if (enabled == NULL || strcmp(enabled, "1") ||
+    if ((enabled != NULL && strcmp(enabled, "1")) ||
         !isfinite(runtime_start) || runtime_start <= 0.0)
         return;
 
@@ -55,66 +71,99 @@ peak_mpi_active_clock_start(double runtime_start)
 
     /* PEAK publishes the runtime origin before enabling MPI wrappers. */
     clock_epoch = runtime_start;
-    writer_pid = getpid();
-    atomic_store_explicit(&clock_owner, writer_pid, memory_order_release);
+    last_cut_ns = (uint64_t)(runtime_start * 1e9);
+    last_limit = BOUNDARIES_PER_HEARTBEAT;
+    atomic_store_explicit(&edge_limit, last_limit, memory_order_relaxed);
+    writer_state = WRITER_IDLE;
+    atomic_store_explicit(&clock_owner, getpid(), memory_order_release);
 }
 
-static void
-open_interval(void)
+static inline void
+publish_boundary(void)
 {
-    const uint64_t now = monotonic_ns();
-    if (!now)
-        return;
-    atomic_fetch_add_explicit(&sequence, 1, memory_order_acq_rel);
-    atomic_store_explicit(&open_ns, now, memory_order_relaxed);
-    atomic_fetch_add_explicit(&sequence, 1, memory_order_release);
-}
-
-static void
-close_interval(void)
-{
-    const uint64_t now = monotonic_ns();
-    uint64_t start = atomic_load_explicit(&open_ns, memory_order_relaxed);
-    if (!start)
-        return;
-    atomic_fetch_add_explicit(&sequence, 1, memory_order_acq_rel);
-    if (now >= start) {
-        /* Nonoverlapping monotonic intervals fit in the elapsed clock range. */
-        atomic_store_explicit(&completed_ns,
-            atomic_load_explicit(&completed_ns, memory_order_relaxed) +
-                now - start, memory_order_relaxed);
-        atomic_store_explicit(&last_end_ns, now, memory_order_relaxed);
+    uint64_t edge = atomic_load_explicit(&published_edge, memory_order_relaxed) + 1;
+    uint64_t limit = atomic_load_explicit(&edge_limit, memory_order_acquire);
+    if (edge <= limit) {
+        Boundary* boundary = &boundaries[edge % BOUNDARIES_PER_HEARTBEAT];
+        boundary->edge = edge;
+        boundary->timestamp_ns = monotonic_ns();
     }
-    atomic_store_explicit(&open_ns, 0, memory_order_relaxed);
-    atomic_fetch_add_explicit(&sequence, 1, memory_order_release);
+    atomic_store_explicit(&published_edge, edge, memory_order_release);
 }
 
 double
-peak_mpi_active_clock_blocked_seconds(double runtime_start, double now)
+peak_mpi_active_clock_blocked_seconds(double runtime_start, double* now,
+                                     unsigned expected_us, bool* saturated)
 {
+    *saturated = false;
     pid_t owner = atomic_load_explicit(&clock_owner, memory_order_acquire);
-    if (!owner || owner != getpid() || runtime_start != clock_epoch ||
-        !isfinite(now) || now <= runtime_start)
+    if (!owner || owner != getpid() || runtime_start != clock_epoch)
         return -1.0;
 
-    for (unsigned attempt = 0; attempt < 2; ++attempt) {
-        unsigned start = atomic_load_explicit(&sequence, memory_order_acquire);
-        if (start & 1)
+    /* Bound the time represented by a state observation even if the
+     * heartbeat is descheduled while taking it.
+     */
+    uint64_t before_read_ns = (uint64_t)(*now * 1e9);
+    uint64_t edge = atomic_load_explicit(&published_edge, memory_order_acquire);
+    uint64_t cut_ns = monotonic_ns();
+    bool state_unchanged = edge ==
+        atomic_load_explicit(&published_edge, memory_order_relaxed);
+    if (cut_ns < before_read_ns || cut_ns <= last_cut_ns)
+        return -1.0;
+
+    /* The edge load publishes completed timestamp slots. The old grant
+     * permits at most one turn through the array, so the writer can only
+     * reuse any slot we read after the next grant is published below.
+     */
+    uint64_t prefix_end = edge < last_limit ? edge : last_limit;
+    uint64_t cursor_ns = last_cut_ns;
+    uint64_t cursor_edge = last_edge;
+    uint64_t window_blocked = 0;
+    for (uint64_t i = last_edge + 1; i <= prefix_end; ++i) {
+        const Boundary* boundary = &boundaries[i % BOUNDARIES_PER_HEARTBEAT];
+        uint64_t timestamp_ns = boundary->timestamp_ns;
+        /* A writer may pass a boundary under the old grant before it
+         * sees the new limit. Its slot then still contains an older tag.
+         */
+        if (boundary->edge != i || timestamp_ns == 0 || timestamp_ns > cut_ns)
             continue;
-        uint64_t completed = atomic_load_explicit(&completed_ns, memory_order_relaxed);
-        uint64_t open = atomic_load_explicit(&open_ns, memory_order_relaxed);
-        uint64_t ended = atomic_load_explicit(&last_end_ns, memory_order_relaxed);
-        atomic_thread_fence(memory_order_acquire);
-        if (start != atomic_load_explicit(&sequence, memory_order_relaxed))
-            continue;
-        if ((double)ended * 1e-9 > now)
-            return -1.0; /* Completion crossed the heartbeat's wall cut. */
-        double open_seconds = (double)open * 1e-9;
-        double running = open && open_seconds < now
-            ? now - fmax(runtime_start, open_seconds) : 0.0;
-        return (double)completed * 1e-9 + running;
+        if (timestamp_ns < cursor_ns)
+            timestamp_ns = cursor_ns;
+        if ((cursor_edge & 1) || i != cursor_edge + 1)
+            window_blocked += timestamp_ns - cursor_ns;
+        cursor_ns = timestamp_ns;
+        cursor_edge = i;
     }
-    return -1.0;
+
+    uint64_t tail_ns = cut_ns - cursor_ns;
+    uint64_t observed_tail_ns = before_read_ns > cursor_ns
+        ? before_read_ns - cursor_ns : 0;
+    *saturated = edge > last_limit;
+    if (cursor_edge == edge) {
+        if (edge & 1)
+            window_blocked += tail_ns;
+        else if (!state_unchanged)
+            window_blocked += tail_ns - observed_tail_ns;
+    } else if (*saturated && !(edge & 1)) {
+        /* An outside sample estimates the unmeasured tail. A delayed
+         * heartbeat cannot extrapolate that sample over missed time.
+         */
+        uint64_t expected_ns = (uint64_t)expected_us * 1000;
+        window_blocked += tail_ns - (observed_tail_ns < expected_ns
+            ? observed_tail_ns : expected_ns);
+    } else {
+        window_blocked += tail_ns;
+    }
+
+    blocked_ns += window_blocked;
+    last_cut_ns = cut_ns;
+    last_edge = edge;
+    last_limit = edge + BOUNDARIES_PER_HEARTBEAT;
+    atomic_store_explicit(&edge_limit, last_limit, memory_order_release);
+
+    *now = (double)(cut_ns / UINT64_C(1000000000)) +
+           (double)(cut_ns % UINT64_C(1000000000)) * 1e-9;
+    return fmin((double)blocked_ns * 1e-9, *now - runtime_start);
 }
 
 static bool
@@ -138,31 +187,43 @@ remote_peer(MPI_Comm comm, int peer)
  */
 #define ACTIVE_SYMBOLS(Name, Parameters)                                      \
     typedef int (*Name##Fn) Parameters;                                       \
-    static Name##Fn next_mpi_##Name, next_pmpi_##Name;                          \
-    static pthread_once_t mpi_once_##Name = PTHREAD_ONCE_INIT;                  \
-    static pthread_once_t pmpi_once_##Name = PTHREAD_ONCE_INIT;                 \
+    static _Atomic(Name##Fn) next_mpi_##Name, next_pmpi_##Name;               \
+    static pthread_once_t mpi_once_##Name = PTHREAD_ONCE_INIT;                \
+    static pthread_once_t pmpi_once_##Name = PTHREAD_ONCE_INIT;               \
     static void resolve_mpi_##Name(void)                                      \
-    { next_mpi_##Name = (Name##Fn)dlsym(RTLD_NEXT, "MPI_" #Name); }             \
+    {                                                                         \
+        atomic_store_explicit(&next_mpi_##Name,                               \
+            (Name##Fn)dlsym(RTLD_NEXT, "MPI_" #Name), memory_order_release);  \
+    }                                                                         \
     static void resolve_pmpi_##Name(void)                                     \
-    { next_pmpi_##Name = (Name##Fn)dlsym(RTLD_NEXT, "PMPI_" #Name); }
+    {                                                                         \
+        atomic_store_explicit(&next_pmpi_##Name,                              \
+            (Name##Fn)dlsym(RTLD_NEXT, "PMPI_" #Name), memory_order_release); \
+    }
 
 #define ACTIVE_WRAPPER(Prefix, prefix, Name, Parameters, Arguments, Eligible) \
     ACTIVE_CLOCK_API int Prefix##_##Name Parameters                           \
-    {                                                                        \
-        pthread_once(&prefix##_once_##Name, resolve_##prefix##_##Name);       \
-        Name##Fn next = next_##prefix##_##Name;                               \
-        if (!next)                                                           \
-            return MPI_ERR_OTHER;                                            \
-        if (!writer_pid)                                                     \
-            return next Arguments;                                           \
-        bool eligible = wrapper_depth++ == 0 && (Eligible);                  \
-        if (eligible)                                                        \
-            open_interval();                                                 \
-        int result = next Arguments;                                         \
-        if (eligible)                                                        \
-            close_interval();                                                \
-        --wrapper_depth;                                                     \
-        return result;                                                       \
+    {                                                                         \
+        Name##Fn next = atomic_load_explicit(&next_##prefix##_##Name,         \
+                                              memory_order_acquire);          \
+        if (!next) {                                                          \
+            pthread_once(&prefix##_once_##Name, resolve_##prefix##_##Name);   \
+            next = atomic_load_explicit(&next_##prefix##_##Name,              \
+                                         memory_order_relaxed);               \
+            if (!next)                                                        \
+                return MPI_ERR_OTHER;                                         \
+        }                                                                     \
+        if (writer_state != WRITER_IDLE)                                      \
+            return next Arguments;                                            \
+        writer_state = WRITER_IN_MPI;                                         \
+        bool eligible = (Eligible);                                           \
+        if (eligible)                                                         \
+            publish_boundary();                                               \
+        int result = next Arguments;                                          \
+        if (eligible)                                                         \
+            publish_boundary();                                               \
+        writer_state = WRITER_IDLE;                                           \
+        return result;                                                        \
     }
 
 #define ACTIVE_CALL(Name, Parameters, Arguments, Eligible)                   \

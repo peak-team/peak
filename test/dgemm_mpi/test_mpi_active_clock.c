@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <mpi.h>
 #include <stdio.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -26,9 +27,34 @@ pause_ms(long milliseconds)
     }
 }
 
-int
-main(void)
+static void
+check_mpi(int result)
 {
+    if (result != MPI_SUCCESS) {
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+}
+
+static double
+wait_for_sum(int rank, int use_pmpi)
+{
+    MPI_Request request;
+    int input = rank + 1;
+    int sum = 0;
+    check_mpi(MPI_Iallreduce(&input, &sum, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD,
+                             &request));
+    double start = MPI_Wtime();
+    check_mpi(use_pmpi ? PMPI_Wait(&request, MPI_STATUS_IGNORE)
+                       : MPI_Wait(&request, MPI_STATUS_IGNORE));
+    double waited = MPI_Wtime() - start;
+    check_mpi(sum == 3 ? MPI_SUCCESS : MPI_ERR_OTHER);
+    return waited;
+}
+
+int
+main(int argc, char **argv)
+{
+    const int dense = argc > 1 && strcmp(argv[1], "dense") == 0;
     int rank, size, provided;
     if (MPI_Init_thread(NULL, NULL, MPI_THREAD_FUNNELED, &provided) != MPI_SUCCESS) {
         return 1;
@@ -60,31 +86,42 @@ main(void)
 
     volatile int work = 0;
     peak_mpi_active_clock_test_target(&work);
+    double dense_time = 0.0;
+    if (dense) {
+        int send = rank + 1;
+        int recv = 0;
+        double start = MPI_Wtime();
+        for (int i = 0; i < 32768; ++i) {
+            check_mpi(MPI_Allreduce(&send, &recv, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD));
+        }
+        dense_time = MPI_Wtime() - start;
+        check_mpi(recv == 3 ? MPI_SUCCESS : MPI_ERR_OTHER);
+    }
+
     if (rank == 1) {
         pause_ms(350);
     }
-
-    int input = rank + 1;
-    int sum = 0;
-    if (MPI_Iallreduce(&input, &sum, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD,
-                       &request) != MPI_SUCCESS) {
-        MPI_Abort(MPI_COMM_WORLD, 1);
-        return 1;
+    double waited = wait_for_sum(rank, dense);
+    double gap = 0.0;
+    double second_wait = 0.0;
+    if (dense) {
+        /* Give rank 0 a short application interval between long waits. */
+        double start = MPI_Wtime();
+        pause_ms(rank == 0 ? 60 : 350);
+        gap = MPI_Wtime() - start;
+        second_wait = wait_for_sum(rank, 0);
     }
-    const double start = MPI_Wtime();
-    if (MPI_Wait(&request, MPI_STATUS_IGNORE) != MPI_SUCCESS) {
-        MPI_Abort(MPI_COMM_WORLD, 1);
-        return 1;
-    }
-    const double waited = MPI_Wtime() - start;
     peak_mpi_active_clock_test_target(&work);
 
-    /* Give the global heartbeat several observations after Wait completes. */
-    pause_ms(120);
-    if (sum != 3 || work != 2 || MPI_Finalize() != MPI_SUCCESS) {
+    /* Check that the heartbeat recovers active credit without another MPI call. */
+    double start = MPI_Wtime();
+    pause_ms(dense ? 250 : 120);
+    double recovery = MPI_Wtime() - start;
+    if (work != 2 || MPI_Finalize() != MPI_SUCCESS) {
         return 1;
     }
-    printf("mpi_active_clock_ok rank=%d pid=%ld wait=%.9g\n",
-           rank, (long)getpid(), waited);
+    printf("mpi_active_clock_ok rank=%d pid=%ld wait=%.9g second_wait=%.9g "
+           "dense=%.9g gap=%.9g recovery=%.9g\n",
+           rank, (long)getpid(), waited, second_wait, dense_time, gap, recovery);
     return 0;
 }

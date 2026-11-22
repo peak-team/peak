@@ -5382,6 +5382,9 @@ void* peak_heartbeat_monitor(void* arg) {
     double reported_active_elapsed = 0.0;
     double reported_active_blocked = 0.0;
     double last_active_budget = -1.0;
+    unsigned saturated_windows = 0;
+    unsigned expected_us = 0;
+    uint32_t mpi_sample_random = (uint32_t)getpid() | UINT32_C(1);
 #endif
     size_t heartbeat_capacity = peak_hook_address_count;
     double min_detach_observation_time =
@@ -5393,6 +5396,9 @@ void* peak_heartbeat_monitor(void* arg) {
             (unsigned int)clipd((double)heartbeat_time,
                                 (double)hb_min_us,
                                 (double)hb_max_us);
+#ifdef HAVE_MPI
+        expected_us = initial_sleep_us;
+#endif
         if (!peak_heartbeat_wait_us(initial_sleep_us)) {
             goto cleanup;
         }
@@ -5408,8 +5414,11 @@ void* peak_heartbeat_monitor(void* arg) {
         double now = peak_second();
 #ifdef HAVE_MPI
         /* Read at the wall cut, before a hook scan can outlive an MPI call. */
+        bool mpi_saturated = false;
         double blocked = enable_global_heartbeat
-            ? peak_mpi_active_clock_blocked_seconds(peak_main_time, now) : -1.0;
+            ? peak_mpi_active_clock_blocked_seconds(
+                  peak_main_time, &now, expected_us, &mpi_saturated) : -1.0;
+        saturated_windows += mpi_saturated;
 #endif
 
         pthread_mutex_lock(&lock);
@@ -5569,9 +5578,11 @@ void* peak_heartbeat_monitor(void* arg) {
                 if (previous_active_blocked >= 0.0 &&
                     total_execution_time > previous_active_elapsed &&
                     blocked >= previous_active_blocked && cost >= previous_active_cost) {
+                    double recent_elapsed = total_execution_time - previous_active_elapsed;
                     PeakMpiActiveClockPolicy recent = peak_mpi_active_clock_policy(
-                        global_target_ratio, total_execution_time - previous_active_elapsed,
-                        blocked - previous_active_blocked, cost - previous_active_cost);
+                        global_target_ratio, recent_elapsed,
+                        fmin(blocked - previous_active_blocked, recent_elapsed),
+                        cost - previous_active_cost);
                     recent_target = recent.ratio;
                 }
                 previous_active_elapsed = total_execution_time;
@@ -6076,6 +6087,21 @@ void* peak_heartbeat_monitor(void* arg) {
                                        (double)hb_min_us,
                                        (double)hb_max_us) + 0.5);
 
+#ifdef HAVE_MPI
+        if (mpi_saturated) {
+            /* Vary only the dense-clock observation cadence to avoid
+             * repeatedly observing the same phase of a periodic MPI loop.
+             */
+            unsigned spread = (unsigned)sleep_us / 8;
+            unsigned low = MAX((unsigned)sleep_us - spread, hb_min_us);
+            unsigned high = (unsigned)MIN(sleep_us + spread, hb_max_us);
+            mpi_sample_random ^= mpi_sample_random << 13;
+            mpi_sample_random ^= mpi_sample_random >> 17;
+            mpi_sample_random ^= mpi_sample_random << 5;
+            sleep_us = low + mpi_sample_random % (high - low + 1);
+        }
+        expected_us = (unsigned)sleep_us;
+#endif
         peak_general_listener_management_cpu_checkpoint(
             &management_cpu_checkpoint_ns,
             &management_cpu_checkpoint_valid);
@@ -6088,11 +6114,11 @@ cleanup:
 #ifdef HAVE_MPI
     if (reported_active_elapsed > 0.0) {
         peak_log_debug("[peak mpi active clock] pid=%ld elapsed=%.9g blocked=%.9g "
-                       "lifetime_target=%.9g configured_target=%.9g\n",
+                       "lifetime_target=%.9g configured_target=%.9g saturated_windows=%u\n",
                        (long)getpid(), reported_active_elapsed, reported_active_blocked,
                        peak_mpi_active_clock_carried_ratio(
                            global_target_ratio, reported_active_elapsed, last_active_budget),
-                       (double)global_target_ratio);
+                       (double)global_target_ratio, saturated_windows);
     }
 #endif
     pthread_mutex_lock(&lock);

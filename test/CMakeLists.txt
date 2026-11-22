@@ -2501,7 +2501,7 @@ if(BUILD_TESTING)
                         --libpeak $<TARGET_FILE:peak>
                         "--preflags=${_PEAK_MPIEXEC_PREFLAGS_STRING}"
                         "--postflags=${_PEAK_MPIEXEC_POSTFLAGS_STRING}")
-            set_tests_properties(test_mpi_active_clock PROPERTIES TIMEOUT 35 PROCESSORS 2)
+            set_tests_properties(test_mpi_active_clock PROPERTIES TIMEOUT 65 PROCESSORS 2)
         endif()
         if(_PEAK_MPI_REPORT_TRANSPORT_AVAILABLE)
             add_test(NAME test_mpi_report_transport

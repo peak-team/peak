@@ -443,6 +443,26 @@ sleep_us =
   clip(heartbeat_time * scale, hb_min_us, hb_max_us)
 ```
 
+With the MPI active clock enabled, wrappers timestamp at most 16 consecutive
+eligible call boundaries per heartbeat. Each boundary advances an ordinal and
+publishes whether the initializing thread is inside a selected call. The
+ordinal matters because equal inside/outside values alone do not show whether
+one or more calls occurred in between. An unchanged ordinal with the same
+state identifies an interval without an eligible boundary. When every boundary
+through the heartbeat cut has a timestamp, their timestamps estimate the
+blocked portion of that interval. These are wrapper observations, so boundary
+timing includes a small amount of wrapper and scheduling delay.
+
+After the timestamp allowance is exhausted, the heartbeat estimates the
+unobserved tail from the current state. An inside state counts the tail as
+blocked. An outside state grants at most the preceding requested sleep duration
+as active time; any excess or uncertain boundary gap counts as blocked. If the
+heartbeat is late, this cap prevents an outside observation from extending
+active credit across the missed time. The estimate can miss short compute gaps
+within dense communication. Saturated windows vary the next sleep by up to
+12.5 percent, clipped to the configured minimum and maximum, to reduce phase
+locking with periodic communication.
+
 With a valid MPI active-clock sample, including a retained sample when a
 later read races, the rate term uses `max(ema_global_rate, 0)`. Falling
 pressure then leaves cadence to the current budget error. An unordered rate
@@ -516,10 +536,13 @@ time. CSV output is independent of text verbosity.
 
 For an MPI controller diagnostic, set `PEAK_VERBOSITY=debug`. The
 `[peak mpi active clock]` line describes the last valid sample on an individual
-process. `elapsed` is elapsed wall time in seconds, `blocked` is time in covered
+process. `elapsed` is elapsed wall time in seconds, `blocked` is estimated time in covered
 blocking MPI calls in seconds, and `lifetime_target` is the resulting
 rank-local overhead budget expressed as a fraction. `configured_target` is
 the configured global overhead budget before that adjustment.
+`saturated_windows` counts heartbeat observations where more than 16 eligible
+call boundaries occurred. The estimate uses rank-local wrapper state and does
+not identify MPI-wide dependencies or guarantee whole-job slowdown.
 
 ## Environment Variables and Defaults
 
