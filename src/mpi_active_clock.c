@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "internal/mpi_active_clock.h"
+#include "logging.h"
 
 #include <mpi.h>
 #include <dlfcn.h>
@@ -67,8 +68,10 @@ sample_clock_ns(void)
 static bool
 sample_clock_available(void)
 {
+#ifdef ACTIVE_CLOCK_ID
     enum { BATCH_SIZE = 128, MAX_CLOCK_NS = 20 };
-    if (!sample_clock_ns())
+    struct timespec resolution;
+    if (clock_getres(ACTIVE_CLOCK_ID, &resolution) != 0 || !sample_clock_ns())
         return false;
     for (unsigned attempt = 0; attempt < 3; ++attempt) {
         uint64_t before = clock_ns(CLOCK_MONOTONIC);
@@ -77,9 +80,12 @@ sample_clock_available(void)
                 return false;
         }
         uint64_t after = clock_ns(CLOCK_MONOTONIC);
-        if (before && after >= before && after - before <= BATCH_SIZE * MAX_CLOCK_NS)
+        if (before && after >= before && after - before <= BATCH_SIZE * MAX_CLOCK_NS) {
+            clock_quantum = (double)resolution.tv_sec + (double)resolution.tv_nsec * 1e-9;
             return true;
+        }
     }
+#endif
     return false;
 }
 
@@ -95,16 +101,13 @@ peak_mpi_active_clock_start(double runtime_start)
     if (PMPI_Query_thread(&level) != MPI_SUCCESS ||
         (level != MPI_THREAD_SINGLE && level != MPI_THREAD_FUNNELED) ||
         PMPI_Comm_size(MPI_COMM_WORLD, &size) != MPI_SUCCESS || size <= 1 ||
-        PMPI_Comm_rank(MPI_COMM_WORLD, &world_rank) != MPI_SUCCESS ||
-        !sample_clock_available())
+        PMPI_Comm_rank(MPI_COMM_WORLD, &world_rank) != MPI_SUCCESS)
         return;
-
-#ifdef ACTIVE_CLOCK_ID
-    struct timespec resolution;
-    if (clock_getres(ACTIVE_CLOCK_ID, &resolution) != 0)
+    if (!sample_clock_available()) {
+        peak_log_debug("[peak mpi active clock unavailable] pid=%ld "
+                       "reason=clock-qualification\n", (long)getpid());
         return;
-    clock_quantum = (double)resolution.tv_sec + (double)resolution.tv_nsec * 1e-9;
-#endif
+    }
     clock_epoch = runtime_start;
     writer_state = WRITER_IDLE;
     atomic_store_explicit(&clock_owner, getpid(), memory_order_release);
@@ -160,10 +163,11 @@ peak_mpi_active_clock_blocked_seconds(double runtime_start, double* now)
         uint64_t first = atomic_load_explicit(&residence_state, memory_order_acquire);
         uint64_t tick = sample_clock_ns();
         uint64_t after = clock_ns(CLOCK_MONOTONIC);
-        uint64_t second = atomic_load_explicit(&residence_state, memory_order_acquire);
-        if (first == UINT64_MAX || second == UINT64_MAX)
+        atomic_thread_fence(memory_order_acquire);
+        uint64_t second = atomic_load_explicit(&residence_state, memory_order_relaxed);
+        if (first == UINT64_MAX || second == UINT64_MAX || !tick)
             return PEAK_MPI_CLOCK_UNAVAILABLE;
-        if (!tick || !after)
+        if (!after)
             return -1.0;
         uint64_t residence = residence_at(first, tick);
         if (after >= before && after - before <= 100000 &&

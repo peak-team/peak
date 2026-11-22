@@ -452,10 +452,13 @@ in all batches, the rank uses the ordinary wall-time policy.
 The MPI thread keeps cumulative residence and the open call state in one
 atomic word. A heartbeat samples the same clock so a call in progress
 contributes to the estimate. The clock is quantized and may miss gaps shorter
-than a tick. The recent detach threshold allows one tick of uncertainty,
+than a tick. Periodic calls that coincide with successive ticks can also
+overestimate residency. The sampled estimate has no per-window error bound.
+The recent detach threshold allows one tick of uncertainty,
 while lifetime budgeting and reattach use the cumulative residence estimate.
-A raced snapshot carries the preceding lifetime allowance. A permanent
-writer-side clock failure restores the ordinary wall-time policy.
+A raced snapshot carries the preceding lifetime allowance. A failed reader
+clock uses the ordinary wall-time policy for that cut. A permanent writer-side
+clock failure restores that policy for the rest of the run.
 
 With a valid MPI active-clock sample, including a retained sample when a
 later read races, the rate term uses `max(ema_global_rate, 0)`. Falling
