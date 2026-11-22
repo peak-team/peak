@@ -204,7 +204,13 @@ static gboolean peak_cfi_record(const guint8 *p, PeakCfiCursor *c,
   gsize bytes;
   if (n < *offset_size || n > G_MAXSIZE ||
       __builtin_add_overflow(header, (gsize)n, &bytes) ||
-      (guintptr)p > UINTPTR_MAX - bytes || !peak_cfi_readable(p, bytes))
+      (guintptr)p > UINTPTR_MAX - bytes)
+    return FALSE;
+  /* With stable mappings during this parse, the header check also covers
+   * records that end within or exactly at the end of its starting page. */
+  gsize page = gum_query_page_size();
+  if (!page || (bytes > page - (guintptr)p % page &&
+                !peak_cfi_readable(p, bytes)))
     return FALSE;
   *c = (PeakCfiCursor){p + header, p + bytes, TRUE};
   return TRUE;
