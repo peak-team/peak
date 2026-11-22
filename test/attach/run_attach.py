@@ -1,6 +1,7 @@
 """Exercise the public attach executable against a non-preloaded live process."""
 import argparse
 import csv
+import ctypes
 import math
 from concurrent.futures import ThreadPoolExecutor
 import os
@@ -166,7 +167,9 @@ parser.add_argument("--agent", type=Path)
 parser.add_argument("--fixture", type=Path)
 parser.add_argument("--require-injection", action="store_true")
 parser.add_argument("--reserve-keys", action="store_true")
-parser.add_argument("--mode", choices=("cli", "runtime", "memory", "calibration", "memory_failure"), required=True)
+parser.add_argument("--mode", choices=("cli", "runtime", "memory", "calibration",
+                                       "memory_failure", "calloc_guard", "calloc_guard_mixed"),
+                    required=True)
 args = parser.parse_args()
 env = {k: v for k, v in os.environ.items()
        if not k.startswith(("PEAK_", "FLAME_"))
@@ -196,9 +199,10 @@ else:
         if args.mode == "calibration":
             fixture_command.append("--single-thread")
         fixture_args = ["--reserve-keys"] if args.reserve_keys else []
+        calloc_guard = args.mode in ("calloc_guard", "calloc_guard_mixed")
         target = subprocess.Popen(fixture_command + fixture_args,
                                   env=env, stdin=subprocess.PIPE, stdout=log, stderr=log,
-                                  cwd=root if args.mode == "memory_failure" else None,
+                                  cwd=root if calloc_guard or args.mode == "memory_failure" else None,
                                   start_new_session=True)
         target.peak_started_at = time.time()
         try:
@@ -209,6 +213,45 @@ else:
             alive(target, progress, root / "fixture.log")
             agent_options = ["--agent", str(args.agent.resolve())] if args.agent else []
             base = [cli, str(target.pid)] + agent_options
+            if calloc_guard:
+                mixed = args.mode == "calloc_guard_mixed"
+                selector = "calloc"
+                function = "peak_attach_existing_target"
+                allocation_env = dict(env, PEAK_MEMORY_PROFILE="0", PEAK_VERBOSITY="info",
+                                      PEAK_HEARTBEAT_INTERVAL="0", PEAK_OUTPUT_AGGREGATION="local")
+                if mixed:
+                    allocation_env["PEAK_ALLOW_UNSAFE_GUM_PROLOGUE"] = "1"
+                    # glibc exports a second name for the same hook address.
+                    if hasattr(ctypes.CDLL(None), "__libc_calloc"):
+                        selector = "__libc_calloc"
+                prefix = root / "calloc-report"
+                command = base + ["--target", selector, "--output", str(prefix)]
+                if mixed:
+                    command += ["--target", function]
+                log_path = root / "fixture.log"
+                code, output = run(command, allocation_env, fixture_log=log_path)
+                assert (code == 0) == mixed, output
+                assert f"{int(mixed)} installed, 0 pending, 1 skipped" in output, output
+                alive(target, progress, log_path)
+                target.stdin.write(b"Q")
+                target.stdin.flush()
+                assert target.wait(timeout=8) == 0
+                logs = log_path.read_text()
+                assert (f"skipping Gum attach for hook {selector}: "
+                        "Gum thread guard may allocate before it is set") in logs, logs
+                if mixed:
+                    paths = list(root.glob(prefix.name + "*.csv"))
+                    assert len(paths) == 1, paths
+                    with paths[0].open() as stream:
+                        rows = list(csv.DictReader(stream))
+                    assert sum(int(row["count"]) for row in rows
+                               if row["function"] == function) > 0, rows
+                    assert all(row["function"] != selector for row in rows), rows
+                    assert all(int(row["dropped_calls"]) == int(row["dropped_threads"]) == 0
+                               for row in rows), rows
+                else:
+                    assert "could not start any requested profiling backend" in output, output
+                raise SystemExit(0)
             if args.mode == "memory_failure":
                 memory = dict(env, PEAK_MEMORY_PROFILE="1", PEAK_HEARTBEAT_INTERVAL="0",
                               PEAK_OUTPUT_AGGREGATION="local")

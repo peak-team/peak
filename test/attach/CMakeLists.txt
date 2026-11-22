@@ -59,6 +59,13 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
             --cli $<TARGET_FILE:peak_attach> --agent $<TARGET_FILE:peak_attach_agent>
             --fixture $<TARGET_FILE:test_attach_fixture> --mode memory_failure --reserve-keys)
     set_tests_properties(test_attach_memory_guard_high_keys PROPERTIES TIMEOUT 70 SKIP_RETURN_CODE 77)
+    foreach(_mode IN ITEMS calloc_guard calloc_guard_mixed)
+        add_test(NAME test_attach_${_mode}_high_keys
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/run_attach.py
+                --cli $<TARGET_FILE:peak_attach> --agent $<TARGET_FILE:peak_attach_agent>
+                --fixture $<TARGET_FILE:test_attach_fixture> --mode ${_mode} --reserve-keys)
+        set_tests_properties(test_attach_${_mode}_high_keys PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
+    endforeach()
 
 endif()
 

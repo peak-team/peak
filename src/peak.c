@@ -30,11 +30,11 @@
 #include "internal/filesystem_stat_guard.h"
 #endif
 #include "internal/general_listener_internal.h"
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(PEAK_ATTACH_RUNTIME)
 #include "internal/general_listener/attach_policy.h"
-#if defined(PEAK_HAVE_GUM_DARWIN_PATCH_API)
-#include "internal/gum_peak_darwin_patch_api.h"
 #endif
+#if defined(__APPLE__) && defined(PEAK_HAVE_GUM_DARWIN_PATCH_API)
+#include "internal/gum_peak_darwin_patch_api.h"
 #endif
 #include "internal/general_listener/report_snapshot.h"
 #include "internal/general_listener/runtime_config.h"
@@ -1286,7 +1286,6 @@ static size_t peak_attach_cpu_installed;
 static size_t peak_attach_cpu_pending;
 static size_t peak_attach_cpu_total;
 #if defined(__linux__) && defined(PEAK_HAVE_GUM_PEAK_PC_API)
-extern gboolean peak_gum_attach_guard_is_allocation_free(void);
 static gboolean peak_attach_memory_guard_refused;
 #endif
 

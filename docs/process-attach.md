@@ -136,7 +136,9 @@ attach have runtime coverage. CUDA attach currently has build-time coverage.
 Linux memory attach requires Gum to set its per-thread guard without allocating.
 If the target has already reserved enough pthread keys that setting the guard
 could allocate, PEAK refuses memory profiling before installing allocator hooks.
-The startup summary reports that refusal and any CPU hooks that were installed.
+It also skips CPU targets that resolve to the `calloc` entry, including aliases
+at the same address. The startup summary reports the memory refusal and the
+CPU target counts.
 
 For MPI jobs, start the application with `MPI_Init_thread` and ensure it
 provides `MPI_THREAD_MULTIPLE` before attaching. This condition is required
