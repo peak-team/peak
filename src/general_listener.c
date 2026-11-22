@@ -5575,7 +5575,12 @@ void* peak_heartbeat_monitor(void* arg) {
                 PeakMpiActiveClockPolicy lifetime = peak_mpi_active_clock_policy(
                     global_target_ratio, total_execution_time, blocked, cost);
                 lifetime_target = lifetime.ratio;
-                if (previous_active_blocked >= 0.0 &&
+                if (mpi_saturated) {
+                    /* A single endpoint is too noisy to set the recent
+                     * target. Use the pooled estimate for this pressure.
+                     */
+                    recent_target = lifetime_target;
+                } else if (previous_active_blocked >= 0.0 &&
                     total_execution_time > previous_active_elapsed &&
                     blocked >= previous_active_blocked && cost >= previous_active_cost) {
                     double recent_elapsed = total_execution_time - previous_active_elapsed;

@@ -541,8 +541,11 @@ blocking MPI calls in seconds, and `lifetime_target` is the resulting
 rank-local overhead budget expressed as a fraction. `configured_target` is
 the configured global overhead budget before that adjustment.
 `saturated_windows` counts heartbeat observations where more than 16 eligible
-call boundaries occurred. The estimate uses rank-local wrapper state and does
-not identify MPI-wide dependencies or guarantee whole-job slowdown.
+call boundaries occurred. In these windows, the recent profiling rate is
+compared with the lifetime target because one MPI state observation is too
+noisy to set a separate recent target. The estimate describes rank-local
+wrapper state and cannot identify MPI-wide dependencies or bound whole-job
+slowdown.
 
 ## Environment Variables and Defaults
 
