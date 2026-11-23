@@ -443,11 +443,17 @@ sleep_us =
   clip(heartbeat_time * scale, hb_min_us, hb_max_us)
 ```
 
-With the MPI active clock enabled, eligible MPI boundaries read a local
-low-cost clock. Linux uses `CLOCK_MONOTONIC_COARSE` and macOS uses
-`CLOCK_MONOTONIC_RAW_APPROX`. The rank qualifies clock availability and read
-cost with short startup batches. If the observed cost exceeds 20 ns per read
-in all batches, the rank uses the ordinary wall-time policy.
+With the MPI active clock enabled on Linux, eligible MPI boundaries read
+`CLOCK_MONOTONIC_COARSE`. The rank qualifies clock availability and read cost
+with short startup batches. If the clock is unavailable or the observed cost
+exceeds 20 ns per read in all batches, the rank uses the ordinary wall-time
+policy. macOS also uses the wall-time policy because
+`CLOCK_MONOTONIC_RAW_APPROX` reports the hardware clock resolution while its
+update interval can be longer.
+
+Qualification bounds the measured clock read cost at startup. The profiling
+budget's spent seconds exclude work in the MPI active-clock wrappers, so the
+global target ratio does not guarantee end-to-end slowdown.
 
 The MPI thread keeps cumulative residence and the open call state in one
 atomic word. A heartbeat samples the same clock so a call in progress
@@ -455,8 +461,8 @@ contributes to the estimate. The clock is quantized and may miss gaps shorter
 than a tick. Periodic calls that coincide with successive ticks can also
 overestimate residency. The sampled estimate has no per-window error bound.
 The recent detach threshold allows one tick of uncertainty up to the lifetime
-target,
-while lifetime budgeting and reattach use the cumulative residence estimate.
+target, while lifetime budgeting and reattach use the cumulative residence
+estimate.
 A raced snapshot carries the preceding lifetime allowance. A failed reader
 clock uses the ordinary wall-time policy for that cut. A permanent writer-side
 clock failure restores that policy for the rest of the run.

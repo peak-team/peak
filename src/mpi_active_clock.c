@@ -26,10 +26,10 @@
 #define ACTIVE_CLOCK_TLS
 #endif
 
+/* The heartbeat uses clock_getres() as the update quantum. Darwin's
+ * approximate clock reports the underlying hardware resolution. */
 #if defined(__linux__) && defined(CLOCK_MONOTONIC_COARSE)
 #define ACTIVE_CLOCK_ID CLOCK_MONOTONIC_COARSE
-#elif defined(__APPLE__)
-#define ACTIVE_CLOCK_ID CLOCK_MONOTONIC_RAW_APPROX
 #endif
 
 /* The low bit marks an open MPI call. The remaining bits hold completed

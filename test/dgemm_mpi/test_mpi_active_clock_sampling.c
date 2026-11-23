@@ -13,17 +13,24 @@
 
 #include <assert.h>
 
+static unsigned qualification_failures;
+
 void
 peak_log_message(PeakVerbosity verbosity, const char* format, ...)
 {
     assert(verbosity == PEAK_VERBOSITY_DEBUG);
     assert(strstr(format, "reason=clock-qualification"));
+    ++qualification_failures;
 }
 
-enum { TICK_US = 1000 };
+enum { TICK_US = 1000, QUALIFICATION_BATCH_SIZE = 128 };
 static const double epoch = 1.0;
 static int wall_us;
 static unsigned coarse_reads;
+static unsigned fine_reads;
+static unsigned resolution_checks;
+static unsigned mpi_thread_checks;
+static unsigned slow_coarse_reads;
 static bool coarse_available;
 static bool fine_failure;
 static unsigned delayed_reads;
@@ -33,6 +40,8 @@ int
 fake_clock_gettime(clockid_t clock_id, struct timespec* time)
 {
     *time = (struct timespec){0};
+    if (clock_id == CLOCK_MONOTONIC)
+        ++fine_reads;
     if (clock_id == CLOCK_MONOTONIC && fine_failure)
         return -1;
     if (clock_id == CLOCK_MONOTONIC && delayed_reads) {
@@ -44,6 +53,10 @@ fake_clock_gettime(clockid_t clock_id, struct timespec* time)
         if (!coarse_available)
             return -1;
         ++coarse_reads;
+        if (slow_coarse_reads) {
+            --slow_coarse_reads;
+            ++wall_us;
+        }
         measured_us -= measured_us % TICK_US;
     } else {
         assert(clock_id == CLOCK_MONOTONIC);
@@ -57,6 +70,7 @@ int
 fake_clock_getres(clockid_t clock_id, struct timespec* time)
 {
     assert(clock_id == CLOCK_MONOTONIC_COARSE);
+    ++resolution_checks;
     time->tv_sec = 0;
     time->tv_nsec = TICK_US * 1000L;
     return 0;
@@ -65,6 +79,7 @@ fake_clock_getres(clockid_t clock_id, struct timespec* time)
 int
 fake_pmpi_query_thread(int* provided)
 {
+    ++mpi_thread_checks;
     *provided = MPI_THREAD_FUNNELED;
     return MPI_SUCCESS;
 }
@@ -127,15 +142,35 @@ main(void)
     peak_mpi_active_clock_start(epoch);
     assert(peak_mpi_active_clock_blocked_seconds(epoch, &unavailable_cut) ==
            PEAK_MPI_CLOCK_UNAVAILABLE);
+    assert(mpi_thread_checks == 0 && resolution_checks == 0 &&
+           coarse_reads == 0 && fine_reads == 0 && qualification_failures == 0);
 
     assert(unsetenv("PEAK_MPI_ACTIVE_CLOCK") == 0);
     coarse_available = false;
     peak_mpi_active_clock_start(epoch);
     assert(peak_mpi_active_clock_blocked_seconds(epoch, &unavailable_cut) ==
            PEAK_MPI_CLOCK_UNAVAILABLE);
+    assert(qualification_failures == 1);
 
     coarse_available = true;
+    /* Each slow read advances wall time by 1us. Include the untimed probe. */
+    slow_coarse_reads = 1 + 3 * QUALIFICATION_BATCH_SIZE;
     peak_mpi_active_clock_start(epoch);
+    assert(slow_coarse_reads == 0 && coarse_reads == 1 + 3 * QUALIFICATION_BATCH_SIZE);
+    assert(fine_reads == 6 && qualification_failures == 2);
+    assert(atomic_load(&clock_owner) == 0 && writer_state == WRITER_INACTIVE);
+    assert(peak_mpi_active_clock_blocked_seconds(epoch, &unavailable_cut) ==
+           PEAK_MPI_CLOCK_UNAVAILABLE);
+    assert(unavailable_cut == epoch + 0.001);
+
+    unsigned reads_before = coarse_reads;
+    unsigned fine_reads_before = fine_reads;
+    slow_coarse_reads = 1 + QUALIFICATION_BATCH_SIZE;
+    peak_mpi_active_clock_start(epoch);
+    assert(slow_coarse_reads == 0);
+    assert(coarse_reads - reads_before == 1 + 2 * QUALIFICATION_BATCH_SIZE);
+    assert(fine_reads - fine_reads_before == 4 && qualification_failures == 2);
+    assert(atomic_load(&clock_owner) == getpid() && writer_state == WRITER_IDLE);
     double blocked = observe_at(1000, 0);
     expect_added(0, blocked, 0, 0);
     assert(fabs(peak_mpi_active_clock_quantum_seconds() - 0.001) < 1e-9);

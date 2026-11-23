@@ -466,7 +466,7 @@ full output and teardown behavior.
 | `PEAK_GLOBAL_OVERHEAD_RATIO` | Global profiling-overhead ratio. Default: `0.1`. |
 | `PEAK_ENABLE_PER_TARGET_HEARTBEAT` | Enable per-target heartbeat detach decisions. Default: disabled. |
 | `PEAK_ENABLE_GLOBAL_HEARTBEAT` | Enable global heartbeat detach decisions. Default: enabled; set `0` or `false` to disable. |
-| `PEAK_MPI_ACTIVE_CLOCK` | Estimate local time available to produce profiling cost by discounting eligible blocking C MPI calls. Requires the global heartbeat, CPU targets, a multi-rank MPI world, MPI SINGLE or FUNNELED, and a supported fast local clock. Default: enabled; set to `0` to disable. |
+| `PEAK_MPI_ACTIVE_CLOCK` | Estimate local time available to produce profiling cost by discounting eligible blocking C MPI calls. Requires the global heartbeat, CPU targets, a multi-rank MPI world, MPI SINGLE or FUNNELED, and a qualifying Linux coarse clock. Default: enabled; set to `0` to disable. |
 | `PEAK_GLOBAL_DETACH_FACTOR` | Global detach hysteresis factor. Default: `1.2`. |
 | `PEAK_GLOBAL_REATTACH_FACTOR` | Global reattach hysteresis factor. Default: `0.85`. |
 | `PEAK_ENABLE_REATTACH` | Allow physical reattach. Default: enabled, but reattach also requires a running heartbeat, a nonzero hibernation cycle, and at least one enabled heartbeat policy. |
