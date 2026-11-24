@@ -1,12 +1,32 @@
 #ifndef PEAK_ATTACH_RUNTIME_CONFIG_H
 #define PEAK_ATTACH_RUNTIME_CONFIG_H
 
-/* Forced into attached-runtime translation units only. Include stdlib before
+/* The attached runtime force-includes this header. Include stdlib before
  * redirecting getenv, so its public declaration remains intact. */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
 #include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+
+static inline int
+peak_attach_config_is_enabled(const char *value)
+{
+    return value != NULL &&
+           (strcmp(value, "1") == 0 || strcasecmp(value, "true") == 0);
+}
+
+static inline const char *
+peak_attach_exec_propagation_error(const char *chain, const char *checkpoint)
+{
+    if (peak_attach_config_is_enabled(chain) ||
+        peak_attach_config_is_enabled(checkpoint))
+        return "late attach cannot propagate PEAK across exec: PEAK_EXEC_CHAIN "
+               "and PEAK_EXEC_CHECKPOINT require startup interposition";
+    return NULL;
+}
+
 #if defined(PEAK_ATTACH_RUNTIME)
 /* Import Gum's GLib symbol remapping before overriding g_getenv. */
 #include "frida-gum.h"

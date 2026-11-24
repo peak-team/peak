@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "internal/attach_protocol.h"
+#include "internal/attach_runtime_config.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -825,6 +826,14 @@ static GVariant *build_configuration(GPtrArray *targets, const char *output)
     if (output)
         g_hash_table_replace(config, g_strdup("PEAK_STATSLOG_PATH"),
                              g_strdup(output));
+    const char *exec_error = peak_attach_exec_propagation_error(
+        g_hash_table_lookup(config, "PEAK_EXEC_CHAIN"),
+        g_hash_table_lookup(config, "PEAK_EXEC_CHECKPOINT"));
+    if (exec_error != NULL) {
+        fprintf(stderr, "peak-attach: %s\n", exec_error);
+        g_hash_table_unref(config);
+        return NULL;
+    }
     const char *const path_keys[] = {
         "PEAK_TARGET_FILE", "PEAK_GPU_TARGET_FILE", "PEAK_STATSLOG_PATH",
     };
@@ -1062,7 +1071,10 @@ int main(int argc, char **argv)
         perror("peak-attach: start injector");
         goto cleanup;
     }
-    diagnostic_phase("worker spawned; awaiting agent");
+    char worker_phase[96];
+    snprintf(worker_phase, sizeof(worker_phase),
+             "worker %ld spawned; awaiting agent", (long)worker.pid);
+    diagnostic_phase(worker_phase);
     gint64 until = deadline_ms() + 15000;
     while (!interrupted && deadline_ms() < until) {
         struct pollfd f = {listener, POLLIN, 0};
