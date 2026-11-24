@@ -12,6 +12,8 @@
 #undef clock_gettime
 
 #include <assert.h>
+#include <limits.h>
+#include "internal/mpi_active_clock_sampling.h"
 
 static unsigned qualification_failures;
 
@@ -131,6 +133,159 @@ expect_added(double previous, double blocked, int expected_us, int tolerance_us)
 {
     assert(fabs((blocked - previous) - expected_us * 1e-6) <=
            tolerance_us * 1e-6 + 1e-9);
+}
+
+typedef enum {
+    PHASE_INSIDE,
+    PHASE_CROSS,
+    PHASE_ALTERNATING,
+    PHASE_WITH_LONG_WAIT,
+    PHASE_ALL_COMPUTE,
+    PHASE_ALL_MPI,
+} PhasePattern;
+
+enum { PHASE_SLEEP_US = 80 * TICK_US, PHASE_WINDOWS = 128 };
+
+typedef struct {
+    PhasePattern pattern;
+    int start_us;
+    int entered_us;
+    int completed_us;
+    unsigned calls;
+    int true_blocked_us;
+} PhaseTimeline;
+
+static void
+next_phase_interval(PhaseTimeline* timeline)
+{
+    unsigned call = timeline->calls++;
+    int step = (int)call * TICK_US;
+    int offset = 200;
+    int duration = 400;
+    switch (timeline->pattern) {
+    case PHASE_CROSS:
+        offset = 800;
+        break;
+    case PHASE_ALTERNATING:
+        offset = (step / PHASE_SLEEP_US) % 2 == 0 ? 800 : 300;
+        break;
+    case PHASE_WITH_LONG_WAIT:
+        step += (int)(call / 64) * 9000;
+        if (call % 64 == 63)
+            duration += 9000;
+        break;
+    case PHASE_ALL_COMPUTE:
+        timeline->entered_us = INT_MAX;
+        timeline->completed_us = INT_MAX;
+        return;
+    case PHASE_ALL_MPI:
+        offset = 0;
+        duration = INT_MAX - timeline->start_us;
+        break;
+    case PHASE_INSIDE:
+        break;
+    }
+    timeline->entered_us = timeline->start_us + step + offset;
+    timeline->completed_us = timeline->entered_us + duration;
+}
+
+static int
+advance_phase_timeline(PhaseTimeline* timeline, int at_us)
+{
+    while (timeline->entered_us <= at_us) {
+        if (!opened)
+            boundary_at(timeline->entered_us);
+        if (timeline->completed_us > at_us)
+            break;
+        boundary_at(timeline->completed_us);
+        timeline->true_blocked_us += timeline->completed_us - timeline->entered_us;
+        next_phase_interval(timeline);
+    }
+    assert(wall_us <= at_us);
+    wall_us = at_us;
+    return timeline->true_blocked_us + (opened ? at_us - timeline->entered_us : 0);
+}
+
+static void
+check_peek(void)
+{
+    unsigned coarse = coarse_reads;
+    unsigned fine = fine_reads;
+    assert(peak_mpi_active_clock_peek(epoch) == (opened != 0));
+    assert(peak_mpi_active_clock_peek(epoch + 1.0) < 0);
+    assert(coarse_reads == coarse && fine_reads == fine);
+}
+
+static void
+test_phase_pattern(PhasePattern pattern)
+{
+    wall_us = 0;
+    opened = 0;
+    atomic_store(&residence_state, 0);
+    PhaseTimeline timeline = {.pattern = pattern, .start_us = TICK_US};
+    next_phase_interval(&timeline);
+    int true_blocked_us = advance_phase_timeline(&timeline, timeline.start_us);
+    check_peek();
+
+    PeakMpiClockSampler sampler = {.random = 42};
+    double now = epoch + timeline.start_us * 1e-6;
+    double raw = peak_mpi_active_clock_blocked_seconds(epoch, &now);
+    assert(raw == 0.0);
+    PeakMpiClockResidence residence = {.epoch = epoch, .now = now, .match_sleep = true};
+    double corrected = 0.0;
+    const uint64_t sleep_ns = PHASE_SLEEP_US * UINT64_C(1000);
+    for (int window = 0; window < PHASE_WINDOWS; ++window) {
+        int start_us = timeline.start_us + window * PHASE_SLEEP_US;
+        sampler.start = now;
+        sampler.raw_start = raw;
+        sampler.probes = peak_mpi_active_clock_probe_count(sleep_ns);
+        sampler.open_probes = 0;
+        for (unsigned probe = 0; probe < sampler.probes; ++probe) {
+            uint64_t offset = peak_mpi_active_clock_probe_offset(
+                &sampler, sleep_ns, probe, sampler.probes);
+            assert(offset >= sleep_ns * probe / sampler.probes);
+            assert(offset < sleep_ns * (probe + 1) / sampler.probes);
+            advance_phase_timeline(&timeline, start_us + (int)(offset / 1000));
+            int open = peak_mpi_active_clock_peek(epoch);
+            assert(open >= 0);
+            sampler.open_probes += (unsigned)open;
+        }
+
+        int end_us = start_us + PHASE_SLEEP_US;
+        true_blocked_us = advance_phase_timeline(&timeline, end_us);
+        sampler.expected_end = epoch + end_us * 1e-6;
+        sampler.tolerance = 0.0005;
+        double cut = sampler.expected_end;
+        double cut_raw = peak_mpi_active_clock_blocked_seconds(epoch, &cut);
+        assert(cut_raw >= raw);
+        double next = peak_mpi_active_clock_accumulate(
+            &residence, &sampler, cut, cut_raw);
+        assert(next >= corrected && next - corrected <= cut - now + 1e-9);
+        corrected = next;
+        now = cut;
+        raw = cut_raw;
+    }
+
+    double elapsed = PHASE_SLEEP_US * PHASE_WINDOWS * 1e-6;
+    double truth = true_blocked_us * 1e-6;
+    assert(corrected >= 0.0 && corrected <= elapsed + 1e-9);
+    assert(sampler.sampled_windows == PHASE_WINDOWS);
+    if (pattern == PHASE_ALL_COMPUTE || pattern == PHASE_ALL_MPI) {
+        assert(fabs(raw - truth) <= 1e-9);
+        assert(fabs(corrected - truth) <= 1e-9);
+        assert(sampler.corrected_windows == 0);
+        return;
+    }
+    assert(sampler.corrected_windows != 0);
+    assert(fabs(corrected - truth) < 0.05 * elapsed);
+    if (pattern == PHASE_CROSS) {
+        /* The same 400 us waits charge a full tick when they straddle it. */
+        assert(raw - truth > 0.50 * elapsed);
+    } else if (pattern == PHASE_INSIDE || pattern == PHASE_WITH_LONG_WAIT) {
+        assert(truth - raw > 0.30 * elapsed);
+    } else {
+        assert(raw - truth > 0.09 * elapsed);
+    }
 }
 
 int
@@ -268,4 +423,12 @@ main(void)
     assert(open_interval() == UINT64_MAX);
     assert(peak_mpi_active_clock_blocked_seconds(epoch, &cut) ==
            PEAK_MPI_CLOCK_UNAVAILABLE);
+    assert(peak_mpi_active_clock_peek(epoch) < 0);
+
+    test_phase_pattern(PHASE_INSIDE);
+    test_phase_pattern(PHASE_CROSS);
+    test_phase_pattern(PHASE_ALTERNATING);
+    test_phase_pattern(PHASE_WITH_LONG_WAIT);
+    test_phase_pattern(PHASE_ALL_COMPUTE);
+    test_phase_pattern(PHASE_ALL_MPI);
 }

@@ -13,6 +13,10 @@ void peak_mpi_active_clock_start(double runtime_start);
  */
 double peak_mpi_active_clock_blocked_seconds(double runtime_start, double* now);
 
+/* Occupancy at the atomic load. A negative result means the clock is
+ * unavailable for this rank or runtime epoch. */
+int peak_mpi_active_clock_peek(double runtime_start);
+
 /* The sampled clock's advertised resolution, after a valid observation. */
 double peak_mpi_active_clock_quantum_seconds(void);
 

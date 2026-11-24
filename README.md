@@ -475,10 +475,13 @@ full output and teardown behavior.
 | `PEAK_HB_K_ERR`, `PEAK_HB_K_RATE` | Adaptive response coefficients. Defaults: `3.0` and `0.8`. |
 | `PEAK_HB_EMA_A` | Growth-rate EMA alpha in `(0, 1]`. Default: `0.3`. |
 
-The active clock estimates wall time inside selected blocking MPI calls on the
-thread that initialized MPI. Eligible MPI boundaries read a low-cost local
-clock, and the heartbeat reads the resulting cumulative residence estimate.
-[Sampling details](docs/heartbeat.md#adaptive-sleep).
+The active clock estimates residence in selected blocking MPI calls on the
+MPI-initializing thread. On Linux, the heartbeat samples the open-call bit at
+randomized times across sleep strata. When probes disagree with the coarse
+clock beyond the sampling guard, PEAK uses sampled occupancy for subsequent
+measured sleeps. Skipped or late spans remain raw; macOS and unsupported
+configurations keep the wall-time policy. See
+[sampling details](docs/heartbeat.md#adaptive-sleep).
 
 Covered MPI and PMPI entry points are `Send`, `Ssend`, `Recv`, `Sendrecv`,
 `Barrier`, `Bcast`, `Reduce`, `Allreduce`, `Allgather`, `Alltoall`,

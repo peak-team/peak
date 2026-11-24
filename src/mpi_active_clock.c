@@ -146,11 +146,26 @@ residence_at(uint64_t state, uint64_t tick)
     return ((state & 1) ? state + (tick << 1) : state) >> 1;
 }
 
+static bool
+clock_owned(double runtime_start)
+{
+    pid_t owner = atomic_load_explicit(&clock_owner, memory_order_acquire);
+    return owner && owner == getpid() && runtime_start == clock_epoch;
+}
+
+int
+peak_mpi_active_clock_peek(double runtime_start)
+{
+    if (!clock_owned(runtime_start))
+        return -1;
+    uint64_t state = atomic_load_explicit(&residence_state, memory_order_acquire);
+    return state == UINT64_MAX ? -1 : (int)(state & 1);
+}
+
 double
 peak_mpi_active_clock_blocked_seconds(double runtime_start, double* now)
 {
-    pid_t owner = atomic_load_explicit(&clock_owner, memory_order_acquire);
-    if (!owner || owner != getpid() || runtime_start != clock_epoch)
+    if (!clock_owned(runtime_start))
         return PEAK_MPI_CLOCK_UNAVAILABLE;
     if (!isfinite(*now) || *now <= runtime_start)
         return -1.0;

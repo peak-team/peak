@@ -443,29 +443,60 @@ sleep_us =
   clip(heartbeat_time * scale, hb_min_us, hb_max_us)
 ```
 
-With the MPI active clock enabled on Linux, eligible MPI boundaries read
-`CLOCK_MONOTONIC_COARSE`. The rank qualifies clock availability and read cost
-with short startup batches. If the clock is unavailable or the observed cost
-exceeds 20 ns per read in all batches, the rank uses the ordinary wall-time
-policy. macOS also uses the wall-time policy because
-`CLOCK_MONOTONIC_RAW_APPROX` reports the hardware clock resolution while its
-update interval can be longer.
+With `PEAK_MPI_ACTIVE_CLOCK=1`, Linux ranks that meet the documented MPI and
+clock qualifications can sample MPI residence during heartbeat sleeps. The
+heartbeat still wakes at its original condition-variable deadline. During a
+sleep it places probes at randomized offsets, one in each equal wall-time
+stratum (up to eight strata, with a 10 ms nominal spacing). Each probe records
+whether an eligible MPI call is open. The fraction of open probes estimates
+MPI residence for that sleep. Estimates from sleeps of different elapsed
+lengths contribute in proportion to their wall-time duration. This is a
+prospective measurement: after persistent disagreement with the coarse clock,
+sampled occupancy is used for subsequent measured sleeps; no earlier time is
+replayed or rewritten.
 
-Qualification bounds the measured clock read cost at startup. The profiling
-budget's spent seconds exclude work in the MPI active-clock wrappers, so the
-global target ratio does not guarantee end-to-end slowdown.
+The first regular sleep can be sampled, without moving the original heartbeat
+wake or first policy assessment. After a sampled sleep, another can be sampled
+once 10 ms has elapsed from that sample window's start. An eligible nonzero
+sleep shorter than 10 ms gets one probe; longer sleeps are capped at eight. A
+missed or late probe, a wake, or a cut that does not match the original sleep
+deadline leaves that span raw; it is not reconstructed later. Previously
+collected evidence is retained across skipped spans, and later valid sleeps
+are measured independently. A genuinely unavailable raw clock cut resets the
+evidence. On Linux this uses `CLOCK_MONOTONIC_COARSE`; unavailable or
+unsupported configurations retain the ordinary wall-time policy.
 
-The MPI thread keeps cumulative residence and the open call state in one
-atomic word. A heartbeat samples the same clock so a call in progress
-contributes to the estimate. The clock is quantized and may miss gaps shorter
-than a tick. Periodic calls that coincide with successive ticks can also
-overestimate residency. The sampled estimate has no per-window error bound.
-The recent detach threshold allows one tick of uncertainty up to the lifetime
-target, while lifetime budgeting and reattach use the cumulative residence
-estimate.
-A raced snapshot carries the preceding lifetime allowance. A failed reader
-clock uses the ordinary wall-time policy for that cut. A permanent writer-side
-clock failure restores that policy for the rest of the run.
+The sampler compares occupancy estimates with coarse-clock residence before
+enabling an occupancy correction for subsequent measured sleeps. It keeps
+separate signed residual evidence for coarse-clock occupancy below and above
+half of the interval, so opposite phase errors are less likely to cancel. After
+at least eight valid probes, each valid sleep with `n` probes and elapsed time
+`t` updates the evidence. With `p = coarse_residence / t` and `w = 1 - n/64`,
+prior residuals are multiplied by `w`, and prior variance by `w²`; the new
+sampled-minus-coarse residual is added to its occupancy bin, and
+`t² p (1-p) / n` is added to the variance. The occupancy mode for subsequent
+measured sleeps is enabled when the sum of the two absolute residuals exceeds
+`2.25 × sqrt(variance) + t / (8n)`. Evidence decays continuously rather than
+being cleared in fixed batches or after a decision. Statistical noise, missed
+boundaries, quantization, and phase patterns that cancel within strata can
+still obscure bias. Skipped or late spans add no evidence; an unavailable raw
+clock cut or inconsistent raw clock history resets it.
+
+On Linux, the active clock uses `CLOCK_MONOTONIC_COARSE`. Startup qualification
+requires a successful read and at least one short batch averaging no more than
+20 ns per read; unavailable or too-costly clocks use ordinary wall time. macOS
+uses its ordinary wall-time policy: `CLOCK_MONOTONIC_RAW_APPROX` reports the
+hardware resolution, but its update interval can be longer.
+
+Clock quantization can miss gaps shorter than a tick, and periodic MPI calls
+aligned with ticks can overestimate residence. There is no per-window error
+bound. For the recent detach threshold, PEAK allows one clock quantum of
+uncertainty, capped by the lifetime target. Lifetime budgeting and reattach
+use cumulative residence. A raced snapshot carries the preceding absolute
+lifetime allowance rather than granting fresh headroom. A failed reader cut
+uses wall time for that cut; a permanent writer-side clock failure disables
+the active-clock path for the rest of the run. MPI wrapper work is excluded
+from measured profiling cost, and this mechanism does not synchronize ranks.
 
 With a valid MPI active-clock sample, including a retained sample when a
 later read races, the rate term uses `max(ema_global_rate, 0)`. Falling

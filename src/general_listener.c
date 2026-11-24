@@ -16,6 +16,7 @@
 #ifdef HAVE_MPI
 #include "internal/general_listener/mpi_report_transport.h"
 #include "internal/mpi_active_clock.h"
+#include "internal/mpi_active_clock_sampling.h"
 #endif
 #include "internal/mpi_active_clock_policy.h"
 #include "internal/jit_provider.h"
@@ -5307,8 +5308,74 @@ peak_general_listener_heartbeat_sample_can_reuse_cache_unlocked(
     }
 }
 
+static struct timespec
+peak_heartbeat_deadline_after(struct timespec start, uint64_t ns)
+{
+    start.tv_sec += ns / UINT64_C(1000000000);
+    start.tv_nsec += (long)(ns % UINT64_C(1000000000));
+    if (start.tv_nsec >= 1000000000L) {
+        start.tv_sec++;
+        start.tv_nsec -= 1000000000L;
+    }
+    return start;
+}
+
+#ifdef HAVE_MPI
+/* Called with heartbeat_mutex held. A signal or wait error ends the
+ * heartbeat wait immediately, just as at the ordinary deadline. */
+static int
+peak_heartbeat_probe_sleep(PeakMpiClockSampler* sampler,
+                           struct timespec realtime_start, uint64_t sleep_ns,
+                           double wait_start, double tolerance)
+{
+    unsigned probes = peak_mpi_active_clock_probe_count(sleep_ns);
+    sampler->incomplete = true;
+    sampler->expected_end = wait_start + (double)sleep_ns * 1e-9;
+    sampler->tolerance = tolerance;
+
+    sampler->start = peak_second();
+    sampler->raw_start =
+        peak_mpi_active_clock_blocked_seconds(peak_main_time, &sampler->start);
+    if (sampler->raw_start < 0.0 ||
+        sampler->start - wait_start > tolerance)
+        return ETIMEDOUT;
+
+    sampler->next_probe_sleep = wait_start + PEAK_MPI_CLOCK_PROBE_INTERVAL_NS * 1e-9;
+    unsigned open_probes = 0;
+    for (unsigned i = 0; i < probes; ++i) {
+        uint64_t offset =
+            peak_mpi_active_clock_probe_offset(sampler, sleep_ns, i, probes);
+        struct timespec deadline =
+            peak_heartbeat_deadline_after(realtime_start, offset);
+        sampler->attempted_probes++;
+        int result = pthread_cond_timedwait(&heartbeat_cond, &heartbeat_mutex,
+                                            &deadline);
+        if (result != ETIMEDOUT || !atomic_load(&heartbeat_running))
+            return result;
+
+        double before = peak_second() - wait_start;
+        int open = peak_mpi_active_clock_peek(peak_main_time);
+        double after = peak_second() - wait_start;
+        /* Reject the complete sample if we missed a stratum or the realtime
+         * wait stopped tracking monotonic time. The heartbeat cut also
+         * checks the original deadline before using the samples. */
+        if (open < 0 ||
+            !peak_mpi_active_clock_probe_ontime(sleep_ns, i, probes, offset, before, tolerance) ||
+            !peak_mpi_active_clock_probe_ontime(sleep_ns, i, probes, offset, after, tolerance))
+            return ETIMEDOUT;
+        open_probes += (unsigned)open;
+    }
+    sampler->probes = probes;
+    sampler->open_probes = open_probes;
+    sampler->incomplete = false;
+    return ETIMEDOUT;
+}
+#else
+typedef struct PeakMpiClockSampler PeakMpiClockSampler;
+#endif
+
 static gboolean
-peak_heartbeat_wait_us(unsigned int sleep_us)
+peak_heartbeat_wait_us(unsigned int sleep_us, PeakMpiClockSampler* sampler)
 {
     pthread_mutex_lock(&heartbeat_mutex);
     if (!atomic_load(&heartbeat_running)) {
@@ -5316,16 +5383,33 @@ peak_heartbeat_wait_us(unsigned int sleep_us)
         return FALSE;
     }
 
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_sec += sleep_us / 1000000U;
-    ts.tv_nsec += (long)(sleep_us % 1000000U) * 1000L;
-    if (ts.tv_nsec >= 1000000000L) {
-        ts.tv_sec += 1;
-        ts.tv_nsec -= 1000000000L;
+    struct timespec start;
+    clock_gettime(CLOCK_REALTIME, &start);
+    uint64_t sleep_ns = (uint64_t)sleep_us * 1000;
+    struct timespec deadline = peak_heartbeat_deadline_after(start, sleep_ns);
+    int result = ETIMEDOUT;
+#ifdef HAVE_MPI
+    if (sampler) {
+        sampler->probes = 0;
+        sampler->incomplete = false;
+        if (sleep_ns && peak_mpi_active_clock_peek(peak_main_time) >= 0) {
+            double wait_start = peak_second();
+            if (wait_start >= sampler->next_probe_sleep) {
+                double tolerance = fmin(0.0005, sleep_us * 0.125e-6);
+                result = peak_heartbeat_probe_sleep(
+                    sampler, start, sleep_ns, wait_start, tolerance);
+            }
+        }
     }
-
-    (void)pthread_cond_timedwait(&heartbeat_cond, &heartbeat_mutex, &ts);
+#else
+    (void)sampler;
+#endif
+    if (result == ETIMEDOUT && atomic_load(&heartbeat_running))
+        result = pthread_cond_timedwait(&heartbeat_cond, &heartbeat_mutex, &deadline);
+#ifdef HAVE_MPI
+    if (sampler && result != ETIMEDOUT)
+        sampler->incomplete = true;
+#endif
     gboolean keep_running = atomic_load(&heartbeat_running);
     pthread_mutex_unlock(&heartbeat_mutex);
     return keep_running;
@@ -5375,7 +5459,16 @@ void* peak_heartbeat_monitor(void* arg) {
     double prev_global_overhead = 0.0;
     double prev_global_time     = now0;
     double ema_global_rate      = 0.0;
+    PeakMpiClockSampler* active_sampler = NULL;
 #ifdef HAVE_MPI
+    PeakMpiClockSampler sampler = {
+        .random = ((uint64_t)(now0 * 1e9) << 16) ^ (uint64_t)getpid()
+    };
+    if (enable_global_heartbeat)
+        active_sampler = &sampler;
+    PeakMpiClockResidence residence = {
+        .epoch = peak_main_time, .now = peak_main_time, .match_sleep = true
+    };
     double previous_active_elapsed = 0.0;
     double previous_active_blocked = -1.0;
     double previous_active_cost = 0.0;
@@ -5393,7 +5486,7 @@ void* peak_heartbeat_monitor(void* arg) {
             (unsigned int)clipd((double)heartbeat_time,
                                 (double)hb_min_us,
                                 (double)hb_max_us);
-        if (!peak_heartbeat_wait_us(initial_sleep_us)) {
+        if (!peak_heartbeat_wait_us(initial_sleep_us, active_sampler)) {
             goto cleanup;
         }
     }
@@ -5411,6 +5504,11 @@ void* peak_heartbeat_monitor(void* arg) {
         double blocked = enable_global_heartbeat
             ? peak_mpi_active_clock_blocked_seconds(peak_main_time, &now)
             : PEAK_MPI_CLOCK_UNAVAILABLE;
+        /* The policy below uses the same corrected increments for lifetime
+         * and recent credit, invalidating the recent baseline on a missed cut. */
+        if (active_sampler)
+            blocked = peak_mpi_active_clock_accumulate(
+                &residence, active_sampler, now, blocked);
 #endif
 
         pthread_mutex_lock(&lock);
@@ -6085,7 +6183,7 @@ void* peak_heartbeat_monitor(void* arg) {
         peak_general_listener_management_cpu_checkpoint(
             &management_cpu_checkpoint_ns,
             &management_cpu_checkpoint_valid);
-        if (!peak_heartbeat_wait_us((unsigned int)sleep_us)) {
+        if (!peak_heartbeat_wait_us((unsigned int)sleep_us, active_sampler)) {
             break;
         }
     }
@@ -6094,11 +6192,23 @@ cleanup:
 #ifdef HAVE_MPI
     if (reported_active_elapsed > 0.0) {
         peak_log_debug("[peak mpi active clock] pid=%ld elapsed=%.9g blocked=%.9g "
-                       "lifetime_target=%.9g configured_target=%.9g\n",
+                       "lifetime_target=%.9g configured_target=%.9g "
+                       "phase_probes=%llu phase_windows=%llu phase_corrections=%llu "
+                       "phase_seconds=%.9g\n",
                        (long)getpid(), reported_active_elapsed, reported_active_blocked,
                        peak_mpi_active_clock_carried_ratio(
                            global_target_ratio, reported_active_elapsed, last_active_budget),
-                       (double)global_target_ratio);
+                       (double)global_target_ratio,
+                       (unsigned long long)sampler.attempted_probes,
+                       (unsigned long long)sampler.sampled_windows,
+                       (unsigned long long)sampler.corrected_windows,
+                       sampler.sampled_seconds);
+    }
+    if (sampler.sampled_windows) {
+        peak_log_debug("[peak mpi active clock phase] pid=%ld sampled_residence=%.9g "
+                       "sampled_raw=%.9g occupancy_seconds=%.9g\n",
+                       (long)getpid(), sampler.sampled_residence, sampler.sampled_raw,
+                       sampler.occupancy_seconds);
     }
 #endif
     pthread_mutex_lock(&lock);

@@ -2634,11 +2634,14 @@ def check_global_detach_overhead_selection(repo_root):
             "global detach must sort candidates by actual overhead ratio")
     require(comparator.find("x->ratio") < comparator.find("x->rate"),
             "global detach comparator must prioritize ratio before rate")
-    initial_wait = heartbeat.find("peak_heartbeat_wait_us(initial_sleep_us)")
+    initial_wait = re.search(
+        r"peak_heartbeat_wait_us\(\s*initial_sleep_us(?:\s*,\s*active_sampler)?\s*\)",
+        heartbeat,
+    )
     loop_start = heartbeat.find("while (atomic_load(&heartbeat_running))")
     require("pthread_cond_timedwait" in wait_helper,
             "heartbeat wait helper must use the existing condition wait")
-    require(initial_wait != -1 and loop_start != -1 and initial_wait < loop_start,
+    require(initial_wait is not None and loop_start != -1 and initial_wait.start() < loop_start,
             "heartbeat must wait one interval before the first detach decision")
     require("PEAK_HEARTBEAT_MIN_OBSERVATION_US" in source and
             "min_detach_observation_time" in heartbeat and
