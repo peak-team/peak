@@ -288,6 +288,49 @@ test_phase_pattern(PhasePattern pattern)
     }
 }
 
+static void
+test_mixed_sampled_and_raw_spans(void)
+{
+    const double gap = 0x1p-12;
+    const double tick = 0x1p-10;
+    const double span = 0x1p-5;
+    PeakMpiClockResidence residence = {
+        .epoch = epoch, .now = epoch + span, .match_sleep = true,
+    };
+    PeakMpiClockSampler window = {
+        .start = residence.now + gap, .raw_start = tick,
+        .probes = 2, .open_probes = 2, .use_occupancy = true,
+    };
+    double raw = tick + span;
+    window.expected_end = window.start + span;
+    double blocked = peak_mpi_active_clock_accumulate(
+        &residence, &window, window.expected_end, raw);
+    /* Equal sleep estimates still require bounding the raw management gap. */
+    assert(blocked == gap + span);
+    assert(window.corrected_windows == 1);
+
+    /* Preserve the raw quantum in a heartbeat that made no probes. */
+    window.probes = 0;
+    raw += tick;
+    double previous = blocked;
+    blocked = peak_mpi_active_clock_accumulate(
+        &residence, &window, residence.now + gap, raw);
+    assert(blocked - previous == tick);
+
+    window.start = residence.now + gap;
+    window.expected_end = window.start + span;
+    window.raw_start = raw + tick;
+    window.probes = 2;
+    window.open_probes = 1;
+    window.use_occupancy = true;
+    raw = window.raw_start + span / 4.0;
+    previous = blocked;
+    blocked = peak_mpi_active_clock_accumulate(
+        &residence, &window, window.expected_end, raw);
+    assert(blocked - previous == gap + span / 2.0);
+    assert(window.corrected_windows == 2);
+}
+
 int
 main(void)
 {
@@ -431,4 +474,5 @@ main(void)
     test_phase_pattern(PHASE_WITH_LONG_WAIT);
     test_phase_pattern(PHASE_ALL_COMPUTE);
     test_phase_pattern(PHASE_ALL_MPI);
+    test_mixed_sampled_and_raw_spans();
 }

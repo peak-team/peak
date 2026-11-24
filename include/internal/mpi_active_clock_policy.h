@@ -1,6 +1,7 @@
 #ifndef PEAK_MPI_ACTIVE_CLOCK_POLICY_H
 #define PEAK_MPI_ACTIVE_CLOCK_POLICY_H
 
+#include <float.h>
 #include <math.h>
 #include <stddef.h>
 
@@ -45,6 +46,61 @@ static inline double peak_mpi_active_clock_recent_ratio(
     double upper = peak_mpi_active_clock_policy(
         q, elapsed, fmax(0.0, blocking - quantum), possible_overlap).ratio;
     return fmax(measured, fmin(upper, lifetime_ratio));
+}
+
+typedef struct {
+    double elapsed, blocked, overlap;
+    double sampled_exposure, squared_weight;
+} PeakMpiActiveClockRecent;
+
+enum { PEAK_MPI_ACTIVE_CLOCK_RECENT_PROBES = 64 };
+
+static inline double peak_mpi_active_clock_recent_horizon(
+    double heartbeat_max, double probe_interval)
+{
+    /* Fixed heartbeats shorter than the throttle can wait nearly two probe
+     * intervals between sampled sleeps. Leave one extra opportunity because
+     * slight timing variation can make 64 probes fall just below the target. */
+    return (PEAK_MPI_ACTIVE_CLOCK_RECENT_PROBES + 1) *
+        fmax(heartbeat_max, 2.0 * probe_interval);
+}
+
+/* Keep costs and residence on the same interval. Raw cuts can bridge
+ * sampled cuts, without increasing the weight of the sampled observations. */
+static inline int peak_mpi_active_clock_recent_add(
+    PeakMpiActiveClockRecent* recent, double max_elapsed, double elapsed,
+    double blocked, double overlap, double sampled_exposure, unsigned probes)
+{
+    if (!probes && recent->elapsed == 0.0)
+        return 0;
+    if (recent->elapsed + elapsed > max_elapsed) {
+        *recent = (PeakMpiActiveClockRecent){0};
+        return 0;
+    }
+    recent->elapsed += elapsed;
+    recent->blocked += blocked;
+    recent->overlap += overlap;
+    if (probes) {
+        /* Each probe represents an equal share of its sleep exposure. */
+        recent->sampled_exposure += sampled_exposure;
+        recent->squared_weight += sampled_exposure * sampled_exposure / probes;
+        /* Equal-weight probes count one each. Uneven exposure requires more
+         * observations so a few unusually long sleeps cannot dominate. */
+        double threshold = PEAK_MPI_ACTIVE_CLOCK_RECENT_PROBES * (1.0 - 8.0 * DBL_EPSILON);
+        if (recent->squared_weight > 0.0 &&
+            recent->sampled_exposure * recent->sampled_exposure >=
+                threshold * recent->squared_weight)
+            return 1;
+    }
+    return 0;
+}
+
+static inline double peak_mpi_active_clock_recent_sampled_ratio(
+    double q, const PeakMpiActiveClockRecent* recent)
+{
+    return peak_mpi_active_clock_policy(
+        q, recent->elapsed, fmin(recent->elapsed, recent->blocked),
+        recent->overlap).ratio;
 }
 
 /* A missed snapshot carries the preceding allowance in seconds. A negative

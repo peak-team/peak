@@ -3,6 +3,7 @@
 
 #include <assert.h>
 #include <float.h>
+#include <stdio.h>
 
 static int equal(double a, double b)
 {
@@ -349,6 +350,269 @@ static void test_phase_selection_adapts_to_workload_change(void)
     }
 }
 
+#ifndef PEAK_DETACH_TRACE_TRIALS
+#define PEAK_DETACH_TRACE_TRIALS 256U
+#endif
+
+enum DetachHeartbeat {
+    DETACH_FIXED,
+    DETACH_VARIABLE,
+    DETACH_DOMINANT_SLEEP,
+};
+
+enum DetachComparison {
+    DETACH_LEGACY,
+    DETACH_CURRENT,
+    DETACH_EXACT,
+    DETACH_COMPARISONS
+};
+
+typedef struct {
+    unsigned decisions[DETACH_COMPARISONS];
+    unsigned trials_with_request[DETACH_COMPARISONS];
+    unsigned horizon_requests[DETACH_COMPARISONS];
+    unsigned requests_within_two_seconds[DETACH_COMPARISONS];
+    unsigned before_change_trials[DETACH_COMPARISONS];
+    unsigned cuts_without_applied_sampling;
+    unsigned observations;
+    double first_request_sum[DETACH_COMPARISONS];
+} DetachRun;
+
+static void test_recent_probe_throttle_and_expiry(void)
+{
+    const uint64_t sleep_ns = UINT64_C(9000000);
+    const double elapsed = sleep_ns * 1e-9;
+    const double horizon = peak_mpi_active_clock_recent_horizon(
+        elapsed, PEAK_MPI_CLOCK_PROBE_INTERVAL_NS * 1e-9);
+    PeakMpiActiveClockRecent recent = {0};
+    uint64_t next_probe_ns = 0;
+    unsigned cuts = 0;
+    unsigned observations = 0;
+    for (uint64_t start_ns = 0; start_ns * 1e-9 < horizon; start_ns += sleep_ns) {
+        unsigned probes = 0;
+        if (start_ns >= next_probe_ns) {
+            probes = peak_mpi_active_clock_probe_count(sleep_ns);
+            next_probe_ns = start_ns + PEAK_MPI_CLOCK_PROBE_INTERVAL_NS;
+        }
+        ++cuts;
+        observations += probes;
+        if (peak_mpi_active_clock_recent_add(
+                &recent, horizon, elapsed, probes ? elapsed : 0.0,
+                elapsed / 20.0, probes ? elapsed : 0.0, probes))
+            break;
+    }
+    assert(cuts == 127 && observations == 64);
+    assert(equal(recent.elapsed, cuts * elapsed));
+    assert(equal(recent.sampled_exposure, observations * elapsed));
+    assert(equal(recent.blocked, observations * elapsed));
+    assert(equal(recent.overlap, cuts * elapsed / 20.0));
+
+    recent = (PeakMpiActiveClockRecent){0};
+    assert(!peak_mpi_active_clock_recent_add(
+        &recent, horizon, elapsed, elapsed, 0.0, elapsed, 1));
+    assert(!peak_mpi_active_clock_recent_add(
+        &recent, horizon, horizon, 0.0, 0.0, 0.0, 0));
+    assert(recent.elapsed == 0.0 && recent.sampled_exposure == 0.0);
+}
+
+static void run_detach_trace(DetachRun* result, unsigned seconds, bool transition,
+                             enum DetachHeartbeat heartbeat, unsigned stable_mpi_us)
+{
+    const uint64_t tick_ns = UINT64_C(4000000);
+    const uint64_t variable_ticks[] = {25, 5, 13, 25, 9, 3};
+    const uint64_t dominant_ticks[] = {100, 3, 3, 3, 3, 3};
+    const double q = 0.1, pressure = 0.05, factor = 1.2;
+    const uint64_t end_ns = seconds * UINT64_C(1000000000);
+    const uint64_t transition_ns = UINT64_C(5000000000);
+    const uint64_t begin_scoring_ns = transition ? transition_ns : 0;
+    const double tick = tick_ns * 1e-9;
+    const double horizon = peak_mpi_active_clock_recent_horizon(
+        heartbeat == DETACH_DOMINANT_SLEEP ? 0.4 : 0.1,
+        PEAK_MPI_CLOCK_PROBE_INTERVAL_NS * 1e-9);
+
+    for (uint64_t trial = 0; trial < PEAK_DETACH_TRACE_TRIALS; ++trial) {
+        /* Use the heartbeat's epoch/PID seed construction and SplitMix64.
+         * All three decisions in each trial see the same probe stream. */
+        double epoch = 1.0 + trial * 2e-6;
+        PeakMpiClockSampler sampler = {
+            .random = ((uint64_t)(epoch * 1e9) << 16) ^ (UINT64_C(1000) + trial),
+        };
+        PeakMpiClockResidence residence = {.epoch = epoch, .now = epoch, .match_sleep = true};
+        uint64_t elapsed_ns = 0, truth_ns = 0, raw_ns = 0;
+        unsigned beat = 0;
+        double corrected = 0.0;
+        PeakMpiActiveClockRecent block = {0};
+        bool requested[DETACH_COMPARISONS] = {false};
+        bool before_change[DETACH_COMPARISONS] = {false};
+
+        while (elapsed_ns < end_ns) {
+            unsigned index = beat % (sizeof(variable_ticks) / sizeof(variable_ticks[0]));
+            uint64_t ticks = 25;
+            if (heartbeat == DETACH_VARIABLE)
+                ticks = variable_ticks[index];
+            if (heartbeat == DETACH_DOMINANT_SLEEP)
+                ticks = dominant_ticks[index];
+            uint64_t sleep_ns = tick_ns * ticks;
+            if (sleep_ns > end_ns - elapsed_ns)
+                sleep_ns = end_ns - elapsed_ns;
+            if (transition && elapsed_ns < transition_ns && sleep_ns > transition_ns - elapsed_ns)
+                sleep_ns = transition_ns - elapsed_ns;
+            uint64_t mpi_ns = (transition && elapsed_ns >= transition_ns
+                               ? 3200 : stable_mpi_us) * UINT64_C(1000);
+            uint64_t previous_elapsed_ns = elapsed_ns;
+
+            sampler.start = residence.now;
+            sampler.raw_start = raw_ns * 1e-9;
+            sampler.probes = peak_mpi_active_clock_probe_count(sleep_ns);
+            sampler.open_probes = 0;
+            for (unsigned probe = 0; probe < sampler.probes; ++probe) {
+                uint64_t offset = peak_mpi_active_clock_probe_offset(
+                    &sampler, sleep_ns, probe, sampler.probes);
+                /* Every short wait sits inside one coarse tick. Full MPI
+                 * runs continuously and is charged by the coarse clock. */
+                sampler.open_probes += mpi_ns == tick_ns ||
+                    (offset % tick_ns >= UINT64_C(200000) &&
+                     offset % tick_ns < UINT64_C(200000) + mpi_ns);
+            }
+
+            elapsed_ns += sleep_ns;
+            truth_ns += (sleep_ns / tick_ns) * mpi_ns;
+            raw_ns += mpi_ns == tick_ns ? sleep_ns : 0;
+            double now = epoch + elapsed_ns * 1e-9;
+            sampler.expected_end = sampler.start + sleep_ns * 1e-9;
+            sampler.tolerance = 0.0005;
+            double recent_elapsed = now - residence.now;
+            double previous = corrected;
+            corrected = peak_mpi_active_clock_accumulate(&residence, &sampler, now, raw_ns * 1e-9);
+            double elapsed = now - epoch;
+            /* The same still-attached work and recorded overlap are fed to
+             * every decision so requests cannot change subsequent inputs. */
+            double cost = pressure * elapsed;
+            double recent_cost = pressure * recent_elapsed;
+            double lifetime = peak_mpi_active_clock_policy(q, elapsed, corrected, cost).ratio;
+            double exact_lifetime = peak_mpi_active_clock_policy(
+                q, elapsed, fmin(truth_ns * 1e-9, elapsed), cost).ratio;
+            double recent = corrected - previous;
+            double exact_recent = fmin((sleep_ns / tick_ns) * mpi_ns * 1e-9, recent_elapsed);
+            double legacy = peak_mpi_active_clock_recent_ratio(
+                q, recent_elapsed, fmin(recent, recent_elapsed), recent_cost, tick, lifetime);
+            unsigned applied_probes = sampler.applied_sleep_seconds > 0.0 ? sampler.probes : 0;
+            double current = applied_probes ? q : legacy;
+            if (beat && peak_mpi_active_clock_recent_add(
+                    &block, horizon, recent_elapsed, recent, recent_cost,
+                    sampler.applied_sleep_seconds, applied_probes)) {
+                current = peak_mpi_active_clock_recent_sampled_ratio(q, &block);
+                block = (PeakMpiActiveClockRecent){0};
+            }
+            double target[DETACH_COMPARISONS] = {
+                [DETACH_LEGACY] = legacy,
+                [DETACH_CURRENT] = current,
+                [DETACH_EXACT] = peak_mpi_active_clock_policy(
+                    q, recent_elapsed, exact_recent, recent_cost).ratio,
+            };
+            if (beat == 0) {
+                target[DETACH_LEGACY] = q;
+                target[DETACH_CURRENT] = q;
+                target[DETACH_EXACT] = q;
+            }
+            ++beat;
+            bool scoring = previous_elapsed_ns >= begin_scoring_ns;
+            if (scoring) {
+                ++result->observations;
+                if (sampler.applied_sleep_seconds == 0.0)
+                    ++result->cuts_without_applied_sampling;
+            }
+            for (unsigned variant = 0; variant < DETACH_COMPARISONS; ++variant) {
+                double lifetime_target = variant == DETACH_EXACT ? exact_lifetime : lifetime;
+                if (pressure <= target[variant] * factor && pressure <= lifetime_target * factor)
+                    continue;
+                if (!scoring) {
+                    if (!before_change[variant]) {
+                        before_change[variant] = true;
+                        ++result->before_change_trials[variant];
+                    }
+                    continue;
+                }
+                ++result->decisions[variant];
+                if (elapsed_ns == end_ns)
+                    ++result->horizon_requests[variant];
+                if (!requested[variant]) {
+                    requested[variant] = true;
+                    ++result->trials_with_request[variant];
+                    uint64_t delay_ns = elapsed_ns - begin_scoring_ns;
+                    if (transition && delay_ns <= UINT64_C(2000000000))
+                        ++result->requests_within_two_seconds[variant];
+                    result->first_request_sum[variant] += delay_ns * 1e-9;
+                }
+            }
+        }
+    }
+}
+
+static void print_detach_run(const char* label, const DetachRun* result, bool transition)
+{
+    printf("%s (%u decisions): legacy/current/exact detach counts", label, result->observations);
+    for (unsigned i = 0; i < DETACH_COMPARISONS; ++i) {
+        double mean = result->trials_with_request[i]
+            ? result->first_request_sum[i] / result->trials_with_request[i] : 0.0;
+        printf(" %u (%u/%u trials, %u at horizon, %.3fs mean first request",
+               result->decisions[i], result->trials_with_request[i], (unsigned)PEAK_DETACH_TRACE_TRIALS,
+               result->horizon_requests[i], mean);
+        if (transition)
+            printf(", %u within 2s, %u before change", result->requests_within_two_seconds[i],
+                   result->before_change_trials[i]);
+        printf(")");
+    }
+    printf("; %u cuts without applied occupancy samples\n", result->cuts_without_applied_sampling);
+}
+
+static void test_occupancy_recent_detach(void)
+{
+    DetachRun short_run = {0}, long_run = {0}, variable_run = {0};
+    DetachRun transition = {0}, variable_transition = {0};
+    DetachRun all_mpi = {0}, all_compute = {0};
+    DetachRun dominant_run = {0}, dominant_transition = {0};
+    run_detach_trace(&short_run, 5, false, DETACH_FIXED, 1600);
+    run_detach_trace(&long_run, 60, false, DETACH_FIXED, 1600);
+    run_detach_trace(&variable_run, 60, false, DETACH_VARIABLE, 1600);
+    run_detach_trace(&transition, 7, true, DETACH_FIXED, 1600);
+    run_detach_trace(&variable_transition, 7, true, DETACH_VARIABLE, 1600);
+    run_detach_trace(&all_mpi, 5, false, DETACH_FIXED, 4000);
+    run_detach_trace(&all_compute, 5, false, DETACH_FIXED, 0);
+
+    run_detach_trace(&dominant_run, 60, false, DETACH_DOMINANT_SLEEP, 1600);
+    run_detach_trace(&dominant_transition, 10, true, DETACH_DOMINANT_SLEEP, 1600);
+
+    print_detach_run("40% MPI, 100ms, 5s", &short_run, false);
+    print_detach_run("40% MPI, 100ms, 60s", &long_run, false);
+    print_detach_run("40% MPI, variable heartbeat, 60s", &variable_run, false);
+    print_detach_run("40% to 80% MPI, 100ms", &transition, true);
+    print_detach_run("40% to 80% MPI, variable heartbeat", &variable_transition, true);
+    print_detach_run("40% MPI, dominant 400ms heartbeat, 60s", &dominant_run, false);
+    print_detach_run("40% to 80% MPI, dominant 400ms heartbeat", &dominant_transition, true);
+    print_detach_run("100% MPI, 100ms", &all_mpi, false);
+    print_detach_run("0% MPI, 100ms", &all_compute, false);
+    assert(short_run.trials_with_request[DETACH_LEGACY] > PEAK_DETACH_TRACE_TRIALS / 2);
+    assert(long_run.trials_with_request[DETACH_LEGACY] == PEAK_DETACH_TRACE_TRIALS);
+    const DetachRun* stable[] = {&short_run, &long_run, &variable_run, &dominant_run};
+    for (size_t i = 0; i < sizeof(stable) / sizeof(stable[0]); ++i) {
+        assert(stable[i]->decisions[DETACH_EXACT] == 0);
+        assert(stable[i]->trials_with_request[DETACH_CURRENT] <= PEAK_DETACH_TRACE_TRIALS / 25);
+    }
+    const DetachRun* changing[] = {&transition, &variable_transition, &dominant_transition};
+    for (size_t i = 0; i < sizeof(changing) / sizeof(changing[0]); ++i) {
+        assert(changing[i]->decisions[DETACH_EXACT] == changing[i]->observations);
+        assert(changing[i]->cuts_without_applied_sampling == 0);
+        assert(changing[i]->trials_with_request[DETACH_CURRENT] >= PEAK_DETACH_TRACE_TRIALS * 9 / 10);
+    }
+    assert(transition.requests_within_two_seconds[DETACH_CURRENT] == PEAK_DETACH_TRACE_TRIALS);
+    assert(variable_transition.requests_within_two_seconds[DETACH_CURRENT] == PEAK_DETACH_TRACE_TRIALS);
+    for (unsigned variant = 0; variant < DETACH_COMPARISONS; ++variant) {
+        assert(all_mpi.decisions[variant] == all_mpi.observations);
+        assert(all_compute.decisions[variant] == 0);
+    }
+}
+
 int main(void)
 {
     expect(20.0, 0.0, 0.0, 0.1, 2.0, 0);
@@ -382,4 +646,6 @@ int main(void)
     test_timing_rejections_preserve_phase_evidence();
     test_phase_full_sample_bounds_raw_overrun();
     test_phase_selection_adapts_to_workload_change();
+    test_recent_probe_throttle_and_expiry();
+    test_occupancy_recent_detach();
 }

@@ -454,7 +454,10 @@ MPI residence for that sleep. Estimates from sleeps of different elapsed
 lengths contribute in proportion to their wall-time duration. This is a
 prospective measurement: after persistent disagreement with the coarse clock,
 sampled occupancy is used for subsequent measured sleeps; no earlier time is
-replayed or rewritten.
+replayed or rewritten. When a sleep uses sampled occupancy, the preceding
+management gap contributes at most its wall duration. A coarse tick observed
+in that gap can straddle the sampled sleep boundary. The raw cursor still
+advances by the full tick.
 
 The first regular sleep can be sampled, without moving the original heartbeat
 wake or first policy assessment. After a sampled sleep, another can be sampled
@@ -491,9 +494,22 @@ hardware resolution, but its update interval can be longer.
 
 Clock quantization can miss gaps shorter than a tick, and periodic MPI calls
 aligned with ticks can overestimate residence. There is no per-window error
-bound. For the recent detach threshold, PEAK allows one clock quantum of
-uncertainty, capped by the lifetime target. Lifetime budgeting and reattach
-use cumulative residence. A raced snapshot carries the preceding absolute
+bound. For a raw recent interval, PEAK allows one clock quantum of
+uncertainty, capped by the lifetime target. When sampled occupancy supplies
+residence, PEAK tightens the recent detach threshold only after a group of
+heartbeat intervals supplies 64 effective probes. A probe's weight is the
+wall duration of its sleep divided by that sleep's probe count. Unequal
+weights require more observations. The group supplies the elapsed time, MPI
+residence, change in profiling and control cost, and each attached hook's
+call rate used to select and debit detach candidates. Each completed group
+is consumed once. A group expires after 65 times the larger of the configured
+maximum heartbeat interval and 20 ms. This gives short heartbeats time to
+gather evidence under the 10 ms probe throttle. Cuts without applied samples
+contribute their coarse-clock residence and hook costs to an open group.
+A single heartbeat can still trigger detach through its ordinary
+wall-time limit, and lifetime pressure remains actionable on every cut.
+Lifetime budgeting and reattach use cumulative residence.
+A raced snapshot carries the preceding absolute
 lifetime allowance rather than granting fresh headroom. A failed reader cut
 uses wall time for that cut; a permanent writer-side clock failure disables
 the active-clock path for the rest of the run. MPI wrapper work is excluded

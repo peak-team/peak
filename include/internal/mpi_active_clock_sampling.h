@@ -13,6 +13,7 @@ typedef struct PeakMpiClockSampler {
     double next_probe_sleep;
     double start, raw_start;
     double expected_end, tolerance;
+    double applied_sleep_seconds;
     unsigned probes, open_probes;
     bool incomplete;
     bool use_occupancy;
@@ -140,10 +141,15 @@ static inline double peak_mpi_active_clock_sampled_delta(
     if (!use_occupancy)
         return delta;
     sampler->occupancy_seconds += elapsed;
-    if (sampled == raw_sleep)
+    sampler->applied_sleep_seconds = elapsed;
+    /* A coarse tick can exceed the management gap. Cap its contribution
+     * before adding the separately measured sleep residence. */
+    double raw_gap = sampler->raw_start - previous_raw;
+    double gap = fmin(raw_gap, sampler->start - previous_now);
+    if (sampled == raw_sleep && gap == raw_gap)
         return delta;
     sampler->corrected_windows++;
-    return delta - raw_sleep + sampled;
+    return gap + sampled;
 }
 
 typedef struct {
@@ -155,6 +161,7 @@ static inline double peak_mpi_active_clock_accumulate(
     PeakMpiClockResidence* residence, PeakMpiClockSampler* sampler,
     double now, double raw)
 {
+    sampler->applied_sleep_seconds = 0.0;
     bool raw_regressed = raw < residence->raw;
     if (raw < 0.0 || raw_regressed)
         peak_mpi_active_clock_reset_evidence(sampler);
@@ -163,9 +170,9 @@ static inline double peak_mpi_active_clock_accumulate(
         return raw;
     }
 
-    /* Preserve coarse deltas outside replaced spans, including quantized
-     * steps larger than a heartbeat. Keep the raw high-water mark through
-     * a regression so a later cut cannot bill it again. */
+    /* Preserve coarse deltas for raw-only spans, including quantized steps
+     * larger than a heartbeat. Keep the raw high-water mark through a
+     * regression so a later cut cannot bill it again. */
     double delta = residence->match_sleep && !raw_regressed
         ? peak_mpi_active_clock_sampled_delta(
             sampler, residence->now, residence->raw, now, raw)

@@ -2068,7 +2068,7 @@ def check_stop_window_accounting_sidecar(repo_root):
         adaptive_sleep_start:heartbeat.find("cleanup:", adaptive_sleep_start)
     ]
     require(re.search(
-        r"\}\s*else\s*\{[^{}]*previous_active_blocked = -1\.0;\s*"
+        r"\}\s*else\s*\{[^;]*previous_active_blocked = -1\.0;\s*"
         r"if \(blocked != PEAK_MPI_CLOCK_UNAVAILABLE\)\s*\{[^{}]*"
         r"peak_mpi_active_clock_carried_ratio\(",
         heartbeat,
@@ -2116,7 +2116,7 @@ def check_stop_window_accounting_sidecar(repo_root):
     require("ratio_snapshot[i] > target_profile_ratio" in per_target_detach and
             "rate_snapshot[i] > target_profile_ratio" not in per_target_detach and
             "gboolean accepted =" in per_target_detach and
-            "projected_attached_recent_sum -= rate_snapshot[i]" in per_target_detach and
+            "projected_attached_recent_sum -= detach_rate" in per_target_detach and
             "projected_attached_lifetime_sum -= ratio_snapshot[i]" in per_target_detach and
             "control_spent_seconds" not in per_target_detach and
             "risk" not in per_target_detach and
@@ -2140,15 +2140,30 @@ def check_stop_window_accounting_sidecar(repo_root):
             "lifetime_target = lifetime.ratio" in heartbeat,
             "detach window targets must default to the configured ratio and use "
             "their matching active-clock decisions")
-    require("double contribution = MAX(rate_snapshot[i], ratio_snapshot[i])"
-            in global_detach_tokens and
+    heartbeat_tokens = " ".join(heartbeat.split())
+    require("sampled_recent_elapsed = sampled_recent.elapsed; "
+            "projected_attached_recent_sum = sampled_attached_seconds / sampled_recent_elapsed; "
+            "recent_target = peak_mpi_active_clock_recent_sampled_ratio( "
+            "global_target_ratio, &sampled_recent);" in heartbeat_tokens and
+            "sampled_attached_seconds += "
+            "(double)(total_num_calls - baseline->calls) * peak_general_overhead" in heartbeat_tokens,
+            "sampled target and attached pressure must use the same cut interval")
+    aligned_rate = ("double detach_rate = sampled_recent_elapsed > 0.0 "
+                    "? peak_heartbeat_recent_rate( calls_snapshot[i], "
+                    "sampled_recent_baseline[i].calls, sampled_recent_elapsed) : rate_snapshot[i];")
+    require(aligned_rate in global_detach_tokens and
+            aligned_rate in " ".join(per_target_detach.split()) and
+            "double contribution = MAX(detach_rate, ratio_snapshot[i])" in global_detach_tokens and
+            "contribution = MAX(detach_rate / MAX(recent_target, 1e-15), "
+            "ratio_snapshot[i] / MAX(lifetime_target, 1e-15))" in global_detach_tokens and
             "if (contribution <= 0.0) continue;" in global_detach_for_budget and
             "entries[n_attached].ratio = contribution" in global_detach_for_budget and
-            "entries[n_attached].rate = rate_snapshot[i]" in global_detach_for_budget and
+            "entries[n_attached].rate = detach_rate" in global_detach_for_budget and
             "entries[n_attached].lifetime = ratio_snapshot[i]" in global_detach_for_budget and
             "double reduced_recent_sum = projected_attached_recent_sum" in global_detach_for_budget and
             "double reduced_lifetime_sum = projected_attached_lifetime_sum" in global_detach_for_budget and
-            "reduced_recent_sum -= entries[k].rate" in global_detach_for_budget and
+            "if (accepted) { wake_controller = TRUE; "
+            "reduced_recent_sum -= entries[k].rate;" in global_detach_tokens and
             "reduced_lifetime_sum -= entries[k].lifetime" in global_detach_for_budget and
             "projected_attached_recent_sum = reduced_recent_sum" in global_detach_for_budget and
             "projected_attached_lifetime_sum = reduced_lifetime_sum" in global_detach_for_budget and
