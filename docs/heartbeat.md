@@ -146,6 +146,7 @@ spent_ratio =
 Heartbeat management CPU time is tracked separately with
 `CLOCK_THREAD_CPUTIME_ID` checkpoints around active policy work. It is reported
 as diagnostics and is not added to detach pressure or reattach admission.
+Randomized probes run during the timed wait, outside those CPU checkpoints.
 
 ## Detach Signals
 
@@ -497,6 +498,11 @@ lifetime allowance rather than granting fresh headroom. A failed reader cut
 uses wall time for that cut; a permanent writer-side clock failure disables
 the active-clock path for the rest of the run. MPI wrapper work is excluded
 from measured profiling cost, and this mechanism does not synchronize ranks.
+Two values of `q` can detach the same hot CPU hooks and retain similar numbers
+of calls. PEAK continues observing eligible MPI calls while those hooks are
+detached to estimate headroom for reattachment. At high communication rates,
+this per-call cost and its effect on peer progress can outweigh differences
+in hook cost. Increasing `q` therefore need not increase elapsed time.
 
 With a valid MPI active-clock sample, including a retained sample when a
 later read races, the rate term uses `max(ema_global_rate, 0)`. Falling
