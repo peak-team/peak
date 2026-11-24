@@ -343,6 +343,9 @@ if(PEAK_BUILD_ATTACH)
         "PEAK_ATTACH_VERSION=\"${PROJECT_VERSION}\""
         "PEAK_ATTACH_AGENT_NAME=\"${CMAKE_SHARED_LIBRARY_PREFIX}peak-attach${CMAKE_SHARED_LIBRARY_SUFFIX}\""
         "PEAK_ATTACH_AGENT_RELATIVE_PATH=\"${_peak_attach_agent_relative}\"")
+    if(PEAK_FRIDA_CORE_DARWIN_INPROCESS)
+        target_compile_definitions(peak_attach PRIVATE PEAK_ATTACH_DARWIN_INPROCESS=1)
+    endif()
     target_link_libraries(peak_attach PRIVATE ${FRIDA_CORE_LIBRARIES}
         Threads::Threads ${DL_LIBRARY} ${RT_LIBRARY} ${RESOLV_LIBRARY} ${M_LIBRARY})
     if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")

@@ -13,6 +13,7 @@ import time
 p = argparse.ArgumentParser()
 for name in ("cli", "fixture", "agent"):
     p.add_argument("--" + name, type=Path, required=True)
+p.add_argument("--darwin-inprocess", action="store_true")
 a = p.parse_args()
 env = {k: v for k, v in os.environ.items() if not k.startswith(("PEAK_", "FLAME_"))
        and k not in ("LD_PRELOAD", "LD_AUDIT", "DYLD_INSERT_LIBRARIES")}
@@ -169,6 +170,9 @@ with tempfile.TemporaryDirectory(prefix="peak-attach-transport-") as directory:
             command = [str(a.cli.resolve()), str(target.pid), "--target",
                        "peak_attach_existing_target", "--agent", str(a.agent.resolve())]
             for cancel in (True, False):
+                log_path = root / "target.log"
+                entered = "attach transport agent entered"
+                previous_entries = log_path.read_text().count(entered)
                 started = time.monotonic()
                 host = subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
                                         stderr=subprocess.PIPE, text=True,
@@ -177,7 +181,7 @@ with tempfile.TemporaryDirectory(prefix="peak-attach-transport-") as directory:
                 history = []
                 try:
                     deadline = time.monotonic() + 3
-                    saw_worker = saw_helper = False
+                    saw_worker = saw_helper = saw_agent = False
                     while time.monotonic() < deadline and host.poll() is None:
                         snapshot = census()
                         history.append((time.monotonic() - started, snapshot))
@@ -186,11 +190,17 @@ with tempfile.TemporaryDirectory(prefix="peak-attach-transport-") as directory:
                                    if process.parent == host.pid and pid in tracked}
                         saw_worker |= bool(workers)
                         saw_helper |= any(process.parent in workers for process in snapshot.values())
-                        if saw_worker and (sys.platform != "darwin" or saw_helper):
+                        if a.darwin_inprocess:
+                            saw_agent = log_path.read_text().count(entered) > previous_entries
+                            if saw_worker and saw_agent:
+                                break
+                        elif saw_worker and (sys.platform != "darwin" or saw_helper):
                             break
                         time.sleep(0.01)
                     assert saw_worker, "did not observe isolated injection worker"
-                    if sys.platform == "darwin":
+                    if a.darwin_inprocess:
+                        assert saw_agent, "isolated worker did not enter the target agent"
+                    elif sys.platform == "darwin":
                         assert saw_helper, ("did not observe Core helper before cancellation/timeout", tracked)
                     if cancel:
                         host.send_signal(signal.SIGINT)
@@ -204,6 +214,8 @@ with tempfile.TemporaryDirectory(prefix="peak-attach-transport-") as directory:
                         time.sleep(0.02)
                     stdout, stderr = host.communicate(timeout=1)
                     assert host.returncode != 0, (stdout, stderr)
+                    if a.darwin_inprocess:
+                        assert "Darwin injector running inside the PEAK worker" in stderr, stderr
                     elapsed = time.monotonic() - started
                     assert elapsed < (9 if cancel else 19), elapsed
                     if not cancel:

@@ -310,7 +310,6 @@ static char *default_bootstrap(void);
 static int run_injector(guint pid, const char *agent, const char *socket_path,
                         int control_fd)
 {
-    FridaInjector *injector = frida_injector_new();
     GError *error = NULL;
     const char *injection_path = agent;
     const char *entrypoint = PEAK_ATTACH_ENTRYPOINT;
@@ -321,7 +320,6 @@ static int run_injector(guint pid, const char *agent, const char *socket_path,
         fprintf(stderr,
                 "peak-attach: Darwin bootstrap library is unreadable\n");
         g_free(bootstrap);
-        g_object_unref(injector);
         return 1;
     }
     if (strlen(agent) + strlen(socket_path) + 20 >=
@@ -329,7 +327,6 @@ static int run_injector(guint pid, const char *agent, const char *socket_path,
         fprintf(stderr, "peak-attach: agent and socket paths exceed Darwin "
                         "injection data capacity\n");
         g_free(bootstrap);
-        g_object_unref(injector);
         return 1;
     }
     char *payload =
@@ -338,6 +335,16 @@ static int run_injector(guint pid, const char *agent, const char *socket_path,
     injection_path = bootstrap;
     entrypoint = "peak_attach_bootstrap_main";
     data = payload;
+#endif
+#if defined(PEAK_ATTACH_DARWIN_INPROCESS)
+    /* The pinned Darwin backend accepts a remote PID and performs the same
+     * Mach task authorization as Frida's external helper. This function runs
+     * inside PEAK's isolated worker, so a second helper and its startup
+     * handshake are unnecessary. */
+    FridaInjector *injector = frida_injector_new_inprocess();
+    diagnostic_phase("Darwin injector running inside the PEAK worker");
+#else
+    FridaInjector *injector = frida_injector_new();
 #endif
     diagnostic_phase("inject begin");
     frida_injector_inject_library_file_sync(injector, pid, injection_path,

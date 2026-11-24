@@ -434,7 +434,8 @@ else:
                 filesystem_phase(target, root / "fixture.log", "B")
                 code, output = run([cli, str(target.pid), "--agent", str(copied_agent),
                                     "--target", "peak_attach_existing_target"], env)
-                assert code != 0 and "already" in output.lower(), (code, output)
+                assert code != 0 and "already" in output.lower(), (
+                    code, output, fixture_evidence(target, root / "fixture.log", output))
                 alive(target, progress, root / "fixture.log")
             filesystem_phase(target, root / "fixture.log", "G")
             if args.mode == "runtime":
