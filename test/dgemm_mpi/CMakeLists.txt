@@ -5,6 +5,13 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(test_mpi_active_clock test_mpi_active_clock.c)
     target_link_libraries(test_mpi_active_clock PRIVATE MPI::MPI_C)
     target_link_options(test_mpi_active_clock PRIVATE -Wl,--export-dynamic)
+
+    add_executable(test_mpi_active_clock_sampling test_mpi_active_clock_sampling.c)
+    target_include_directories(test_mpi_active_clock_sampling PRIVATE ${PROJECT_SOURCE_DIR}/include)
+    target_compile_options(test_mpi_active_clock_sampling PRIVATE -UNDEBUG)
+    target_link_libraries(test_mpi_active_clock_sampling
+        PRIVATE MPI::MPI_C Threads::Threads ${CMAKE_DL_LIBS} m)
+    add_test(NAME test_mpi_active_clock_sampling COMMAND test_mpi_active_clock_sampling)
 endif()
 add_library(test_mpi_init_deferred_module MODULE
     mpi_init_deferred_module.c)

@@ -86,11 +86,16 @@ set_tests_properties(test_attach_config PROPERTIES TIMEOUT 10)
 
 add_library(test_attach_unresponsive_agent MODULE unresponsive_agent.c)
 set_target_properties(test_attach_unresponsive_agent PROPERTIES PREFIX "")
+set(_peak_attach_transport_options)
+if(PEAK_FRIDA_CORE_DARWIN_INPROCESS)
+    list(APPEND _peak_attach_transport_options --darwin-inprocess)
+endif()
 add_test(NAME test_attach_transport
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/run_transport.py
         --cli $<TARGET_FILE:peak_attach>
         --fixture $<TARGET_FILE:test_attach_fixture>
-        --agent $<TARGET_FILE:test_attach_unresponsive_agent>)
+        --agent $<TARGET_FILE:test_attach_unresponsive_agent>
+        ${_peak_attach_transport_options})
 set_tests_properties(test_attach_transport PROPERTIES TIMEOUT 60)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")

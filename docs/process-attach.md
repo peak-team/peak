@@ -169,6 +169,14 @@ files are
 signing settings describe the permissions required by the test fixture; they
 are not a recommendation to weaken signing policy for production apps.
 
+With the pinned macOS Arm64 Frida Core archive, PEAK runs Frida's Darwin
+injector backend inside its isolated worker to avoid the separate Frida
+helper's startup handshake. Frida documents this factory for same-process
+injection. In the pinned Darwin implementation its backend accepts the
+requested remote PID and still requires the worker to obtain the target's
+Mach task port through normal debugging authorization. Builds using a
+caller-provided Core archive use Frida's separate helper.
+
 The macOS Arm64 backend installs the initial hook set while holding target
 threads and uses the staged Darwin patch operation. After initialization, the
 Darwin controller can stage `ATTACH` and `REPLACE` operations for new entries;

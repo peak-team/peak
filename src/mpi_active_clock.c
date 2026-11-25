@@ -1,5 +1,7 @@
 #define _GNU_SOURCE
 #include "internal/mpi_active_clock.h"
+#include "internal/mpi_epoch_policy.h"
+#include "logging.h"
 
 #include <mpi.h>
 #include <dlfcn.h>
@@ -19,30 +21,108 @@
 #define ACTIVE_CLOCK_API
 #endif
 
-static _Atomic unsigned sequence;
-static _Atomic uint64_t open_ns, completed_ns, last_end_ns;
-static _Atomic pid_t clock_owner;
-static _Thread_local pid_t writer_pid;
-static _Thread_local unsigned wrapper_depth;
-static _Thread_local int world_rank;
-static double clock_epoch;
+#if defined(__linux__) && defined(__GNUC__) && !defined(PEAK_ATTACH_RUNTIME)
+#define ACTIVE_CLOCK_TLS __attribute__((tls_model("initial-exec")))
+#else
+#define ACTIVE_CLOCK_TLS
+#endif
 
-static uint64_t
-monotonic_ns(void)
+/* The heartbeat uses clock_getres() as the update quantum. Darwin's
+ * approximate clock reports the underlying hardware resolution. */
+#if defined(__linux__) && defined(CLOCK_MONOTONIC_COARSE)
+#define ACTIVE_CLOCK_ID CLOCK_MONOTONIC_COARSE
+#endif
+
+/* The low bit marks an open MPI call. The remaining bits hold completed
+ * residence when closed and completed residence minus entry time when open.
+ * Unsigned arithmetic keeps the signed offset in the same atomic word.
+ * UINT64_MAX marks permanent failure of the selected clock.
+ */
+static _Atomic uint64_t residence_state;
+static _Atomic pid_t clock_owner;
+enum { WRITER_INACTIVE, WRITER_IDLE, WRITER_IN_MPI };
+static _Thread_local unsigned writer_state ACTIVE_CLOCK_TLS;
+static _Thread_local int world_rank ACTIVE_CLOCK_TLS;
+static double clock_epoch;
+static double clock_quantum;
+
+static inline uint64_t
+clock_ns(clockid_t clock)
 {
     struct timespec now;
-    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0 ||
-        (uint64_t)now.tv_sec > UINT64_MAX / UINT64_C(1000000000) - 1)
+    if (clock_gettime(clock, &now) != 0)
         return 0;
     return (uint64_t)now.tv_sec * UINT64_C(1000000000) +
            (uint64_t)now.tv_nsec;
+}
+
+static void
+epoch_completed(uint64_t nomination, unsigned kind, bool succeeded)
+{
+    static _Thread_local uint64_t last_nomination ACTIVE_CLOCK_TLS;
+    static _Thread_local unsigned attempts ACTIVE_CLOCK_TLS;
+    static _Thread_local unsigned selected_kind ACTIVE_CLOCK_TLS;
+
+    if (nomination != last_nomination) {
+        last_nomination = nomination;
+        attempts = 0;
+        selected_kind = PEAK_MPI_EPOCH_FAILED;
+    }
+    if (attempts == PEAK_MPI_EPOCH_MAX_ATTEMPTS ||
+        !peak_mpi_epoch_sample_kind(&selected_kind, kind, succeeded))
+        return;
+    ++attempts;
+    if (atomic_load_explicit(&clock_owner, memory_order_relaxed) != getpid() ||
+        atomic_load_explicit(&residence_state, memory_order_relaxed) == UINT64_MAX)
+        return;
+
+    const uint64_t now = clock_ns(CLOCK_MONOTONIC);
+    if (now)
+        peak_general_listener_mpi_epoch_completed(nomination, attempts,
+            succeeded ? kind : PEAK_MPI_EPOCH_FAILED,
+            (double)(now / UINT64_C(1000000000)) +
+            (double)(now % UINT64_C(1000000000)) * 1e-9);
+}
+
+static inline uint64_t
+sample_clock_ns(void)
+{
+#ifdef ACTIVE_CLOCK_ID
+    return clock_ns(ACTIVE_CLOCK_ID);
+#else
+    return 0;
+#endif
+}
+
+static bool
+sample_clock_available(void)
+{
+#ifdef ACTIVE_CLOCK_ID
+    enum { BATCH_SIZE = 128, MAX_CLOCK_NS = 20 };
+    struct timespec resolution;
+    if (clock_getres(ACTIVE_CLOCK_ID, &resolution) != 0 || !sample_clock_ns())
+        return false;
+    for (unsigned attempt = 0; attempt < 3; ++attempt) {
+        uint64_t before = clock_ns(CLOCK_MONOTONIC);
+        for (unsigned i = 0; i < BATCH_SIZE; ++i) {
+            if (!sample_clock_ns())
+                return false;
+        }
+        uint64_t after = clock_ns(CLOCK_MONOTONIC);
+        if (before && after >= before && after - before <= BATCH_SIZE * MAX_CLOCK_NS) {
+            clock_quantum = (double)resolution.tv_sec + (double)resolution.tv_nsec * 1e-9;
+            return true;
+        }
+    }
+#endif
+    return false;
 }
 
 void
 peak_mpi_active_clock_start(double runtime_start)
 {
     const char* enabled = getenv("PEAK_MPI_ACTIVE_CLOCK");
-    if (enabled == NULL || strcmp(enabled, "1") ||
+    if ((enabled != NULL && strcmp(enabled, "1")) ||
         !isfinite(runtime_start) || runtime_start <= 0.0)
         return;
 
@@ -52,67 +132,95 @@ peak_mpi_active_clock_start(double runtime_start)
         PMPI_Comm_size(MPI_COMM_WORLD, &size) != MPI_SUCCESS || size <= 1 ||
         PMPI_Comm_rank(MPI_COMM_WORLD, &world_rank) != MPI_SUCCESS)
         return;
-
-    /* PEAK publishes the runtime origin before enabling MPI wrappers. */
+    if (!sample_clock_available()) {
+        peak_log_debug("[peak mpi active clock unavailable] pid=%ld "
+                       "reason=clock-qualification\n", (long)getpid());
+        return;
+    }
     clock_epoch = runtime_start;
-    writer_pid = getpid();
-    atomic_store_explicit(&clock_owner, writer_pid, memory_order_release);
+    writer_state = WRITER_IDLE;
+    atomic_store_explicit(&clock_owner, getpid(), memory_order_release);
 }
 
-static void
+static inline uint64_t
 open_interval(void)
 {
-    const uint64_t now = monotonic_ns();
-    if (!now)
-        return;
-    atomic_fetch_add_explicit(&sequence, 1, memory_order_acq_rel);
-    atomic_store_explicit(&open_ns, now, memory_order_relaxed);
-    atomic_fetch_add_explicit(&sequence, 1, memory_order_release);
+    uint64_t completed = atomic_load_explicit(&residence_state, memory_order_relaxed);
+    if (completed == UINT64_MAX)
+        return UINT64_MAX;
+    uint64_t tick = sample_clock_ns();
+    uint64_t opened = tick ? (completed - (tick << 1)) | 1 : UINT64_MAX;
+    atomic_store_explicit(&residence_state, opened, memory_order_release);
+    return opened;
 }
 
-static void
-close_interval(void)
+static inline void
+close_interval(uint64_t opened)
 {
-    const uint64_t now = monotonic_ns();
-    uint64_t start = atomic_load_explicit(&open_ns, memory_order_relaxed);
-    if (!start)
-        return;
-    atomic_fetch_add_explicit(&sequence, 1, memory_order_acq_rel);
-    if (now >= start) {
-        /* Nonoverlapping monotonic intervals fit in the elapsed clock range. */
-        atomic_store_explicit(&completed_ns,
-            atomic_load_explicit(&completed_ns, memory_order_relaxed) +
-                now - start, memory_order_relaxed);
-        atomic_store_explicit(&last_end_ns, now, memory_order_relaxed);
-    }
-    atomic_store_explicit(&open_ns, 0, memory_order_relaxed);
-    atomic_fetch_add_explicit(&sequence, 1, memory_order_release);
+    uint64_t tick = sample_clock_ns();
+    uint64_t completed = tick ? opened + (tick << 1) - 1 : UINT64_MAX;
+    atomic_store_explicit(&residence_state, completed, memory_order_release);
 }
 
 double
-peak_mpi_active_clock_blocked_seconds(double runtime_start, double now)
+peak_mpi_active_clock_quantum_seconds(void)
+{
+    /* The caller has acquired the clock owner in a valid observation. */
+    return clock_quantum;
+}
+
+static inline uint64_t
+residence_at(uint64_t state, uint64_t tick)
+{
+    return ((state & 1) ? state + (tick << 1) : state) >> 1;
+}
+
+static bool
+clock_owned(double runtime_start)
 {
     pid_t owner = atomic_load_explicit(&clock_owner, memory_order_acquire);
-    if (!owner || owner != getpid() || runtime_start != clock_epoch ||
-        !isfinite(now) || now <= runtime_start)
+    return owner && owner == getpid() && runtime_start == clock_epoch;
+}
+
+int
+peak_mpi_active_clock_peek(double runtime_start)
+{
+    if (!clock_owned(runtime_start))
+        return -1;
+    uint64_t state = atomic_load_explicit(&residence_state, memory_order_acquire);
+    return state == UINT64_MAX ? -1 : (int)(state & 1);
+}
+
+double
+peak_mpi_active_clock_blocked_seconds(double runtime_start, double* now)
+{
+    if (!clock_owned(runtime_start))
+        return PEAK_MPI_CLOCK_UNAVAILABLE;
+    if (!isfinite(*now) || *now <= runtime_start)
         return -1.0;
 
+    /* Match residence and wall cuts within a short bracket. A dense MPI
+     * loop may change the open bit without changing residence at this tick.
+     */
+    uint64_t before = (uint64_t)(*now * 1e9);
     for (unsigned attempt = 0; attempt < 2; ++attempt) {
-        unsigned start = atomic_load_explicit(&sequence, memory_order_acquire);
-        if (start & 1)
-            continue;
-        uint64_t completed = atomic_load_explicit(&completed_ns, memory_order_relaxed);
-        uint64_t open = atomic_load_explicit(&open_ns, memory_order_relaxed);
-        uint64_t ended = atomic_load_explicit(&last_end_ns, memory_order_relaxed);
+        uint64_t first = atomic_load_explicit(&residence_state, memory_order_acquire);
+        uint64_t tick = sample_clock_ns();
+        uint64_t after = clock_ns(CLOCK_MONOTONIC);
         atomic_thread_fence(memory_order_acquire);
-        if (start != atomic_load_explicit(&sequence, memory_order_relaxed))
-            continue;
-        if ((double)ended * 1e-9 > now)
-            return -1.0; /* Completion crossed the heartbeat's wall cut. */
-        double open_seconds = (double)open * 1e-9;
-        double running = open && open_seconds < now
-            ? now - fmax(runtime_start, open_seconds) : 0.0;
-        return (double)completed * 1e-9 + running;
+        uint64_t second = atomic_load_explicit(&residence_state, memory_order_relaxed);
+        if (first == UINT64_MAX || second == UINT64_MAX || !tick)
+            return PEAK_MPI_CLOCK_UNAVAILABLE;
+        if (!after)
+            return -1.0;
+        uint64_t residence = residence_at(first, tick);
+        if (after >= before && after - before <= 100000 &&
+            residence == residence_at(second, tick)) {
+            *now = (double)(after / UINT64_C(1000000000)) +
+                   (double)(after % UINT64_C(1000000000)) * 1e-9;
+            return fmin((double)residence * 1e-9, *now - runtime_start);
+        }
+        before = after;
     }
     return -1.0;
 }
@@ -138,37 +246,56 @@ remote_peer(MPI_Comm comm, int peer)
  */
 #define ACTIVE_SYMBOLS(Name, Parameters)                                      \
     typedef int (*Name##Fn) Parameters;                                       \
-    static Name##Fn next_mpi_##Name, next_pmpi_##Name;                          \
-    static pthread_once_t mpi_once_##Name = PTHREAD_ONCE_INIT;                  \
-    static pthread_once_t pmpi_once_##Name = PTHREAD_ONCE_INIT;                 \
+    static _Atomic(Name##Fn) next_mpi_##Name, next_pmpi_##Name;               \
+    static pthread_once_t mpi_once_##Name = PTHREAD_ONCE_INIT;                \
+    static pthread_once_t pmpi_once_##Name = PTHREAD_ONCE_INIT;               \
     static void resolve_mpi_##Name(void)                                      \
-    { next_mpi_##Name = (Name##Fn)dlsym(RTLD_NEXT, "MPI_" #Name); }             \
+    {                                                                         \
+        atomic_store_explicit(&next_mpi_##Name,                               \
+            (Name##Fn)dlsym(RTLD_NEXT, "MPI_" #Name), memory_order_release);  \
+    }                                                                         \
     static void resolve_pmpi_##Name(void)                                     \
-    { next_pmpi_##Name = (Name##Fn)dlsym(RTLD_NEXT, "PMPI_" #Name); }
-
-#define ACTIVE_WRAPPER(Prefix, prefix, Name, Parameters, Arguments, Eligible) \
-    ACTIVE_CLOCK_API int Prefix##_##Name Parameters                           \
-    {                                                                        \
-        pthread_once(&prefix##_once_##Name, resolve_##prefix##_##Name);       \
-        Name##Fn next = next_##prefix##_##Name;                               \
-        if (!next)                                                           \
-            return MPI_ERR_OTHER;                                            \
-        if (!writer_pid)                                                     \
-            return next Arguments;                                           \
-        bool eligible = wrapper_depth++ == 0 && (Eligible);                  \
-        if (eligible)                                                        \
-            open_interval();                                                 \
-        int result = next Arguments;                                         \
-        if (eligible)                                                        \
-            close_interval();                                                \
-        --wrapper_depth;                                                     \
-        return result;                                                       \
+    {                                                                         \
+        atomic_store_explicit(&next_pmpi_##Name,                              \
+            (Name##Fn)dlsym(RTLD_NEXT, "PMPI_" #Name), memory_order_release); \
     }
 
-#define ACTIVE_CALL(Name, Parameters, Arguments, Eligible)                   \
+#define ACTIVE_WRAPPER(Prefix, prefix, Name, Parameters, Arguments, Eligible, Kind, EpochEligible) \
+    ACTIVE_CLOCK_API int Prefix##_##Name Parameters                           \
+    {                                                                         \
+        Name##Fn next = atomic_load_explicit(&next_##prefix##_##Name,         \
+                                              memory_order_acquire);          \
+        if (!next) {                                                          \
+            pthread_once(&prefix##_once_##Name, resolve_##prefix##_##Name);   \
+            next = atomic_load_explicit(&next_##prefix##_##Name,              \
+                                         memory_order_relaxed);               \
+            if (!next)                                                        \
+                return MPI_ERR_OTHER;                                         \
+        }                                                                     \
+        if (writer_state != WRITER_IDLE)                                      \
+            return next Arguments;                                            \
+        writer_state = WRITER_IN_MPI;                                         \
+        uint64_t opened = (Eligible) ? open_interval() : UINT64_MAX;          \
+        int result = next Arguments;                                          \
+        if (opened != UINT64_MAX)                                             \
+            close_interval(opened);                                           \
+        if (Kind) {                                                           \
+            uint64_t nomination = atomic_load_explicit(                       \
+                &peak_mpi_epoch_armed, memory_order_relaxed);                  \
+            if (nomination && (EpochEligible))                                \
+                epoch_completed(nomination, Kind, result == MPI_SUCCESS);    \
+        }                                                                     \
+        writer_state = WRITER_IDLE;                                           \
+        return result;                                                        \
+    }
+
+#define ACTIVE_CALL_EPOCH(Name, Parameters, Arguments, Eligible, Kind, EpochEligible) \
     ACTIVE_SYMBOLS(Name, Parameters)                                         \
-    ACTIVE_WRAPPER(MPI, mpi, Name, Parameters, Arguments, Eligible)          \
-    ACTIVE_WRAPPER(PMPI, pmpi, Name, Parameters, Arguments, Eligible)
+    ACTIVE_WRAPPER(MPI, mpi, Name, Parameters, Arguments, Eligible, Kind, EpochEligible) \
+    ACTIVE_WRAPPER(PMPI, pmpi, Name, Parameters, Arguments, Eligible, Kind, EpochEligible)
+
+#define ACTIVE_CALL(Name, Parameters, Arguments, Eligible)                   \
+    ACTIVE_CALL_EPOCH(Name, Parameters, Arguments, Eligible, 0, false)
 
 ACTIVE_CALL(Send, (const void* buffer, int count, MPI_Datatype type, int dest,
                    int tag, MPI_Comm comm),
@@ -201,15 +328,17 @@ ACTIVE_CALL(Waitsome, (int count, MPI_Request requests[], int* outcount,
             (count, requests, outcount, indices, statuses),
             count > 0 && requests)
 
-ACTIVE_CALL(Barrier, (MPI_Comm comm), (comm), network_comm(comm))
+ACTIVE_CALL_EPOCH(Barrier, (MPI_Comm comm), (comm), network_comm(comm),
+                  PEAK_MPI_EPOCH_BARRIER, comm == MPI_COMM_WORLD)
 ACTIVE_CALL(Bcast, (void* buffer, int count, MPI_Datatype type, int root, MPI_Comm comm),
             (buffer, count, type, root, comm), network_comm(comm))
 ACTIVE_CALL(Reduce, (const void* send_buffer, void* recv_buffer, int count,
                      MPI_Datatype type, MPI_Op op, int root, MPI_Comm comm),
             (send_buffer, recv_buffer, count, type, op, root, comm), network_comm(comm))
-ACTIVE_CALL(Allreduce, (const void* send_buffer, void* recv_buffer, int count,
-                        MPI_Datatype type, MPI_Op op, MPI_Comm comm),
-            (send_buffer, recv_buffer, count, type, op, comm), network_comm(comm))
+ACTIVE_CALL_EPOCH(Allreduce, (const void* send_buffer, void* recv_buffer, int count,
+                              MPI_Datatype type, MPI_Op op, MPI_Comm comm),
+                  (send_buffer, recv_buffer, count, type, op, comm), network_comm(comm),
+                  PEAK_MPI_EPOCH_ALLREDUCE, comm == MPI_COMM_WORLD && count > 0)
 ACTIVE_CALL(Allgather, (const void* send_buffer, int send_count, MPI_Datatype send_type,
                         void* recv_buffer, int recv_count, MPI_Datatype recv_type,
                         MPI_Comm comm),

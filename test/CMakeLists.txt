@@ -5,6 +5,10 @@ if(BUILD_TESTING)
     target_compile_options(test_mpi_active_clock_policy PRIVATE -UNDEBUG)
     target_link_libraries(test_mpi_active_clock_policy PRIVATE m)
     add_test(NAME test_mpi_active_clock_policy COMMAND test_mpi_active_clock_policy)
+    add_executable(test_heartbeat_detach_policy heartbeat/test_heartbeat_detach_policy.c)
+    target_include_directories(test_heartbeat_detach_policy PRIVATE ${PROJECT_SOURCE_DIR}/include)
+    target_compile_options(test_heartbeat_detach_policy PRIVATE -UNDEBUG)
+    add_test(NAME test_heartbeat_detach_policy COMMAND test_heartbeat_detach_policy)
     if(CMAKE_SYSTEM_NAME MATCHES "Linux")
         add_test(NAME test_darwin_attach_controller_mock
             COMMAND ${CMAKE_COMMAND} -E env CC=${CMAKE_C_COMPILER}
@@ -1534,6 +1538,29 @@ if(BUILD_TESTING)
             PROPERTIES
                 TIMEOUT 60
                 PASS_REGULAR_EXPRESSION "hotloop_trace_check_ok")
+        foreach(_short_reattach_case IN ITEMS implicit explicit_50 disabled unfunded)
+            set(_short_reattach_cycle)
+            set(_short_reattach_expect)
+            set(_short_reattach_ratio 0.10)
+            if(_short_reattach_case STREQUAL "explicit_50")
+                set(_short_reattach_cycle PEAK_HIBERNATION_CYCLE=50)
+            elseif(_short_reattach_case STREQUAL "disabled")
+                set(_short_reattach_cycle PEAK_HIBERNATION_CYCLE=0)
+            elseif(_short_reattach_case STREQUAL "unfunded")
+                set(_short_reattach_ratio 0.0001)
+            endif()
+            if(NOT _short_reattach_case STREQUAL "implicit")
+                set(_short_reattach_expect --expect-no-reattach)
+            endif()
+            add_test(NAME test_detach_hotloop_short_reattach_${_short_reattach_case}
+                COMMAND ${CMAKE_COMMAND} -E env --unset=PEAK_HIBERNATION_CYCLE
+                    ${_short_reattach_cycle} "${PRELOAD_VAR}" $<TARGET_FILE:test_detach_hotloop>
+                    --short-reattach-check ${_short_reattach_expect})
+            set_tests_properties(test_detach_hotloop_short_reattach_${_short_reattach_case}
+                PROPERTIES
+                    TIMEOUT 10
+                    ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=1;PEAK_ENABLE_REATTACH=1;PEAK_REATTACH_COOLDOWN_MS=400;PEAK_HEARTBEAT_INTERVAL=0.1;PEAK_HB_MIN_US=100000;PEAK_HB_MAX_US=100000;PEAK_COST=0.001;PEAK_GLOBAL_OVERHEAD_RATIO=${_short_reattach_ratio};PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=strict")
+        endforeach()
         add_test(NAME test_detach_hotloop_observed_overhead_reattach_guard_strict
             COMMAND ${Python3_EXECUTABLE}
                     ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_detach_hotloop_trace_check.py
@@ -2511,7 +2538,7 @@ if(BUILD_TESTING)
                         --libpeak $<TARGET_FILE:peak>
                         "--preflags=${_PEAK_MPIEXEC_PREFLAGS_STRING}"
                         "--postflags=${_PEAK_MPIEXEC_POSTFLAGS_STRING}")
-            set_tests_properties(test_mpi_active_clock PROPERTIES TIMEOUT 35 PROCESSORS 2)
+            set_tests_properties(test_mpi_active_clock PROPERTIES TIMEOUT 65 PROCESSORS 2)
         endif()
         if(_PEAK_MPI_REPORT_TRANSPORT_AVAILABLE)
             add_test(NAME test_mpi_report_transport

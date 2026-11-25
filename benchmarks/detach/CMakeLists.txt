@@ -1,5 +1,13 @@
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
+if(MPI_C_FOUND)
+  add_executable(benchmark_mpi_critical_work benchmark_mpi_critical_work.c)
+  target_link_libraries(benchmark_mpi_critical_work PRIVATE MPI::MPI_C)
+  set_target_properties(benchmark_mpi_critical_work PROPERTIES
+    ENABLE_EXPORTS TRUE
+    INTERPROCEDURAL_OPTIMIZATION FALSE)
+endif()
+
 add_executable(benchmark_detach_hotloop
   ${PROJECT_SOURCE_DIR}/test/detach_runtime/test_detach_hotloop.c
 )

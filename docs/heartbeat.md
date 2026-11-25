@@ -146,6 +146,7 @@ spent_ratio =
 Heartbeat management CPU time is tracked separately with
 `CLOCK_THREAD_CPUTIME_ID` checkpoints around active policy work. It is reported
 as diagnostics and is not added to detach pressure or reattach admission.
+Randomized probes run during the timed wait, outside those CPU checkpoints.
 
 ## Detach Signals
 
@@ -171,16 +172,26 @@ attached_lifetime_sum = sum lifetime_ratio[i] for attached hooks
 profile_global_overhead = max(attached_recent_sum, attached_lifetime_sum)
 ```
 
-If `profile_global_overhead` exceeds
-`global_target_ratio * peak_global_detach_factor`, attached candidates are
-ranked by `max(recent_rate, lifetime_ratio)`, then by recent rate and index.
-After each accepted detach request, the heartbeat debits the local projected
-recent and lifetime sums and stops once the projected global overhead is at or
-below `global_target_ratio`.
+Global detach starts when either projected sum exceeds its own target times
+`peak_global_detach_factor`. Each target defaults to `global_target_ratio`. The
+MPI active clock can supply distinct recent and lifetime targets.
 
-The request context records the call count, lifetime ratio, global profile
-pressure, elapsed time, and recent rate that caused the request. It does not
-perform the mutation. The controller owns mutation ordering.
+When both projected sums exceed their targets, the heartbeat ranks candidates
+by the larger of their recent and lifetime contributions, normalizing each
+contribution by its own target when the targets differ. Ties favor the higher
+recent rate, then the lower hook index. When only one sum exceeds its target,
+candidates are ranked by their contribution to that sum, with ties resolved by
+hook index. An accepted detach debits both projected sums. If that debit
+satisfies one of two exceeded targets, the heartbeat re-sorts the remaining
+candidates once using the contribution to the remaining deficit. The pass
+stops when both targets are satisfied or no eligible candidate provides relief
+to a remaining deficit.
+
+The request context records the per-hook call count, lifetime ratio, global
+profile pressure, elapsed time, and recent rate. For a grouped recent detach,
+the reported global pressure and per-hook recent rate come from the latest
+heartbeat snapshot. Selection and ranking use the group's observation window.
+The controller owns mutation ordering.
 
 ## Reattach Risk Scaling
 
@@ -249,6 +260,14 @@ static const unsigned int peak_reattach_default_cooldown_ms = 60000;
 `peak_general_listener_init_reattach_policy_once()` reads the cooldown before
 the first eligibility check. `PEAK_REATTACH_COOLDOWN_MS=0` disables the
 cooldown and is used by several focused tests.
+
+When `PEAK_HIBERNATION_CYCLE` is unset and the configured cooldown is positive
+and shorter than 60 seconds, the heartbeat can also check for reattach after
+that much wall time has passed since the last check. At least one hook must
+have finished its cooldown. The extra check runs on an existing heartbeat
+and applies the same admission budget as the regular cycle check. Setting
+`PEAK_HIBERNATION_CYCLE` explicitly selects cycle-based checks, with zero
+disabling heartbeat reattach.
 
 A reattach candidate must still be:
 
@@ -443,6 +462,108 @@ sleep_us =
   clip(heartbeat_time * scale, hb_min_us, hb_max_us)
 ```
 
+With `PEAK_MPI_ACTIVE_CLOCK=1`, Linux ranks that meet the documented MPI and
+clock qualifications can sample MPI residence during heartbeat sleeps. The
+heartbeat still wakes at its original condition-variable deadline. During a
+sleep it places probes at randomized offsets, one in each equal wall-time
+stratum (up to eight strata, with a 10 ms nominal spacing). Each probe records
+whether an eligible MPI call is open. The fraction of open probes estimates
+MPI residence for that sleep. Estimates from sleeps of different elapsed
+lengths contribute in proportion to their wall-time duration. This is a
+prospective measurement: after persistent disagreement with the coarse clock,
+sampled occupancy is used for subsequent measured sleeps; no earlier time is
+replayed or rewritten. When a sleep uses sampled occupancy, the preceding
+management gap contributes at most its wall duration. A coarse tick observed
+in that gap can straddle the sampled sleep boundary. The raw cursor still
+advances by the full tick.
+
+The first regular sleep can be sampled, without moving the original heartbeat
+wake or first policy assessment. After a sampled sleep, another can be sampled
+once 10 ms has elapsed from that sample window's start. An eligible nonzero
+sleep shorter than 10 ms gets one probe; longer sleeps are capped at eight. A
+missed or late probe, a wake, or a cut that does not match the original sleep
+deadline leaves that span raw; it is not reconstructed later. Previously
+collected evidence is retained across skipped spans, and later valid sleeps
+are measured independently. A genuinely unavailable raw clock cut resets the
+evidence. On Linux this uses `CLOCK_MONOTONIC_COARSE`; unavailable or
+unsupported configurations retain the ordinary wall-time policy.
+
+The sampler compares occupancy estimates with coarse-clock residence before
+enabling an occupancy correction for subsequent measured sleeps. It keeps
+separate signed residual evidence for coarse-clock occupancy below and above
+half of the interval, so opposite phase errors are less likely to cancel. After
+at least eight valid probes, each valid sleep with `n` probes and elapsed time
+`t` updates the evidence. With `p = coarse_residence / t` and `w = 1 - n/64`,
+prior residuals are multiplied by `w`, and prior variance by `w²`; the new
+sampled-minus-coarse residual is added to its occupancy bin, and
+`t² p (1-p) / n` is added to the variance. The occupancy mode for subsequent
+measured sleeps is enabled when the sum of the two absolute residuals exceeds
+`2.25 × sqrt(variance) + t / (8n)`. Evidence decays continuously rather than
+being cleared in fixed batches or after a decision. Statistical noise, missed
+boundaries, quantization, and phase patterns that cancel within strata can
+still obscure bias. Skipped or late spans add no evidence; an unavailable raw
+clock cut or inconsistent raw clock history resets it.
+
+On Linux, the active clock uses `CLOCK_MONOTONIC_COARSE`. Startup qualification
+requires a successful read and at least one short batch averaging no more than
+20 ns per read; unavailable or too-costly clocks use ordinary wall time. macOS
+uses its ordinary wall-time policy: `CLOCK_MONOTONIC_RAW_APPROX` reports the
+hardware resolution, but its update interval can be longer.
+
+Clock quantization can miss gaps shorter than a tick, and periodic MPI calls
+aligned with ticks can overestimate residence. There is no per-window error
+bound. For a raw recent interval, PEAK allows one clock quantum of
+uncertainty, capped by the lifetime target. A sleep that uses sampled
+occupancy opens a recent observation group. Once open, the group uses valid
+probe measurements from subsequent sleeps, including sleeps that use coarse
+residence for lifetime accounting. A probe's weight is the wall duration of
+its sleep divided by that sleep's probe count. The group requires 64 effective
+probes, so unequal weights require more observations.
+
+The group uses its full elapsed interval for profiling and control costs and
+for the hook call rates used to select and debit detach candidates. MPI
+residence in the group comes from valid measured sleeps. Unmeasured spans
+contribute elapsed time and costs. Invalid clock or hook snapshots clear the
+group. Each completed group is consumed once, and a group expires after 65
+times the larger of the configured maximum heartbeat interval and 20 ms. This
+gives short heartbeats time to gather evidence under the 10 ms probe throttle.
+For a coarse-selected cut, the ordinary recent decision uses the raw target.
+For an occupancy-selected cut, the ordinary recent decision uses the
+configured wall-time target while the group collects evidence. Either
+ordinary recent decision or a lifetime budget violation takes priority over
+the grouped recent decision.
+
+With the qualified MPI active clock and global heartbeat enabled, PEAK can
+also sample the MPI owner thread's existing counter for the attached hook
+with the highest recent rate. An MPI epoch runs from the return of one outer
+`MPI_COMM_WORLD` barrier or positive-count all-reduce to the return of the
+next eligible collective of the same kind. The heartbeat can request that
+hook's detach when its estimated profiling cost exceeds `q / (1 + q)` of
+elapsed time in each of two completed epochs within one maximum heartbeat
+interval. For a completed epoch of duration `T` with estimated hook cost
+`C`, the model compares `C` with `T - C`. Solving `C / (T - C) > q`
+gives the observed cost fraction for the epoch decision. At a 10% target,
+a 100 ms epoch allows about 9.09 ms of estimated hook cost. Each nomination
+allows at most five attempts, and the MPI thread skips a sample if the
+listener lock is busy. After confirmation, the heartbeat can act on the
+result once, up to one maximum heartbeat interval after the collection
+deadline. Ordinary recent and lifetime decisions retain their
+detach factor and take priority, as do queued hook changes. Evidence expires
+if the hook or its attachment changes. This captures short bursts that slow a
+rank's peers while the burst's cost is diluted across a longer heartbeat.
+
+Lifetime budgeting and reattach use cumulative residence.
+A raced snapshot carries the preceding absolute
+lifetime allowance rather than granting fresh headroom. A failed reader cut
+uses wall time for that cut; a permanent writer-side clock failure disables
+the active-clock path for the rest of the run. MPI wrapper work is excluded
+from measured profiling cost, and this mechanism does not synchronize ranks.
+Two values of `q` can detach the same hot CPU hooks and retain similar numbers
+of calls. PEAK continues observing eligible MPI calls while those hooks are
+detached to estimate headroom for reattachment. At high communication rates,
+this per-call cost and its effect on peer progress can outweigh differences
+in hook cost. Increasing `q` therefore need not increase elapsed time.
+
 With a valid MPI active-clock sample, including a retained sample when a
 later read races, the rate term uses `max(ema_global_rate, 0)`. Falling
 pressure then leaves cadence to the current budget error. An unordered rate
@@ -516,10 +637,14 @@ time. CSV output is independent of text verbosity.
 
 For an MPI controller diagnostic, set `PEAK_VERBOSITY=debug`. The
 `[peak mpi active clock]` line describes the last valid sample on an individual
-process. `elapsed` is elapsed wall time in seconds, `blocked` is time in covered
+process. `elapsed` is elapsed wall time in seconds, `blocked` is estimated time in covered
 blocking MPI calls in seconds, and `lifetime_target` is the resulting
 rank-local overhead budget expressed as a fraction. `configured_target` is
 the configured global overhead budget before that adjustment.
+The estimate describes rank-local wrapper state and cannot identify MPI-wide
+dependencies or bound whole-job slowdown. The `[peak mpi sync epochs]` line
+reports completed same-kind intervals, groups with two corroborating
+intervals, and accepted detach requests based on those groups.
 
 ## Environment Variables and Defaults
 

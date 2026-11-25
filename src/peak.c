@@ -27,6 +27,7 @@
 #include "exec_interceptor.h"
 #include "internal/exec_interceptor_internal.h"
 #ifdef PEAK_ATTACH_RUNTIME
+#include "internal/attach_runtime_config.h"
 #include "internal/filesystem_stat_guard.h"
 #endif
 #include "internal/general_listener_internal.h"
@@ -2707,9 +2708,10 @@ peak_attach_runtime_start(char **message)
     *message = g_strdup("attach activation is supported on Linux and macOS");
     return 0;
 #else
-    if (parse_env_to_bool("PEAK_EXEC_CHAIN") ||
-        parse_env_to_bool("PEAK_EXEC_CHECKPOINT")) {
-        *message = g_strdup("late attach cannot propagate PEAK across exec: PEAK_EXEC_CHAIN and PEAK_EXEC_CHECKPOINT require startup interposition");
+    const char *exec_error = peak_attach_exec_propagation_error(
+        getenv("PEAK_EXEC_CHAIN"), getenv("PEAK_EXEC_CHECKPOINT"));
+    if (exec_error != NULL) {
+        *message = g_strdup(exec_error);
         return 0;
     }
 #ifdef HAVE_MPI

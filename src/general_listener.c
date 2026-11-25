@@ -6,6 +6,7 @@
 #include "internal/general_listener_internal.h"
 #include "internal/general_listener/attach_policy.h"
 #include "internal/general_listener/exec_checkpoint_writer.h"
+#include "internal/general_listener/heartbeat_detach_policy.h"
 #include "internal/general_listener/report_formatter.h"
 #include "internal/general_listener/report_maxima.h"
 #include "internal/general_listener/report_model.h"
@@ -16,6 +17,8 @@
 #ifdef HAVE_MPI
 #include "internal/general_listener/mpi_report_transport.h"
 #include "internal/mpi_active_clock.h"
+#include "internal/mpi_epoch_policy.h"
+#include "internal/mpi_active_clock_sampling.h"
 #endif
 #include "internal/mpi_active_clock_policy.h"
 #include "internal/jit_provider.h"
@@ -445,6 +448,7 @@ static gsize peak_controller_shutdown_policy_initialized = 0;
 static unsigned int peak_controller_max_retry_count = 300;
 static double peak_controller_max_pending_age_s = 30.0;
 static double peak_reattach_cooldown_s = 60.0;
+static gboolean peak_use_short_reattach_retry;
 static PeakEnvWarningState peak_reattach_cooldown_warning_emitted;
 static PeakEnvWarningState peak_controller_pending_age_warning_emitted;
 static PeakEnvWarningState peak_controller_retry_count_warning_emitted;
@@ -474,6 +478,9 @@ peak_general_listener_init_reattach_policy_once(void)
     unsigned int cooldown_ms =
         (unsigned int)peak_parse_env_unsigned(&schema);
     peak_reattach_cooldown_s = (double)cooldown_ms / 1000.0;
+    peak_use_short_reattach_retry =
+        cooldown_ms > 0 && cooldown_ms < peak_reattach_default_cooldown_ms &&
+        g_getenv("PEAK_HIBERNATION_CYCLE") == NULL;
 }
 
 static void
@@ -4909,26 +4916,15 @@ peak_general_listener_controller_stop(void)
 /* Heartbeat policy. */
 
 typedef struct {
-    size_t index;
-    double ratio; /* Detach pressure or reattach historical seconds. */
-    double rate;  /* Detach contribution or oldest-detach ordering key. */
-    double lifetime;
-} OverheadEntry;
+    gulong calls;
+    gboolean attached;
+} SampledRecentBaseline;
 
-/* Sort global detach candidates by descending ratio. */
-static int compare_ratio_de(const void* a, const void* b) {
-    const OverheadEntry* x = (const OverheadEntry*)a;
-    const OverheadEntry* y = (const OverheadEntry*)b;
-
-    if (x->ratio < y->ratio) return 1;
-    if (x->ratio > y->ratio) return -1;
-
-    /* Prefer faster-growing overhead when ratios tie. */
-    if (x->rate < y->rate) return 1;
-    if (x->rate > y->rate) return -1;
-    if (x->index < y->index) return -1;
-    if (x->index > y->index) return 1;
-    return 0;
+static double
+peak_heartbeat_recent_rate(gulong calls, gulong previous, double elapsed)
+{
+    gulong delta = calls >= previous ? calls - previous : calls;
+    return ((double)delta * peak_general_overhead) / elapsed;
 }
 
 /* Sort global reattach candidates by ascending rate. */
@@ -5307,8 +5303,74 @@ peak_general_listener_heartbeat_sample_can_reuse_cache_unlocked(
     }
 }
 
+static struct timespec
+peak_heartbeat_deadline_after(struct timespec start, uint64_t ns)
+{
+    start.tv_sec += ns / UINT64_C(1000000000);
+    start.tv_nsec += (long)(ns % UINT64_C(1000000000));
+    if (start.tv_nsec >= 1000000000L) {
+        start.tv_sec++;
+        start.tv_nsec -= 1000000000L;
+    }
+    return start;
+}
+
+#ifdef HAVE_MPI
+/* Called with heartbeat_mutex held. A signal or wait error ends the
+ * heartbeat wait immediately, just as at the ordinary deadline. */
+static int
+peak_heartbeat_probe_sleep(PeakMpiClockSampler* sampler,
+                           struct timespec realtime_start, uint64_t sleep_ns,
+                           double wait_start, double tolerance)
+{
+    unsigned probes = peak_mpi_active_clock_probe_count(sleep_ns);
+    sampler->incomplete = true;
+    sampler->expected_end = wait_start + (double)sleep_ns * 1e-9;
+    sampler->tolerance = tolerance;
+
+    sampler->start = peak_second();
+    sampler->raw_start =
+        peak_mpi_active_clock_blocked_seconds(peak_main_time, &sampler->start);
+    if (sampler->raw_start < 0.0 ||
+        sampler->start - wait_start > tolerance)
+        return ETIMEDOUT;
+
+    sampler->next_probe_sleep = wait_start + PEAK_MPI_CLOCK_PROBE_INTERVAL_NS * 1e-9;
+    unsigned open_probes = 0;
+    for (unsigned i = 0; i < probes; ++i) {
+        uint64_t offset =
+            peak_mpi_active_clock_probe_offset(sampler, sleep_ns, i, probes);
+        struct timespec deadline =
+            peak_heartbeat_deadline_after(realtime_start, offset);
+        sampler->attempted_probes++;
+        int result = pthread_cond_timedwait(&heartbeat_cond, &heartbeat_mutex,
+                                            &deadline);
+        if (result != ETIMEDOUT || !atomic_load(&heartbeat_running))
+            return result;
+
+        double before = peak_second() - wait_start;
+        int open = peak_mpi_active_clock_peek(peak_main_time);
+        double after = peak_second() - wait_start;
+        /* Reject the complete sample if we missed a stratum or the realtime
+         * wait stopped tracking monotonic time. The heartbeat cut also
+         * checks the original deadline before using the samples. */
+        if (open < 0 ||
+            !peak_mpi_active_clock_probe_ontime(sleep_ns, i, probes, offset, before, tolerance) ||
+            !peak_mpi_active_clock_probe_ontime(sleep_ns, i, probes, offset, after, tolerance))
+            return ETIMEDOUT;
+        open_probes += (unsigned)open;
+    }
+    sampler->probes = probes;
+    sampler->open_probes = open_probes;
+    sampler->incomplete = false;
+    return ETIMEDOUT;
+}
+#else
+typedef struct PeakMpiClockSampler PeakMpiClockSampler;
+#endif
+
 static gboolean
-peak_heartbeat_wait_us(unsigned int sleep_us)
+peak_heartbeat_wait_us(unsigned int sleep_us, PeakMpiClockSampler* sampler)
 {
     pthread_mutex_lock(&heartbeat_mutex);
     if (!atomic_load(&heartbeat_running)) {
@@ -5316,20 +5378,96 @@ peak_heartbeat_wait_us(unsigned int sleep_us)
         return FALSE;
     }
 
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_sec += sleep_us / 1000000U;
-    ts.tv_nsec += (long)(sleep_us % 1000000U) * 1000L;
-    if (ts.tv_nsec >= 1000000000L) {
-        ts.tv_sec += 1;
-        ts.tv_nsec -= 1000000000L;
+    struct timespec start;
+    clock_gettime(CLOCK_REALTIME, &start);
+    uint64_t sleep_ns = (uint64_t)sleep_us * 1000;
+    struct timespec deadline = peak_heartbeat_deadline_after(start, sleep_ns);
+    int result = ETIMEDOUT;
+#ifdef HAVE_MPI
+    if (sampler) {
+        sampler->probes = 0;
+        sampler->incomplete = false;
+        if (sleep_ns && peak_mpi_active_clock_peek(peak_main_time) >= 0) {
+            double wait_start = peak_second();
+            if (wait_start >= sampler->next_probe_sleep) {
+                double tolerance = fmin(0.0005, sleep_us * 0.125e-6);
+                result = peak_heartbeat_probe_sleep(
+                    sampler, start, sleep_ns, wait_start, tolerance);
+            }
+        }
     }
-
-    (void)pthread_cond_timedwait(&heartbeat_cond, &heartbeat_mutex, &ts);
+#else
+    (void)sampler;
+#endif
+    if (result == ETIMEDOUT && atomic_load(&heartbeat_running))
+        result = pthread_cond_timedwait(&heartbeat_cond, &heartbeat_mutex, &deadline);
+#ifdef HAVE_MPI
+    if (sampler && result != ETIMEDOUT)
+        sampler->incomplete = true;
+#endif
     gboolean keep_running = atomic_load(&heartbeat_running);
     pthread_mutex_unlock(&heartbeat_mutex);
     return keep_running;
 }
+
+#ifdef HAVE_MPI
+_Atomic uint64_t peak_mpi_epoch_armed;
+static PeakMpiEpoch mpi_epoch;
+static uint64_t mpi_epoch_nomination;
+
+static PeakMpiEpochHook
+peak_mpi_epoch_hook_unlocked(size_t hook)
+{
+    if (!peak_general_hook_is_published_unlocked(hook) ||
+        peak_hook_states[hook] != PEAK_HOOK_ATTACHED)
+        return (PeakMpiEpochHook){0};
+
+    PeakGeneralListener* listener = PEAKGENERAL_LISTENER(array_listener[hook]);
+    uint64_t control = atomic_load_explicit(&listener->callback_hook_control,
+                                            memory_order_acquire);
+    if (peak_general_listener_callback_hook_state(control) != PEAK_HOOK_ATTACHED ||
+        (control & PEAK_CALLBACK_DETACH_COUNT_REQUEST_BIT))
+        return (PeakMpiEpochHook){0};
+
+    return (PeakMpiEpochHook){
+        .hook = hook,
+        .listener = listener,
+        .control = control,
+        .provider_generation = peak_hook_provider_generation
+            ? peak_hook_provider_generation[hook] : 0
+    };
+}
+
+void
+peak_general_listener_mpi_epoch_completed(uint64_t nomination, unsigned attempt,
+                                          unsigned kind, double now)
+{
+    if (pthread_mutex_trylock(&lock) != 0)
+        return;
+
+    if (nomination == atomic_load_explicit(&peak_mpi_epoch_armed, memory_order_relaxed)) {
+        PeakMpiEpochHook hook = {0};
+        gulong calls = 0;
+        if (atomic_load_explicit(&heartbeat_running, memory_order_relaxed) &&
+            !peak_general_controller_mpi_finalize_requested() &&
+            thread_data.initialized && thread_data.self_mapped_valid) {
+            hook = peak_mpi_epoch_hook_unlocked(mpi_epoch.nominee.hook);
+            const PeakGeneralListener* listener = hook.listener;
+            if (listener && listener->num_calls &&
+                thread_data.self_mapped_id < listener->fast_stats_capacity) {
+                calls = peak_general_listener_num_calls_load(
+                    peak_general_listener_num_calls_slot(
+                        (PeakGeneralListener*)listener, thread_data.self_mapped_id));
+            } else {
+                hook = (PeakMpiEpochHook){0};
+            }
+        }
+        if (peak_mpi_epoch_observe(&mpi_epoch, hook, kind, attempt, now, calls))
+            atomic_store_explicit(&peak_mpi_epoch_armed, 0, memory_order_relaxed);
+    }
+    pthread_mutex_unlock(&lock);
+}
+#endif
 
 void* peak_heartbeat_monitor(void* arg) {
     PeakHeartbeatArgs* heartbeat_args = (PeakHeartbeatArgs*)arg;
@@ -5375,10 +5513,27 @@ void* peak_heartbeat_monitor(void* arg) {
     double prev_global_overhead = 0.0;
     double prev_global_time     = now0;
     double ema_global_rate      = 0.0;
+    double last_reattach_check  = now0;
+    PeakMpiClockSampler* active_sampler = NULL;
+    SampledRecentBaseline* sampled_recent_baseline = NULL;
 #ifdef HAVE_MPI
+    PeakMpiClockSampler sampler = {
+        .random = ((uint64_t)(now0 * 1e9) << 16) ^ (uint64_t)getpid()
+    };
+    if (enable_global_heartbeat)
+        active_sampler = &sampler;
+    PeakMpiClockResidence residence = {
+        .epoch = peak_main_time, .now = peak_main_time, .match_sleep = true
+    };
     double previous_active_elapsed = 0.0;
     double previous_active_blocked = -1.0;
     double previous_active_cost = 0.0;
+    PeakMpiActiveClockRecent sampled_recent = {0};
+    double sampled_recent_horizon = peak_mpi_active_clock_recent_horizon(
+        hb_max_us * 1e-6, PEAK_MPI_CLOCK_PROBE_INTERVAL_NS * 1e-9);
+    uint64_t sampled_recent_windows = 0;
+    bool have_mpi_epoch_nomination = false;
+    uint64_t epoch_intervals = 0, epoch_groups = 0, epoch_requests = 0;
     double reported_active_elapsed = 0.0;
     double reported_active_blocked = 0.0;
     double last_active_budget = -1.0;
@@ -5393,7 +5548,7 @@ void* peak_heartbeat_monitor(void* arg) {
             (unsigned int)clipd((double)heartbeat_time,
                                 (double)hb_min_us,
                                 (double)hb_max_us);
-        if (!peak_heartbeat_wait_us(initial_sleep_us)) {
+        if (!peak_heartbeat_wait_us(initial_sleep_us, active_sampler)) {
             goto cleanup;
         }
     }
@@ -5406,10 +5561,24 @@ void* peak_heartbeat_monitor(void* arg) {
         gboolean wake_controller = FALSE;
         heartbeat_counter++;
         double now = peak_second();
+        double sampled_recent_elapsed = 0.0;
 #ifdef HAVE_MPI
         /* Read at the wall cut, before a hook scan can outlive an MPI call. */
         double blocked = enable_global_heartbeat
-            ? peak_mpi_active_clock_blocked_seconds(peak_main_time, now) : -1.0;
+            ? peak_mpi_active_clock_blocked_seconds(peak_main_time, &now)
+            : PEAK_MPI_CLOCK_UNAVAILABLE;
+        gboolean sampled_recent_valid =
+            blocked >= residence.raw && now > residence.now;
+        if (!sampled_recent_valid)
+            sampled_recent = (PeakMpiActiveClockRecent){0};
+        /* Lifetime credit uses each corrected increment immediately. */
+        if (active_sampler)
+            blocked = peak_mpi_active_clock_accumulate(
+                &residence, active_sampler, now, blocked);
+        gboolean start_sampled_recent = sampled_recent.elapsed == 0.0;
+        gboolean collect_sampled_recent =
+            !start_sampled_recent || sampler.applied_sleep_seconds > 0.0;
+        double sampled_attached_seconds = 0.0;
 #endif
 
         pthread_mutex_lock(&lock);
@@ -5430,6 +5599,17 @@ void* peak_heartbeat_monitor(void* arg) {
             previous_time = g_renew(double, previous_time, current_hook_count);
             recent_baseline_ready =
                 g_renew(gboolean, recent_baseline_ready, current_hook_count);
+#ifdef HAVE_MPI
+            if (sampled_recent_baseline) {
+                sampled_recent_baseline = g_renew(
+                    SampledRecentBaseline, sampled_recent_baseline,
+                    current_hook_count);
+                memset(&sampled_recent_baseline[old_capacity], 0,
+                       (current_hook_count - old_capacity) *
+                           sizeof(*sampled_recent_baseline));
+            }
+            sampled_recent_valid = FALSE;
+#endif
             for (size_t i = old_capacity; i < current_hook_count; i++) {
                 calls_snapshot[i] = 0;
                 profile_seconds_snapshot[i] = 0.0;
@@ -5442,6 +5622,12 @@ void* peak_heartbeat_monitor(void* arg) {
             }
             heartbeat_capacity = current_hook_count;
         }
+#ifdef HAVE_MPI
+        /* The cut that first enables sampling seeds the attachment baseline. */
+        if (!sampled_recent_baseline &&
+            (sampler.use_occupancy || sampler.applied_sleep_seconds > 0.0))
+            sampled_recent_baseline = g_new0(SampledRecentBaseline, heartbeat_capacity);
+#endif
 
         double total_execution_time = now - peak_main_time;
         if (total_execution_time <= 0.0) total_execution_time = 1e-12;
@@ -5449,6 +5635,14 @@ void* peak_heartbeat_monitor(void* arg) {
             (double)hb_max_us / 1e6;
         gboolean detach_observation_ready =
             total_execution_time >= min_detach_observation_time;
+        gboolean scheduled_reattach_check =
+            check_interval != 0 && (heartbeat_counter % check_interval) == 0;
+        gboolean use_short_reattach_retry =
+            detach_observation_ready && enable_reattach && check_interval != 0 &&
+            (enable_per_target_heartbeat || enable_global_heartbeat) &&
+            !scheduled_reattach_check && peak_use_short_reattach_retry &&
+            now - last_reattach_check >= peak_reattach_cooldown_s;
+        gboolean short_reattach_retry_ready = FALSE;
 
         double profile_spent_seconds = 0.0;
         double control_spent_seconds = 0.0;
@@ -5461,10 +5655,21 @@ void* peak_heartbeat_monitor(void* arg) {
         uint64_t control_pause_wall_ns = 0;
         PeakDetachAccountingSnapshot detach_accounting;
 
+#ifdef HAVE_MPI
+        PeakMpiEpochHook epoch_nominee = {0};
+        double epoch_nominee_rate = 0.0;
+#endif
         size_t slot_limit = pthread_listener_reserved_slot_limit();
         pthread_mutex_lock(&lock);
         for (size_t i = 0; i < heartbeat_capacity; i++) {
             if (!(hook_address[i] && array_listener[i])) {
+#ifdef HAVE_MPI
+                if (sampled_recent_baseline) {
+                    if (recent_baseline_ready[i])
+                        sampled_recent_valid = FALSE;
+                    sampled_recent_baseline[i].attached = FALSE;
+                }
+#endif
                 calls_snapshot[i] = 0;
                 profile_seconds_snapshot[i] = 0.0;
                 lifetime_snapshot[i] = 0.0;
@@ -5480,6 +5685,17 @@ void* peak_heartbeat_monitor(void* arg) {
                 continue;
             }
 
+            gboolean attached =
+                peak_general_listener_hook_is_attached_for_policy_unlocked(i);
+            /* Piggyback the due check on the ordinary locked hook scan. */
+            if (use_short_reattach_retry &&
+                peak_hook_states != NULL &&
+                peak_hook_states[i] == PEAK_HOOK_DETACHED &&
+                peak_detached[i] && !peak_need_detach[i] &&
+                peak_general_listener_reattach_cooldown_ready_unlocked(i, now)) {
+                short_reattach_retry_ready = TRUE;
+                use_short_reattach_retry = FALSE;
+            }
             gulong total_num_calls = 0;
             double hook_profile_spent_seconds = 0.0;
             gboolean reuse_cached_sample =
@@ -5499,6 +5715,10 @@ void* peak_heartbeat_monitor(void* arg) {
                         &hook_profile_spent_seconds);
             }
             if (!have_sample) {
+#ifdef HAVE_MPI
+                if (collect_sampled_recent)
+                    sampled_recent_valid = FALSE;
+#endif
                 calls_snapshot[i] = 0;
                 profile_seconds_snapshot[i] = 0.0;
                 lifetime_snapshot[i] = 0.0;
@@ -5519,23 +5739,45 @@ void* peak_heartbeat_monitor(void* arg) {
             if (!reuse_cached_sample && recent_baseline_ready[i]) {
                 double dt = now - previous_time[i];
                 if (dt <= 1e-12) dt = 1e-12;
-                gulong previous_num_calls = previous_calls[i];
-                gulong recent_calls =
-                    total_num_calls >= previous_num_calls
-                        ? total_num_calls - previous_num_calls
-                        : total_num_calls;
-                recent_rate =
-                    ((double)recent_calls * peak_general_overhead) / dt;
+                recent_rate = peak_heartbeat_recent_rate(
+                    total_num_calls, previous_calls[i], dt);
             }
             rate_snapshot[i] = recent_rate;
             ratio_snapshot[i] = ratio;
 
+#ifdef HAVE_MPI
+            if (sampled_recent_baseline) {
+                SampledRecentBaseline* baseline = &sampled_recent_baseline[i];
+                if (collect_sampled_recent) {
+                    if (start_sampled_recent)
+                        baseline->calls = previous_calls[i];
+                    if (attached != baseline->attached || !recent_baseline_ready[i] ||
+                        total_num_calls < previous_calls[i] ||
+                        (attached && reuse_cached_sample))
+                        sampled_recent_valid = FALSE;
+                    if (attached && sampled_recent_valid)
+                        sampled_attached_seconds +=
+                            (double)(total_num_calls - baseline->calls) * peak_general_overhead;
+                }
+                baseline->attached = attached;
+            }
+#endif
             previous_calls[i] = total_num_calls;
             previous_time[i] = now;
             recent_baseline_ready[i] = TRUE;
             profile_spent_seconds += hook_profile_spent_seconds;
 
-            if (peak_general_listener_hook_is_attached_for_policy_unlocked(i)) {
+            if (attached) {
+#ifdef HAVE_MPI
+                if (blocked >= 0.0 && total_num_calls >= PEAK_GLOBAL_DETACH_MIN_CALLS &&
+                    recent_rate > epoch_nominee_rate) {
+                    PeakMpiEpochHook candidate = peak_mpi_epoch_hook_unlocked(i);
+                    if (candidate.listener) {
+                        epoch_nominee = candidate;
+                        epoch_nominee_rate = recent_rate;
+                    }
+                }
+#endif
                 attached_recent_sum += recent_rate;
                 attached_lifetime_sum += ratio;
             }
@@ -5569,10 +5811,31 @@ void* peak_heartbeat_monitor(void* arg) {
                 if (previous_active_blocked >= 0.0 &&
                     total_execution_time > previous_active_elapsed &&
                     blocked >= previous_active_blocked && cost >= previous_active_cost) {
-                    PeakMpiActiveClockPolicy recent = peak_mpi_active_clock_policy(
-                        global_target_ratio, total_execution_time - previous_active_elapsed,
-                        blocked - previous_active_blocked, cost - previous_active_cost);
-                    recent_target = recent.ratio;
+                    double recent_elapsed = total_execution_time - previous_active_elapsed;
+                    double recent_blocked = blocked - previous_active_blocked;
+                    double recent_overlap = cost - previous_active_cost;
+                    if (sampler.applied_sleep_seconds <= 0.0) {
+                        recent_target = peak_mpi_active_clock_recent_ratio(
+                            global_target_ratio, recent_elapsed,
+                            fmin(recent_blocked, recent_elapsed), recent_overlap,
+                            peak_mpi_active_clock_quantum_seconds(), lifetime_target);
+                    }
+                    gboolean immediate_pressure =
+                        !(attached_recent_sum <= recent_target * peak_global_detach_factor &&
+                          attached_lifetime_sum <= lifetime_target * peak_global_detach_factor);
+                    if (peak_mpi_active_clock_recent_confirm(
+                            &sampled_recent, sampled_recent_horizon, sampled_recent_valid,
+                            recent_elapsed, recent_overlap, &sampler, immediate_pressure)) {
+                        sampled_recent_windows++;
+                        sampled_recent_elapsed = sampled_recent.elapsed;
+                        projected_attached_recent_sum =
+                            sampled_attached_seconds / sampled_recent_elapsed;
+                        recent_target = peak_mpi_active_clock_recent_sampled_ratio(
+                            global_target_ratio, &sampled_recent);
+                        sampled_recent = (PeakMpiActiveClockRecent){0};
+                    }
+                } else {
+                    sampled_recent = (PeakMpiActiveClockRecent){0};
                 }
                 previous_active_elapsed = total_execution_time;
                 previous_active_blocked = blocked;
@@ -5581,11 +5844,13 @@ void* peak_heartbeat_monitor(void* arg) {
                 reported_active_blocked = blocked;
                 last_active_budget = lifetime.budget;
             } else {
-                /* A raced snapshot cannot grant fresh lifetime headroom.
-                 * Recent hook rates still cover just one heartbeat interval. */
-                lifetime_target = peak_mpi_active_clock_carried_ratio(
-                    global_target_ratio, total_execution_time, last_active_budget);
+                /* Recent hook rates cover just one heartbeat interval. */
                 previous_active_blocked = -1.0;
+                if (blocked != PEAK_MPI_CLOCK_UNAVAILABLE) {
+                    /* A raced snapshot cannot grant fresh lifetime headroom. */
+                    lifetime_target = peak_mpi_active_clock_carried_ratio(
+                        global_target_ratio, total_execution_time, last_active_budget);
+                }
             }
         }
 #endif
@@ -5613,7 +5878,12 @@ void* peak_heartbeat_monitor(void* arg) {
                             rate_snapshot[i]);
                     if (accepted) {
                         wake_controller = TRUE;
-                        projected_attached_recent_sum -= rate_snapshot[i];
+                        double detach_rate = sampled_recent_elapsed > 0.0
+                            ? peak_heartbeat_recent_rate(
+                                calls_snapshot[i], sampled_recent_baseline[i].calls,
+                                sampled_recent_elapsed)
+                            : rate_snapshot[i];
+                        projected_attached_recent_sum -= detach_rate;
                         if (projected_attached_recent_sum < 0.0) {
                             projected_attached_recent_sum = 0.0;
                         }
@@ -5628,11 +5898,11 @@ void* peak_heartbeat_monitor(void* arg) {
         }
 
         /* 2) Global detach. */
+        const gboolean global_pressure =
+            projected_attached_recent_sum > recent_target * peak_global_detach_factor ||
+            projected_attached_lifetime_sum > lifetime_target * peak_global_detach_factor;
         if (detach_observation_ready && enable_global_heartbeat) {
-            if (projected_attached_recent_sum >
-                    recent_target * peak_global_detach_factor ||
-                projected_attached_lifetime_sum >
-                    lifetime_target * peak_global_detach_factor) {
+            if (global_pressure) {
                 size_t n_attached = 0;
                 pthread_mutex_lock(&lock);
                 for (size_t i = 0; i < heartbeat_capacity; i++) {
@@ -5644,36 +5914,35 @@ void* peak_heartbeat_monitor(void* arg) {
                     if (calls_snapshot[i] < PEAK_GLOBAL_DETACH_MIN_CALLS) {
                         continue;
                     }
-                    double contribution =
-                        MAX(rate_snapshot[i], ratio_snapshot[i]);
+                    double detach_rate = sampled_recent_elapsed > 0.0
+                        ? peak_heartbeat_recent_rate(
+                            calls_snapshot[i], sampled_recent_baseline[i].calls,
+                            sampled_recent_elapsed)
+                        : rate_snapshot[i];
+                    double contribution = MAX(detach_rate, ratio_snapshot[i]);
                     if (contribution <= 0.0) continue;
                     if (recent_target != lifetime_target)
-                        contribution = MAX(rate_snapshot[i] / MAX(recent_target, 1e-15),
+                        contribution = MAX(detach_rate / MAX(recent_target, 1e-15),
                             ratio_snapshot[i] / MAX(lifetime_target, 1e-15));
                     entries[n_attached].index = i;
                     entries[n_attached].ratio = contribution;
-                    entries[n_attached].rate = rate_snapshot[i];
+                    entries[n_attached].rate = detach_rate;
                     entries[n_attached].lifetime = ratio_snapshot[i];
                     n_attached++;
                 }
 
-                if (n_attached > 1) {
-                    qsort(entries,
-                          n_attached,
-                          sizeof(OverheadEntry),
-                          compare_ratio_de);
-                }
-
                 double reduced_recent_sum = projected_attached_recent_sum;
                 double reduced_lifetime_sum = projected_attached_lifetime_sum;
+                gboolean recent_exceeded = reduced_recent_sum > recent_target;
+                gboolean lifetime_exceeded = reduced_lifetime_sum > lifetime_target;
+                peak_heartbeat_sort_detach_entries(entries, n_attached,
+                                                   recent_exceeded,
+                                                   lifetime_exceeded);
                 for (size_t k = 0; k < n_attached; k++) {
                     size_t idx = entries[k].index;
 
-                    if (reduced_recent_sum <= recent_target &&
-                        reduced_lifetime_sum <= lifetime_target) {
-                        break;
-                    }
-                    if (entries[k].ratio <= 0.0) {
+                    if ((!recent_exceeded || entries[k].rate <= 0.0) &&
+                        (!lifetime_exceeded || entries[k].lifetime <= 0.0)) {
                         break;
                     }
 
@@ -5701,6 +5970,16 @@ void* peak_heartbeat_monitor(void* arg) {
                         if (reduced_lifetime_sum < 0.0) {
                             reduced_lifetime_sum = 0.0;
                         }
+                        gboolean both_exceeded = recent_exceeded && lifetime_exceeded;
+                        recent_exceeded = reduced_recent_sum > recent_target;
+                        lifetime_exceeded = reduced_lifetime_sum > lifetime_target;
+                        /* Detach only lowers pressure, so the remaining
+                         * candidates need at most one change in ordering. */
+                        if (both_exceeded && recent_exceeded != lifetime_exceeded) {
+                            peak_heartbeat_sort_detach_entries(
+                                entries + k + 1, n_attached - k - 1,
+                                recent_exceeded, lifetime_exceeded);
+                        }
                     }
                 }
                 projected_attached_recent_sum = reduced_recent_sum;
@@ -5709,11 +5988,72 @@ void* peak_heartbeat_monitor(void* arg) {
             }
         }
 
+#ifdef HAVE_MPI
+        /* MPI synchronization epoch detach. */
+        /* Admit only the nominated hook after ordinary policy. */
+        if (enable_global_heartbeat &&
+            (epoch_nominee.listener || have_mpi_epoch_nomination)) {
+            pthread_mutex_lock(&lock);
+            bool allow_epoch = detach_observation_ready && blocked >= 0.0 &&
+                sampled_recent_elapsed == 0.0 && !global_pressure && !wake_controller &&
+                atomic_load_explicit(&heartbeat_running, memory_order_acquire) &&
+                !peak_general_controller_mpi_finalize_requested();
+            if (!allow_epoch || now > mpi_epoch.expires ||
+                (mpi_epoch.confirmed_at > 0.0 ? mpi_epoch.confirmed_at <= now :
+                 atomic_load_explicit(&peak_mpi_epoch_armed, memory_order_relaxed) == 0)) {
+                epoch_intervals += mpi_epoch.completed_intervals;
+                epoch_groups += mpi_epoch.confirmed_at > 0.0;
+                atomic_store_explicit(&peak_mpi_epoch_armed, 0, memory_order_relaxed);
+                size_t hook = mpi_epoch.nominee.hook;
+                if (allow_epoch && hook < heartbeat_capacity &&
+                    calls_snapshot[hook] >= PEAK_GLOBAL_DETACH_MIN_CALLS &&
+                    peak_mpi_epoch_ready(&mpi_epoch, peak_mpi_epoch_hook_unlocked(hook), now) &&
+                    !peak_general_controller_has_pending_unlocked() &&
+                    peak_second() <= mpi_epoch.expires &&
+                    peak_general_listener_request_detach_with_context_unlocked(
+                        hook, PEAK_HOOK_REQUEST_SOURCE_GLOBAL_HEARTBEAT, calls_snapshot[hook],
+                        lifetime_snapshot[hook], profile_global_overhead,
+                        total_execution_time, rate_snapshot[hook])) {
+                    ++epoch_requests;
+                    wake_controller = TRUE;
+                    projected_attached_recent_sum =
+                        fmax(0.0, projected_attached_recent_sum - rate_snapshot[hook]);
+                    projected_attached_lifetime_sum =
+                        fmax(0.0, projected_attached_lifetime_sum - ratio_snapshot[hook]);
+                }
+                mpi_epoch = (PeakMpiEpoch){0};
+                have_mpi_epoch_nomination = false;
+            }
+            if (allow_epoch && !wake_controller && epoch_nominee.listener &&
+                mpi_epoch.confirmed_at == 0.0 &&
+                atomic_load_explicit(&peak_mpi_epoch_armed, memory_order_relaxed) == 0) {
+                PeakMpiEpochHook hook = peak_mpi_epoch_hook_unlocked(epoch_nominee.hook);
+                double min_rate = peak_mpi_epoch_cost_fraction(global_target_ratio) /
+                                  peak_general_overhead;
+                if (peak_mpi_epoch_same_hook(epoch_nominee, hook) &&
+                    peak_general_listener_positive_finite(min_rate)) {
+                    mpi_epoch = (PeakMpiEpoch){
+                        .nominee = hook,
+                        .nominated_at = now,
+                        .expires = now + heartbeat_observation_horizon_seconds,
+                        .min_calls_per_second = min_rate
+                    };
+                    have_mpi_epoch_nomination = true;
+                    if (++mpi_epoch_nomination == 0)
+                        ++mpi_epoch_nomination;
+                    atomic_store_explicit(&peak_mpi_epoch_armed, mpi_epoch_nomination,
+                                          memory_order_relaxed);
+                }
+            }
+            pthread_mutex_unlock(&lock);
+        }
+#endif
+
         /* 3) Reattach. */
         if (detach_observation_ready &&
             enable_reattach &&
-            check_interval != 0 &&
-            (heartbeat_counter % check_interval) == 0) {
+            (scheduled_reattach_check || short_reattach_retry_ready)) {
+            last_reattach_check = now;
             double reattach_gate_ratio = 0.0;
             double reattach_spent_seconds = 0.0;
             double reattach_risk_spent_ratio = 0.0;
@@ -6067,7 +6407,7 @@ void* peak_heartbeat_monitor(void* arg) {
         double denominator = error_denominator + hb_k_rate * ema_global_rate;
 #ifdef HAVE_MPI
         /* A falling or unordered rate cannot cancel the active-clock budget error. */
-        if (reported_active_elapsed > 0.0)
+        if (reported_active_elapsed > 0.0 && blocked != PEAK_MPI_CLOCK_UNAVAILABLE)
             denominator = fmax(fmax(1.0, error_denominator), denominator);
 #endif
         double scale = 1.0 / denominator;
@@ -6079,7 +6419,7 @@ void* peak_heartbeat_monitor(void* arg) {
         peak_general_listener_management_cpu_checkpoint(
             &management_cpu_checkpoint_ns,
             &management_cpu_checkpoint_valid);
-        if (!peak_heartbeat_wait_us((unsigned int)sleep_us)) {
+        if (!peak_heartbeat_wait_us((unsigned int)sleep_us, active_sampler)) {
             break;
         }
     }
@@ -6088,19 +6428,45 @@ cleanup:
 #ifdef HAVE_MPI
     if (reported_active_elapsed > 0.0) {
         peak_log_debug("[peak mpi active clock] pid=%ld elapsed=%.9g blocked=%.9g "
-                       "lifetime_target=%.9g configured_target=%.9g\n",
+                       "lifetime_target=%.9g configured_target=%.9g "
+                       "phase_probes=%llu phase_windows=%llu phase_corrections=%llu "
+                       "phase_seconds=%.9g\n",
                        (long)getpid(), reported_active_elapsed, reported_active_blocked,
                        peak_mpi_active_clock_carried_ratio(
                            global_target_ratio, reported_active_elapsed, last_active_budget),
-                       (double)global_target_ratio);
+                       (double)global_target_ratio,
+                       (unsigned long long)sampler.attempted_probes,
+                       (unsigned long long)sampler.sampled_windows,
+                       (unsigned long long)sampler.corrected_windows,
+                       sampler.sampled_seconds);
+    }
+    if (sampler.sampled_windows) {
+        peak_log_debug("[peak mpi active clock phase] pid=%ld sampled_residence=%.9g "
+                       "sampled_raw=%.9g occupancy_seconds=%.9g recent_sampled_windows=%llu\n",
+                       (long)getpid(), sampler.sampled_residence, sampler.sampled_raw,
+                       sampler.occupancy_seconds, (unsigned long long)sampled_recent_windows);
     }
 #endif
     pthread_mutex_lock(&lock);
+#ifdef HAVE_MPI
+    atomic_store_explicit(&peak_mpi_epoch_armed, 0, memory_order_relaxed);
+    epoch_intervals += mpi_epoch.completed_intervals;
+    epoch_groups += mpi_epoch.confirmed_at > 0.0;
+    mpi_epoch = (PeakMpiEpoch){0};
+#endif
     peak_general_listener_snapshot_heartbeat_overhead_seconds_unlocked();
     pthread_mutex_unlock(&lock);
+#ifdef HAVE_MPI
+    if (reported_active_elapsed > 0.0) {
+        peak_log_debug("[peak mpi sync epochs] pid=%ld intervals=%llu groups=%llu requests=%llu\n",
+                       (long)getpid(), (unsigned long long)epoch_intervals,
+                       (unsigned long long)epoch_groups, (unsigned long long)epoch_requests);
+    }
+#endif
     g_free(previous_time);
     g_free(previous_calls);
     g_free(recent_baseline_ready);
+    g_free(sampled_recent_baseline);
     g_free(rate_snapshot);
     g_free(ratio_snapshot);
     g_free(lifetime_snapshot);

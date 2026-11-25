@@ -85,7 +85,20 @@ def alive(process, progress, fixture_log=None):
         raise AssertionError(f"{error}; target status={process.poll()}\n{detail}") from error
 
 
-def fixture_evidence(process, log_path):
+def crash_report_matches(content, target_pid, injector_pids):
+    # Modern .ips files use JSON. Older .crash files use labeled text fields.
+    header = "\n".join(content.splitlines()[:80])
+    pid = re.search(r'^\s*"pid"\s*:\s*(\d+)|^Process:.*\[(\d+)\]',
+                    header, re.MULTILINE)
+    parent = re.search(r'^\s*"parentPid"\s*:\s*(\d+)|^Parent Process:.*\[(\d+)\]',
+                       header, re.MULTILINE)
+    crashed_pid = int(pid.group(1) or pid.group(2)) if pid else None
+    parent_pid = int(parent.group(1) or parent.group(2)) if parent else None
+    return (crashed_pid == target_pid or crashed_pid in injector_pids
+            or parent_pid in injector_pids)
+
+
+def fixture_evidence(process, log_path, injector_output=""):
     evidence = log_path.read_text(errors="replace")
     status = process.poll()
     evidence += f"\nTarget PID {process.pid} status={status}"
@@ -111,7 +124,11 @@ def fixture_evidence(process, log_path):
                    Path("/Library/Logs/DiagnosticReports")]
     started = getattr(process, "peak_started_at", time.time() - 60)
     deadline = time.monotonic() + 6
-    expected_pid = re.compile(r'"pid"\s*:\s*' + str(process.pid) + r'\b|\[' + str(process.pid) + r'\]')
+    injector_pids = {int(pid) for pid in re.findall(
+        r"^peak-attach\[(\d+)\]:", injector_output, re.MULTILINE)}
+    injector_pids.update(int(pid) for pid in re.findall(
+        r"^peak-attach\[\d+\]: (?:worker|tracked injector child) (\d+)\b",
+        injector_output, re.MULTILINE))
     while time.monotonic() < deadline:
         for directory in directories:
             try:
@@ -122,14 +139,16 @@ def fixture_evidence(process, log_path):
                 try:
                     if report.suffix not in (".ips", ".crash") or report.stat().st_mtime < started - 2:
                         continue
-                    content = report.read_text(errors="replace")[:262144]
+                    with report.open(errors="replace") as stream:
+                        content = stream.read(262144)
                 except OSError:
                     continue
-                if expected_pid.search(content) or report.name.startswith("frida"):
+                if crash_report_matches(content, process.pid, injector_pids):
                     return evidence + f"\nNative crash report {report}:\n{content}"
         time.sleep(0.2)
-    return evidence + (f"\nNo native target/helper crash report for PID {process.pid} status {status} "
-                       f"within 6s; inspected {directories!r}")
+    return evidence + (f"\nNo matching native crash report within 6s for target PID "
+                       f"{process.pid} status {status} or injector PIDs "
+                       f"{sorted(injector_pids)}; inspected {directories!r}")
 
 
 def filesystem_phase(target, log_path, phase):
@@ -295,7 +314,7 @@ else:
                 prefix = root / "calibration"
                 code, output = run(base + ["--target", "peak_attach_existing_target",
                                           "--output", str(prefix)], env)
-                assert code == 0, (output, fixture_evidence(target, root / "fixture.log"))
+                assert code == 0, (output, fixture_evidence(target, root / "fixture.log", output))
                 before = counter(progress)
                 wait_for(lambda: counter(progress) > before + 10, 3)
                 target.stdin.write(b"Q")
@@ -338,19 +357,29 @@ else:
                 code, output = run([cli, str(target.pid), "--agent", str(invalid_agent),
                                     "--target", "peak_attach_existing_target"], env,
                                    fixture_log=root / "fixture.log")
-                assert code != 0 and "Darwin loader" in output, (code, output)
+                assert code != 0 and "Darwin loader" in output, (
+                    code, output, fixture_evidence(target, root / "fixture.log", output))
                 assert not any(word in output.lower() for word in
                                ("timed out", "connection was lost",
                                 "activation was not confirmed")), output
                 alive(target, progress, root / "fixture.log")
                 filesystem_phase(target, root / "fixture.log", "B")
+            rejected_prefix = root / "rejected"
+            for option, value in (("PEAK_EXEC_CHAIN", "1"),
+                                  ("PEAK_EXEC_CHECKPOINT", "TrUe")):
+                code, output = run(
+                    base + ["--target", "peak_attach_existing_target",
+                            "--output", str(rejected_prefix)],
+                    dict(env, PEAK_ATTACH_DIAGNOSTICS="1", **{option: value}))
+                assert code != 0 and "late attach cannot propagate PEAK across exec" in output, (
+                    option, code, output)
+                assert "spawned; awaiting agent" not in output and "inject begin" not in output, output
+                assert not list(root.glob("rejected*.csv")), list(root.iterdir())
+            alive(target, progress, root / "fixture.log")
             # Correctable preflight failures must release their claim/config
             # without creating hooks, reports, or a second runtime instance.
-            rejected_prefix = root / "rejected"
             retry_cases = [
                 ("!", env, "invalid PEAK target selector"),
-                ("peak_attach_existing_target", dict(env, PEAK_EXEC_CHAIN="1"),
-                 "late attach cannot propagate PEAK across exec"),
                 (None, dict(env, PEAK_GPU_TARGET_FILE=str(root / "missing-gpu.txt")),
                  "PEAK_GPU_TARGET_FILE has no readable GPU targets"),
             ]
@@ -364,7 +393,7 @@ else:
                                           str(rejected_prefix)], rejected_env,
                                    fixture_log=root / "fixture.log")
                 assert code != 0 and diagnostic in output, (
-                    code, output, fixture_evidence(target, root / "fixture.log"))
+                    code, diagnostic, output, fixture_evidence(target, root / "fixture.log", output))
                 assert "already" not in output.lower(), output
                 alive(target, progress, root / "fixture.log")
                 assert not list(root.glob("rejected*.csv")), list(root.iterdir())
@@ -383,7 +412,8 @@ else:
                     raise AssertionError("native injection required but OS denied it:\n" + output)
                 print("SKIP: platform denied native attach:\n" + output)
                 raise SystemExit(77)
-            assert code == 0, (code, output, target.poll(), fixture_evidence(target, root / "fixture.log"))
+            assert code == 0, (code, output, target.poll(),
+                               fixture_evidence(target, root / "fixture.log", output))
             alive(target, progress, root / "fixture.log")
             filesystem_phase(target, root / "fixture.log", "G")
             alive(target, progress, root / "fixture.log")
@@ -395,7 +425,7 @@ else:
                 for duplicate in duplicates:
                     code, output = duplicate.result()
                     assert code != 0 and "already" in output.lower(), (
-                        code, output, fixture_evidence(target, root / "fixture.log"))
+                        code, output, fixture_evidence(target, root / "fixture.log", output))
             alive(target, progress, root / "fixture.log")
             # A byte-for-byte copied agent has different image identity too.
             if args.agent:
@@ -404,7 +434,8 @@ else:
                 filesystem_phase(target, root / "fixture.log", "B")
                 code, output = run([cli, str(target.pid), "--agent", str(copied_agent),
                                     "--target", "peak_attach_existing_target"], env)
-                assert code != 0 and "already" in output.lower(), (code, output)
+                assert code != 0 and "already" in output.lower(), (
+                    code, output, fixture_evidence(target, root / "fixture.log", output))
                 alive(target, progress, root / "fixture.log")
             filesystem_phase(target, root / "fixture.log", "G")
             if args.mode == "runtime":
