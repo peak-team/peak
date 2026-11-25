@@ -16,6 +16,14 @@ peak_mpi_epoch_sample_kind(unsigned* selected, unsigned kind, bool succeeded)
     return *selected != PEAK_MPI_EPOCH_FAILED && *selected == kind;
 }
 
+/* If profiling adds C to a completed epoch of duration T, its modeled
+ * slowdown is C / (T - C). Solve for the observed cost fraction C / T. */
+static inline double
+peak_mpi_epoch_cost_fraction(double q)
+{
+    return q / (1.0 + q);
+}
+
 typedef struct {
     size_t hook;
     const void* listener;

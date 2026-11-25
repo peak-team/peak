@@ -6028,7 +6028,7 @@ void* peak_heartbeat_monitor(void* arg) {
                 mpi_epoch.confirmed_at == 0.0 &&
                 atomic_load_explicit(&peak_mpi_epoch_armed, memory_order_relaxed) == 0) {
                 PeakMpiEpochHook hook = peak_mpi_epoch_hook_unlocked(epoch_nominee.hook);
-                double min_rate = global_target_ratio * peak_global_detach_factor /
+                double min_rate = peak_mpi_epoch_cost_fraction(global_target_ratio) /
                                   peak_general_overhead;
                 if (peak_mpi_epoch_same_hook(epoch_nominee, hook) &&
                     peak_general_listener_positive_finite(min_rate)) {

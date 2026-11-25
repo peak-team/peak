@@ -536,12 +536,16 @@ also sample the MPI owner thread's existing counter for the attached hook
 with the highest recent rate. An MPI epoch runs from the return of one outer
 `MPI_COMM_WORLD` barrier or positive-count all-reduce to the return of the
 next eligible collective of the same kind. The heartbeat can request that
-hook's detach when two completed epochs within one maximum heartbeat interval
-each exceed the configured global overhead ratio times the detach factor.
-Each nomination allows at most five attempts, and the MPI thread skips a
-sample if the listener lock is busy. The ordinary recent and lifetime
-decisions and queued hook changes take priority. Evidence expires if the
-hook or its attachment changes. This captures short bursts that slow a
+hook's detach when its estimated profiling cost exceeds `q / (1 + q)` of
+elapsed time in each of two completed epochs within one maximum heartbeat
+interval. For a completed epoch of duration `T` with estimated hook cost
+`C`, the model compares `C` with `T - C`. Solving `C / (T - C) > q`
+gives the observed cost fraction for the epoch decision. At a 10% target,
+a 100 ms epoch allows about 9.09 ms of estimated hook cost. Each nomination
+allows at most five attempts, and the MPI thread skips a sample if the
+listener lock is busy. Ordinary recent and lifetime decisions retain their
+detach factor and take priority, as do queued hook changes. Evidence expires
+if the hook or its attachment changes. This captures short bursts that slow a
 rank's peers while the burst's cost is diluted across a longer heartbeat.
 
 Lifetime budgeting and reattach use cumulative residence.

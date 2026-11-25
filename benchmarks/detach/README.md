@@ -86,8 +86,12 @@ the instrumented order in the second block and brackets each block with native
 runs. The fully attached arm disables heartbeat detach and must record every
 offered call with zero drops or lifecycle transitions. q5 and q10 use the
 global heartbeat and MPI active clock with per-target heartbeat disabled.
-They enable reattach and use a 100 ms cooldown by default, with the hibernation
-cycle unset. Use `--cooldown-ms` to set a different cooldown or
+For the MPI epoch fallback, the 5% and 10% global targets correspond to
+estimated hook cost above 4.76% and 9.09% of the observed collective interval,
+respectively, in each of two corroborating epochs. This is a local policy
+trigger. The native brackets independently measure application slowdown.
+Both budget arms enable reattach and use a 100 ms cooldown by default,
+with the hibernation cycle unset. Use `--cooldown-ms` to set a different cooldown or
 `--no-reattach` to inspect first-detach behavior. The native and fully
 attached controls keep the same settings in either case. Each arm has a
 launch timeout. For a quick functional check, pass the small counts from the

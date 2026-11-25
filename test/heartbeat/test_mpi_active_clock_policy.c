@@ -743,6 +743,32 @@ static void test_recent_raw_pressure_and_topology_reset(void)
     }
 }
 
+static void test_epoch_slowdown_threshold(void)
+{
+    const double observed_seconds = 0.1;
+    const double cost_per_call = 1e-6;
+    double limit = peak_mpi_epoch_cost_fraction(0.1);
+    assert(equal(observed_seconds * limit, 0.00909090909090909));
+    assert(observed_seconds * limit < 0.012); /* Former q × 1.2 threshold. */
+    assert(equal(observed_seconds * peak_mpi_epoch_cost_fraction(0.05),
+                 0.00476190476190476));
+    assert(equal(observed_seconds * peak_mpi_epoch_cost_fraction(1.0), 0.05));
+
+    int listener;
+    PeakMpiEpochHook hook = { .hook = 3, .listener = &listener, .control = 8 };
+    PeakMpiEpoch sample = {
+        .nominee = hook, .nominated_at = 1.0, .expires = 2.0,
+        .min_calls_per_second = limit / cost_per_call,
+    };
+    assert(!peak_mpi_epoch_observe(&sample, hook, PEAK_MPI_EPOCH_BARRIER, 1, 1.1, 0));
+    assert(!peak_mpi_epoch_observe(&sample, hook, PEAK_MPI_EPOCH_BARRIER, 2, 1.2, 9090));
+    assert(sample.corroborations == 0);
+    assert(!peak_mpi_epoch_observe(&sample, hook, PEAK_MPI_EPOCH_BARRIER, 3, 1.3, 18181));
+    assert(!peak_mpi_epoch_ready(&sample, hook, 1.3));
+    assert(peak_mpi_epoch_observe(&sample, hook, PEAK_MPI_EPOCH_BARRIER, 4, 1.4, 27272));
+    assert(peak_mpi_epoch_ready(&sample, hook, 1.4));
+}
+
 static void test_completed_epochs(void)
 {
     int hot_listener = 0, cheap_listener = 0;
@@ -868,5 +894,6 @@ int main(void)
     test_sparse_applied_recent_decisions(0, 2);
     test_recent_raw_pressure_and_topology_reset();
     test_occupancy_selected_cut_rejects_biased_raw_pressure();
+    test_epoch_slowdown_threshold();
     test_completed_epochs();
 }
