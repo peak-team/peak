@@ -498,9 +498,9 @@ static void run_detach_trace(DetachRun* result, unsigned seconds, bool transitio
                 q, recent_elapsed, fmin(recent, recent_elapsed), recent_cost, tick, lifetime);
             unsigned applied_probes = sampler.applied_sleep_seconds > 0.0 ? sampler.probes : 0;
             double current = applied_probes ? q : legacy;
-            if (beat && peak_mpi_active_clock_recent_add(
-                    &block, horizon, recent_elapsed, recent, recent_cost,
-                    sampler.applied_sleep_seconds, applied_probes)) {
+            if (beat && peak_mpi_active_clock_recent_confirm(
+                    &block, horizon, true, recent_elapsed, recent_cost, &sampler,
+                    pressure > current * factor || pressure > lifetime * factor)) {
                 current = peak_mpi_active_clock_recent_sampled_ratio(q, &block);
                 block = (PeakMpiActiveClockRecent){0};
             }
@@ -613,6 +613,135 @@ static void test_occupancy_recent_detach(void)
     }
 }
 
+static void test_sparse_applied_recent_decisions(int variable, int priority)
+{
+    const double q = 0.1, rate = 0.05, factor = 1.2;
+    PeakMpiActiveClockRecent group = {0};
+    double measured_wall = 0.0, unmeasured_wall = 0.0;
+    unsigned measured_probes = 0;
+    double first_request = 0.0;
+    for (unsigned cut = 0; cut < 29; ++cut) {
+        const int applied = cut % 29 == 0;
+        const int observed = cut != 1;
+        const double elapsed = variable && cut % 2 ? 0.0625 : 0.125;
+        const unsigned probes = observed ? (elapsed == 0.125 ? 8 : 4) : 0;
+        const double overlap = rate * elapsed;
+        /* The unmeasured span's raw value is deliberately high. It can
+         * inform its ordinary decision without inflating the aligned group. */
+        const double raw = !observed ? elapsed : 0.0;
+        const double ordinary = applied ? q : peak_mpi_active_clock_recent_ratio(
+            q, elapsed, raw, overlap, 0.001, q);
+        const double attached = observed ? (priority == 1 ? 0.13 : rate) : 0.0;
+        measured_wall += observed ? elapsed : 0.0;
+        unmeasured_wall += observed ? 0.0 : elapsed;
+        measured_probes += probes;
+        PeakMpiClockSampler observation = {
+            .applied_sleep_seconds = applied ? elapsed : 0.0,
+            .measured_sleep_seconds = observed ? elapsed : 0.0,
+            .measured_mpi_seconds = observed ? 0.875 * elapsed : 0.0,
+            .probes = probes,
+        };
+        const bool immediate = attached > ordinary * factor || priority == 2;
+        bool confirmed = peak_mpi_active_clock_recent_confirm(
+            &group, 32.5, true, elapsed, overlap, &observation, immediate);
+        if (measured_probes < 64) {
+            assert(!confirmed);
+            assert(equal(group.blocked, 0.875 * measured_wall));
+            assert(equal(group.elapsed, measured_wall + unmeasured_wall));
+            continue;
+        }
+        if (priority) {
+            assert(!confirmed && group.elapsed == 0.0);
+            return;
+        }
+        if (!confirmed)
+            continue;
+        assert(equal(group.elapsed, measured_wall + unmeasured_wall));
+        double target = peak_mpi_active_clock_recent_sampled_ratio(q, &group);
+        assert(equal(target, q * (1.0 + rate -
+            0.875 * measured_wall / (measured_wall + unmeasured_wall))));
+        if (rate > target * factor)
+            first_request = group.elapsed;
+        break;
+    }
+    /* With one applied cut before 29, the old 64-applied-probe path
+     * cannot make this request. */
+    assert(first_request >= 1.0 && first_request < 1.25);
+}
+
+static void test_occupancy_selected_cut_rejects_biased_raw_pressure(void)
+{
+    const double q = 0.1, rate = 0.05, factor = 1.2, elapsed = 0.125;
+    const double lifetime_target = q;
+    /* The established detector identified a phase lock. The coarse clock
+     * counts each short wait as a whole tick, though true duty is 40%. */
+    PeakMpiClockSampler sampler = {.use_occupancy = true, .evidence_probes = 8};
+    PeakMpiClockResidence residence = {.epoch = 1.0, .now = 1.0, .match_sleep = true};
+    PeakMpiActiveClockRecent group = {0};
+    double raw_target = peak_mpi_active_clock_recent_ratio(
+        q, elapsed, elapsed, rate * elapsed, 0.001, lifetime_target);
+    double exact_target = peak_mpi_active_clock_policy(
+        q, elapsed, 0.4 * elapsed, rate * elapsed).ratio;
+    assert(rate > factor * raw_target);
+    assert(rate <= factor * exact_target);
+
+    for (unsigned i = 0; i < 8; ++i) {
+        sampler.start = residence.now;
+        sampler.expected_end = sampler.start + elapsed;
+        sampler.raw_start = residence.raw;
+        sampler.probes = 8;
+        sampler.open_probes = i % 5 == 0 ? 4 : 3;
+        (void)peak_mpi_active_clock_accumulate(
+            &residence, &sampler, sampler.expected_end, residence.raw + elapsed);
+        assert(equal(sampler.applied_sleep_seconds, elapsed));
+        double target = q;
+        bool immediate = rate > target * factor || rate > lifetime_target * factor;
+        bool confirmed = peak_mpi_active_clock_recent_confirm(
+            &group, 32.5, true, elapsed, rate * elapsed, &sampler, immediate);
+        assert(confirmed == (i == 7));
+        if (confirmed)
+            target = peak_mpi_active_clock_recent_sampled_ratio(q, &group);
+        assert(rate <= factor * target);
+    }
+}
+
+static void test_recent_raw_pressure_and_topology_reset(void)
+{
+    PeakMpiActiveClockRecent group = {0};
+    const double elapsed = 0.125, q = 0.1, factor = 1.2, rate = 0.05;
+    PeakMpiClockSampler observation = {
+        .measured_sleep_seconds = elapsed, .measured_mpi_seconds = elapsed / 2, .probes = 8,
+    };
+    for (unsigned i = 0; i < 7; ++i) {
+        observation.applied_sleep_seconds = i == 0 ? elapsed : 0.0;
+        assert(!peak_mpi_active_clock_recent_confirm(
+            &group, 32.5, true, elapsed, 0.0, &observation, false));
+    }
+    double ordinary = peak_mpi_active_clock_recent_ratio(
+        q, elapsed, elapsed, rate * elapsed, 0.001, q);
+    assert(rate > factor * ordinary);
+    assert(!peak_mpi_active_clock_recent_confirm(
+        &group, 32.5, true, elapsed, rate * elapsed, &observation, rate > factor * ordinary));
+    assert(group.elapsed == 0.0);
+
+    observation.applied_sleep_seconds = elapsed;
+    assert(!peak_mpi_active_clock_recent_confirm(
+        &group, 32.5, true, elapsed, 0.0, &observation, false));
+    assert(group.elapsed > 0.0);
+    /* A changed hook population invalidates the group even if a sample
+     * was applied on this cut. Subsequent raw-selected observations do
+     * not resurrect it unless another correction opens a new group. */
+    assert(!peak_mpi_active_clock_recent_confirm(
+        &group, 32.5, false, elapsed, 0.0, &observation, false));
+    assert(group.elapsed == 0.0);
+    observation.applied_sleep_seconds = 0.0;
+    for (unsigned i = 0; i < 16; ++i) {
+        assert(!peak_mpi_active_clock_recent_confirm(
+            &group, 32.5, true, elapsed, 0.0, &observation, false));
+        assert(group.elapsed == 0.0);
+    }
+}
+
 int main(void)
 {
     expect(20.0, 0.0, 0.0, 0.1, 2.0, 0);
@@ -648,4 +777,10 @@ int main(void)
     test_phase_selection_adapts_to_workload_change();
     test_recent_probe_throttle_and_expiry();
     test_occupancy_recent_detach();
+    test_sparse_applied_recent_decisions(0, 0);
+    test_sparse_applied_recent_decisions(1, 0);
+    test_sparse_applied_recent_decisions(0, 1);
+    test_sparse_applied_recent_decisions(0, 2);
+    test_recent_raw_pressure_and_topology_reset();
+    test_occupancy_selected_cut_rejects_biased_raw_pressure();
 }

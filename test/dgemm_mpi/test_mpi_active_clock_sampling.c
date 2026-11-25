@@ -289,6 +289,52 @@ test_phase_pattern(PhasePattern pattern)
 }
 
 static void
+test_measurement_during_quiet_to_aliased_phase(void)
+{
+    const double span = 0x1p-3;
+    PeakMpiClockResidence residence = {.epoch = epoch, .now = epoch, .match_sleep = true};
+    PeakMpiClockSampler sampler = {.probes = 8};
+    for (unsigned cut = 1; cut <= 18; ++cut) {
+        sampler.start = epoch + (cut - 1) * span;
+        sampler.expected_end = sampler.start + span;
+        sampler.open_probes = cut > 16 ? 6 : 0;
+        double blocked = peak_mpi_active_clock_accumulate(
+            &residence, &sampler, sampler.expected_end, 0.0);
+        assert(sampler.measured_sleep_seconds == span);
+        assert(sampler.measured_mpi_seconds == (cut > 16 ? span * 0.75 : 0.0));
+        if (cut < 18) {
+            assert(blocked == 0.0 && sampler.applied_sleep_seconds == 0.0);
+        } else {
+            assert(blocked == span * 0.75 && sampler.applied_sleep_seconds == span);
+        }
+    }
+}
+
+static void
+test_measurement_available_independent_of_correction(void)
+{
+    const double span = 0x1p-3;
+    PeakMpiClockResidence residence = {.epoch = epoch, .now = epoch, .match_sleep = true};
+    PeakMpiClockSampler sampler = {
+        .start = epoch, .expected_end = epoch + span,
+        .probes = 8, .open_probes = 4,
+    };
+    double corrected = peak_mpi_active_clock_accumulate(
+        &residence, &sampler, epoch + span, span / 2);
+    /* This valid sleep selected raw but supplied actual observations. */
+    assert(corrected == span / 2 && sampler.applied_sleep_seconds == 0.0);
+    assert(sampler.measured_sleep_seconds == span);
+    assert(sampler.measured_mpi_seconds == span / 2);
+    sampler.incomplete = true;
+    corrected = peak_mpi_active_clock_accumulate(
+        &residence, &sampler, epoch + 2 * span, span);
+    assert(corrected == span && sampler.measured_sleep_seconds == 0.0 &&
+           sampler.measured_mpi_seconds == 0.0);
+    (void)peak_mpi_active_clock_accumulate(&residence, &sampler, epoch + 3 * span, -1.0);
+    assert(sampler.measured_sleep_seconds == 0.0 && sampler.measured_mpi_seconds == 0.0);
+}
+
+static void
 test_mixed_sampled_and_raw_spans(void)
 {
     const double gap = 0x1p-12;
@@ -474,5 +520,7 @@ main(void)
     test_phase_pattern(PHASE_WITH_LONG_WAIT);
     test_phase_pattern(PHASE_ALL_COMPUTE);
     test_phase_pattern(PHASE_ALL_MPI);
+    test_measurement_available_independent_of_correction();
+    test_measurement_during_quiet_to_aliased_phase();
     test_mixed_sampled_and_raw_spans();
 }

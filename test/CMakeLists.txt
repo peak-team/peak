@@ -5,6 +5,10 @@ if(BUILD_TESTING)
     target_compile_options(test_mpi_active_clock_policy PRIVATE -UNDEBUG)
     target_link_libraries(test_mpi_active_clock_policy PRIVATE m)
     add_test(NAME test_mpi_active_clock_policy COMMAND test_mpi_active_clock_policy)
+    add_executable(test_heartbeat_detach_policy heartbeat/test_heartbeat_detach_policy.c)
+    target_include_directories(test_heartbeat_detach_policy PRIVATE ${PROJECT_SOURCE_DIR}/include)
+    target_compile_options(test_heartbeat_detach_policy PRIVATE -UNDEBUG)
+    add_test(NAME test_heartbeat_detach_policy COMMAND test_heartbeat_detach_policy)
     if(CMAKE_SYSTEM_NAME MATCHES "Linux")
         add_test(NAME test_darwin_attach_controller_mock
             COMMAND ${CMAKE_COMMAND} -E env CC=${CMAKE_C_COMPILER}

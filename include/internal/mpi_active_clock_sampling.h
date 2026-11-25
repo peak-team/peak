@@ -14,6 +14,7 @@ typedef struct PeakMpiClockSampler {
     double start, raw_start;
     double expected_end, tolerance;
     double applied_sleep_seconds;
+    double measured_sleep_seconds, measured_mpi_seconds;
     unsigned probes, open_probes;
     bool incomplete;
     bool use_occupancy;
@@ -132,6 +133,8 @@ static inline double peak_mpi_active_clock_sampled_delta(
     double coarse = fmin(elapsed, raw_sleep);
     double sampled = peak_mpi_active_clock_sampled_seconds(
         elapsed, raw_sleep, sampler->probes, sampler->open_probes);
+    sampler->measured_sleep_seconds = elapsed;
+    sampler->measured_mpi_seconds = sampled;
     bool use_occupancy = sampler->use_occupancy;
     peak_mpi_active_clock_add_evidence(sampler, elapsed, coarse, sampled);
     sampler->sampled_windows++;
@@ -162,6 +165,8 @@ static inline double peak_mpi_active_clock_accumulate(
     double now, double raw)
 {
     sampler->applied_sleep_seconds = 0.0;
+    sampler->measured_sleep_seconds = 0.0;
+    sampler->measured_mpi_seconds = 0.0;
     bool raw_regressed = raw < residence->raw;
     if (raw < 0.0 || raw_regressed)
         peak_mpi_active_clock_reset_evidence(sampler);

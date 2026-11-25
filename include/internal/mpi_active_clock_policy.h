@@ -4,6 +4,7 @@
 #include <float.h>
 #include <math.h>
 #include <stddef.h>
+#include "internal/mpi_active_clock_sampling.h"
 
 typedef struct {
     double ratio;
@@ -101,6 +102,29 @@ static inline double peak_mpi_active_clock_recent_sampled_ratio(
     return peak_mpi_active_clock_policy(
         q, recent->elapsed, fmin(recent->elapsed, recent->blocked),
         recent->overlap).ratio;
+}
+
+/* On success, the caller uses and consumes the aligned group. Otherwise
+ * a pending group survives unless invalid, expired, or vetoed at completion. */
+static inline bool peak_mpi_active_clock_recent_confirm(
+    PeakMpiActiveClockRecent* recent, double horizon, bool valid,
+    double elapsed, double overlap, const PeakMpiClockSampler* sampler,
+    bool immediate_pressure)
+{
+    if (!valid) {
+        *recent = (PeakMpiActiveClockRecent){0};
+        return false;
+    }
+    if (!(recent->elapsed > 0.0 || sampler->applied_sleep_seconds > 0.0) ||
+        !peak_mpi_active_clock_recent_add(recent, horizon, elapsed,
+            sampler->measured_mpi_seconds, overlap, sampler->measured_sleep_seconds,
+            sampler->measured_sleep_seconds > 0.0 ? sampler->probes : 0))
+        return false;
+    if (immediate_pressure) {
+        *recent = (PeakMpiActiveClockRecent){0};
+        return false;
+    }
+    return true;
 }
 
 /* A missed snapshot carries the preceding allowance in seconds. A negative

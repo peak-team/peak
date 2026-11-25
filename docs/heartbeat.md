@@ -172,12 +172,20 @@ attached_lifetime_sum = sum lifetime_ratio[i] for attached hooks
 profile_global_overhead = max(attached_recent_sum, attached_lifetime_sum)
 ```
 
-If `profile_global_overhead` exceeds
-`global_target_ratio * peak_global_detach_factor`, attached candidates are
-ranked by `max(recent_rate, lifetime_ratio)`, then by recent rate and index.
-After each accepted detach request, the heartbeat debits the local projected
-recent and lifetime sums and stops once the projected global overhead is at or
-below `global_target_ratio`.
+Global detach starts when either projected sum exceeds its own target times
+`peak_global_detach_factor`. Each target defaults to `global_target_ratio`. The
+MPI active clock can supply distinct recent and lifetime targets.
+
+When both projected sums exceed their targets, the heartbeat ranks candidates
+by the larger of their recent and lifetime contributions, normalizing each
+contribution by its own target when the targets differ. Ties favor the higher
+recent rate, then the lower hook index. When only one sum exceeds its target,
+candidates are ranked by their contribution to that sum, with ties resolved by
+hook index. An accepted detach debits both projected sums. If that debit
+satisfies one of two exceeded targets, the heartbeat re-sorts the remaining
+candidates once using the contribution to the remaining deficit. The pass
+stops when both targets are satisfied or no eligible candidate provides relief
+to a remaining deficit.
 
 The request context records the call count, lifetime ratio, global profile
 pressure, elapsed time, and recent rate that caused the request. It does not
@@ -503,19 +511,26 @@ hardware resolution, but its update interval can be longer.
 Clock quantization can miss gaps shorter than a tick, and periodic MPI calls
 aligned with ticks can overestimate residence. There is no per-window error
 bound. For a raw recent interval, PEAK allows one clock quantum of
-uncertainty, capped by the lifetime target. When sampled occupancy supplies
-residence, PEAK tightens the recent detach threshold only after a group of
-heartbeat intervals supplies 64 effective probes. A probe's weight is the
-wall duration of its sleep divided by that sleep's probe count. Unequal
-weights require more observations. The group supplies the elapsed time, MPI
-residence, change in profiling and control cost, and each attached hook's
-call rate used to select and debit detach candidates. Each completed group
-is consumed once. A group expires after 65 times the larger of the configured
-maximum heartbeat interval and 20 ms. This gives short heartbeats time to
-gather evidence under the 10 ms probe throttle. Cuts without applied samples
-contribute their coarse-clock residence and hook costs to an open group.
-A single heartbeat can still trigger detach through its ordinary
-wall-time limit, and lifetime pressure remains actionable on every cut.
+uncertainty, capped by the lifetime target. A sleep that uses sampled
+occupancy opens a recent observation group. Once open, the group uses valid
+probe measurements from subsequent sleeps, including sleeps that use coarse
+residence for lifetime accounting. A probe's weight is the wall duration of
+its sleep divided by that sleep's probe count. The group requires 64 effective
+probes, so unequal weights require more observations.
+
+The group uses its full elapsed interval for profiling and control costs and
+for the hook call rates used to select and debit detach candidates. MPI
+residence in the group comes from valid measured sleeps. Unmeasured spans
+contribute elapsed time and costs. Invalid clock or hook snapshots clear the
+group. Each completed group is consumed once, and a group expires after 65
+times the larger of the configured maximum heartbeat interval and 20 ms. This
+gives short heartbeats time to gather evidence under the 10 ms probe throttle.
+For a coarse-selected cut, the ordinary recent decision uses the raw target.
+For an occupancy-selected cut, the ordinary recent decision uses the
+configured wall-time target while the group collects evidence. Either
+ordinary recent decision or a lifetime budget violation takes priority over
+the grouped recent decision.
+
 Lifetime budgeting and reattach use cumulative residence.
 A raced snapshot carries the preceding absolute
 lifetime allowance rather than granting fresh headroom. A failed reader cut

@@ -6,6 +6,7 @@
 #include "internal/general_listener_internal.h"
 #include "internal/general_listener/attach_policy.h"
 #include "internal/general_listener/exec_checkpoint_writer.h"
+#include "internal/general_listener/heartbeat_detach_policy.h"
 #include "internal/general_listener/report_formatter.h"
 #include "internal/general_listener/report_maxima.h"
 #include "internal/general_listener/report_model.h"
@@ -4914,13 +4915,6 @@ peak_general_listener_controller_stop(void)
 /* Heartbeat policy. */
 
 typedef struct {
-    size_t index;
-    double ratio; /* Detach pressure or reattach historical seconds. */
-    double rate;  /* Detach contribution or oldest-detach ordering key. */
-    double lifetime;
-} OverheadEntry;
-
-typedef struct {
     gulong calls;
     gboolean attached;
 } SampledRecentBaseline;
@@ -4930,22 +4924,6 @@ peak_heartbeat_recent_rate(gulong calls, gulong previous, double elapsed)
 {
     gulong delta = calls >= previous ? calls - previous : calls;
     return ((double)delta * peak_general_overhead) / elapsed;
-}
-
-/* Sort global detach candidates by descending ratio. */
-static int compare_ratio_de(const void* a, const void* b) {
-    const OverheadEntry* x = (const OverheadEntry*)a;
-    const OverheadEntry* y = (const OverheadEntry*)b;
-
-    if (x->ratio < y->ratio) return 1;
-    if (x->ratio > y->ratio) return -1;
-
-    /* Prefer faster-growing overhead when ratios tie. */
-    if (x->rate < y->rate) return 1;
-    if (x->rate > y->rate) return -1;
-    if (x->index < y->index) return -1;
-    if (x->index > y->index) return 1;
-    return 0;
 }
 
 /* Sort global reattach candidates by ascending rate. */
@@ -5760,32 +5738,24 @@ void* peak_heartbeat_monitor(void* arg) {
                     double recent_elapsed = total_execution_time - previous_active_elapsed;
                     double recent_blocked = blocked - previous_active_blocked;
                     double recent_overlap = cost - previous_active_cost;
-                    unsigned probes = sampler.applied_sleep_seconds > 0.0
-                        ? sampler.probes : 0;
-                    if (!probes) {
+                    if (sampler.applied_sleep_seconds <= 0.0) {
                         recent_target = peak_mpi_active_clock_recent_ratio(
                             global_target_ratio, recent_elapsed,
                             fmin(recent_blocked, recent_elapsed), recent_overlap,
                             peak_mpi_active_clock_quantum_seconds(), lifetime_target);
                     }
-                    if (!sampled_recent_valid) {
-                        sampled_recent = (PeakMpiActiveClockRecent){0};
-                    } else if (peak_mpi_active_clock_recent_add(
-                                   &sampled_recent, sampled_recent_horizon,
-                                   recent_elapsed, recent_blocked, recent_overlap,
-                                   sampler.applied_sleep_seconds, probes)) {
-                        /* Keep an immediate wall-budget violation actionable.
-                         * Otherwise use the completed window for the entire
-                         * recent detach decision. */
-                        if (attached_recent_sum <=
-                            global_target_ratio * peak_global_detach_factor) {
-                            sampled_recent_windows++;
-                            sampled_recent_elapsed = sampled_recent.elapsed;
-                            projected_attached_recent_sum =
-                                sampled_attached_seconds / sampled_recent_elapsed;
-                            recent_target = peak_mpi_active_clock_recent_sampled_ratio(
-                                global_target_ratio, &sampled_recent);
-                        }
+                    gboolean immediate_pressure =
+                        !(attached_recent_sum <= recent_target * peak_global_detach_factor &&
+                          attached_lifetime_sum <= lifetime_target * peak_global_detach_factor);
+                    if (peak_mpi_active_clock_recent_confirm(
+                            &sampled_recent, sampled_recent_horizon, sampled_recent_valid,
+                            recent_elapsed, recent_overlap, &sampler, immediate_pressure)) {
+                        sampled_recent_windows++;
+                        sampled_recent_elapsed = sampled_recent.elapsed;
+                        projected_attached_recent_sum =
+                            sampled_attached_seconds / sampled_recent_elapsed;
+                        recent_target = peak_mpi_active_clock_recent_sampled_ratio(
+                            global_target_ratio, &sampled_recent);
                         sampled_recent = (PeakMpiActiveClockRecent){0};
                     }
                 } else {
@@ -5885,23 +5855,18 @@ void* peak_heartbeat_monitor(void* arg) {
                     n_attached++;
                 }
 
-                if (n_attached > 1) {
-                    qsort(entries,
-                          n_attached,
-                          sizeof(OverheadEntry),
-                          compare_ratio_de);
-                }
-
                 double reduced_recent_sum = projected_attached_recent_sum;
                 double reduced_lifetime_sum = projected_attached_lifetime_sum;
+                gboolean recent_exceeded = reduced_recent_sum > recent_target;
+                gboolean lifetime_exceeded = reduced_lifetime_sum > lifetime_target;
+                peak_heartbeat_sort_detach_entries(entries, n_attached,
+                                                   recent_exceeded,
+                                                   lifetime_exceeded);
                 for (size_t k = 0; k < n_attached; k++) {
                     size_t idx = entries[k].index;
 
-                    if (reduced_recent_sum <= recent_target &&
-                        reduced_lifetime_sum <= lifetime_target) {
-                        break;
-                    }
-                    if (entries[k].ratio <= 0.0) {
+                    if ((!recent_exceeded || entries[k].rate <= 0.0) &&
+                        (!lifetime_exceeded || entries[k].lifetime <= 0.0)) {
                         break;
                     }
 
@@ -5928,6 +5893,16 @@ void* peak_heartbeat_monitor(void* arg) {
                         reduced_lifetime_sum -= entries[k].lifetime;
                         if (reduced_lifetime_sum < 0.0) {
                             reduced_lifetime_sum = 0.0;
+                        }
+                        gboolean both_exceeded = recent_exceeded && lifetime_exceeded;
+                        recent_exceeded = reduced_recent_sum > recent_target;
+                        lifetime_exceeded = reduced_lifetime_sum > lifetime_target;
+                        /* Detach only lowers pressure, so the remaining
+                         * candidates need at most one change in ordering. */
+                        if (both_exceeded && recent_exceeded != lifetime_exceeded) {
+                            peak_heartbeat_sort_detach_entries(
+                                entries + k + 1, n_attached - k - 1,
+                                recent_exceeded, lifetime_exceeded);
                         }
                     }
                 }

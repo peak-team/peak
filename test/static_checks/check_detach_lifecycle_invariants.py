@@ -2130,7 +2130,10 @@ def check_stop_window_accounting_sidecar(repo_root):
             "if (projected_attached_recent_sum > recent_target * peak_global_detach_factor || "
             "projected_attached_lifetime_sum > lifetime_target * peak_global_detach_factor)"
             in global_detach_tokens and
-            "if (reduced_recent_sum <= recent_target && reduced_lifetime_sum <= lifetime_target)"
+            "recent_exceeded = reduced_recent_sum > recent_target" in global_detach_tokens and
+            "lifetime_exceeded = reduced_lifetime_sum > lifetime_target" in global_detach_tokens and
+            "if ((!recent_exceeded || entries[k].rate <= 0.0) && "
+            "(!lifetime_exceeded || entries[k].lifetime <= 0.0))"
             in global_detach_tokens,
             "global detach must trigger on either window exceeding its own threshold "
             "and reduce until both windows fit")
@@ -2145,6 +2148,14 @@ def check_stop_window_accounting_sidecar(repo_root):
             "projected_attached_recent_sum = sampled_attached_seconds / sampled_recent_elapsed; "
             "recent_target = peak_mpi_active_clock_recent_sampled_ratio( "
             "global_target_ratio, &sampled_recent);" in heartbeat_tokens and
+            "if (sampler.applied_sleep_seconds <= 0.0) { "
+            "recent_target = peak_mpi_active_clock_recent_ratio(" in heartbeat_tokens and
+            "gboolean immediate_pressure = !(attached_recent_sum <= recent_target * "
+            "peak_global_detach_factor && attached_lifetime_sum <= lifetime_target * "
+            "peak_global_detach_factor);" in heartbeat_tokens and
+            "peak_mpi_active_clock_recent_confirm( &sampled_recent, sampled_recent_horizon, "
+            "sampled_recent_valid, recent_elapsed, recent_overlap, &sampler, immediate_pressure)"
+            in heartbeat_tokens and
             "sampled_attached_seconds += "
             "(double)(total_num_calls - baseline->calls) * peak_general_overhead" in heartbeat_tokens,
             "sampled target and attached pressure must use the same cut interval")
@@ -2632,7 +2643,9 @@ def check_detach_profile_accounting_order(repo_root):
 def check_global_detach_overhead_selection(repo_root):
     source = read_source(repo_root, "src/general_listener.c")
     heartbeat = extract_function(source, "peak_heartbeat_monitor")
-    comparator = extract_function(source, "compare_ratio_de")
+    policy = read_source(repo_root, "include/internal/general_listener/heartbeat_detach_policy.h")
+    comparator = extract_function(policy, "compare_ratio_de")
+    ordering = extract_function(policy, "peak_heartbeat_sort_detach_entries")
     wait_helper = extract_function(source, "peak_heartbeat_wait_us")
 
     global_detach_marker = "/* 2) Global detach. */"
@@ -2643,10 +2656,14 @@ def check_global_detach_overhead_selection(repo_root):
             "heartbeat must keep explicit global detach and reattach sections")
     global_detach = heartbeat[start:end]
 
-    require("compare_rate_de" not in source,
-            "global detach must not sort by transient overhead rate")
-    require("compare_ratio_de" in global_detach,
-            "global detach must sort candidates by actual overhead ratio")
+    require("recent_exceeded && lifetime_exceeded ? compare_ratio_de" in ordering and
+            "peak_heartbeat_compare_recent_detach" in ordering and
+            "peak_heartbeat_compare_lifetime_detach" in ordering,
+            "global detach must use combined ranking only while both targets are exceeded")
+    require(global_detach.count("peak_heartbeat_sort_detach_entries(") == 2 and
+            "both_exceeded && recent_exceeded != lifetime_exceeded" in global_detach and
+            "entries + k + 1, n_attached - k - 1" in global_detach,
+            "global detach may re-sort only unattempted candidates when one target is satisfied")
     require(comparator.find("x->ratio") < comparator.find("x->rate"),
             "global detach comparator must prioritize ratio before rate")
     initial_wait = re.search(
