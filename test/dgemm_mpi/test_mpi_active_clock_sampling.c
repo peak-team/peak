@@ -38,6 +38,77 @@ static bool fine_failure;
 static unsigned delayed_reads;
 static uint64_t opened;
 
+/* Stand in for the listener while exercising the real MPI wrappers offline. */
+_Atomic uint64_t peak_mpi_epoch_armed;
+static unsigned epoch_samples;
+static unsigned expected_epoch_kind;
+
+void
+peak_general_listener_mpi_epoch_completed(uint64_t nomination, unsigned attempt,
+                                          unsigned kind, double now)
+{
+    assert(nomination == 1 && attempt == ++epoch_samples);
+    assert(kind == expected_epoch_kind);
+    assert(fabs(now - (epoch + wall_us * 1e-6)) < 1e-9);
+}
+
+static int barrier_result = MPI_SUCCESS;
+
+static int
+fake_barrier(MPI_Comm comm)
+{
+    (void)comm;
+    return barrier_result;
+}
+
+static int
+fake_allreduce(const void* send_buffer, void* recv_buffer, int count,
+               MPI_Datatype type, MPI_Op op, MPI_Comm comm)
+{
+    (void)send_buffer;
+    (void)recv_buffer;
+    (void)count;
+    (void)type;
+    (void)op;
+    (void)comm;
+    /* Simulate an MPI implementation or tool that makes a nested call. */
+    return PMPI_Barrier(MPI_COMM_WORLD);
+}
+
+static void
+test_epoch_boundaries(void)
+{
+    atomic_store(&residence_state, 0);
+    atomic_store(&next_mpi_Barrier, fake_barrier);
+    atomic_store(&next_pmpi_Barrier, fake_barrier);
+    atomic_store(&next_mpi_Allreduce, fake_allreduce);
+
+    assert(MPI_Barrier(MPI_COMM_WORLD) == MPI_SUCCESS && epoch_samples == 0);
+    atomic_store(&peak_mpi_epoch_armed, 1);
+    assert(MPI_Barrier(MPI_COMM_SELF) == MPI_SUCCESS);
+    assert(MPI_Allreduce(NULL, NULL, 0, MPI_INT, MPI_SUM, MPI_COMM_WORLD) == MPI_SUCCESS);
+    assert(epoch_samples == 0);
+
+    expected_epoch_kind = PEAK_MPI_EPOCH_ALLREDUCE;
+    int send = 1, receive;
+    assert(MPI_Allreduce(&send, &receive, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD) == MPI_SUCCESS);
+    assert(epoch_samples == 1);
+    assert(MPI_Barrier(MPI_COMM_WORLD) == MPI_SUCCESS && epoch_samples == 1);
+
+    expected_epoch_kind = PEAK_MPI_EPOCH_FAILED;
+    barrier_result = MPI_ERR_OTHER;
+    assert(MPI_Allreduce(&send, &receive, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD) == MPI_ERR_OTHER);
+    assert(epoch_samples == 2);
+    barrier_result = MPI_SUCCESS;
+    expected_epoch_kind = PEAK_MPI_EPOCH_ALLREDUCE;
+    for (unsigned i = 0; i < PEAK_MPI_EPOCH_MAX_ATTEMPTS; ++i) {
+        wall_us += TICK_US;
+        assert(MPI_Allreduce(&send, &receive, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD) == MPI_SUCCESS);
+    }
+    assert(epoch_samples == PEAK_MPI_EPOCH_MAX_ATTEMPTS);
+    atomic_store(&peak_mpi_epoch_armed, 0);
+}
+
 int
 fake_clock_gettime(clockid_t clock_id, struct timespec* time)
 {
@@ -523,4 +594,5 @@ main(void)
     test_measurement_available_independent_of_correction();
     test_measurement_during_quiet_to_aliased_phase();
     test_mixed_sampled_and_raw_spans();
+    test_epoch_boundaries();
 }
