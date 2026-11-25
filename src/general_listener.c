@@ -446,6 +446,7 @@ static gsize peak_controller_shutdown_policy_initialized = 0;
 static unsigned int peak_controller_max_retry_count = 300;
 static double peak_controller_max_pending_age_s = 30.0;
 static double peak_reattach_cooldown_s = 60.0;
+static gboolean peak_use_short_reattach_retry;
 static PeakEnvWarningState peak_reattach_cooldown_warning_emitted;
 static PeakEnvWarningState peak_controller_pending_age_warning_emitted;
 static PeakEnvWarningState peak_controller_retry_count_warning_emitted;
@@ -475,6 +476,9 @@ peak_general_listener_init_reattach_policy_once(void)
     unsigned int cooldown_ms =
         (unsigned int)peak_parse_env_unsigned(&schema);
     peak_reattach_cooldown_s = (double)cooldown_ms / 1000.0;
+    peak_use_short_reattach_retry =
+        cooldown_ms > 0 && cooldown_ms < peak_reattach_default_cooldown_ms &&
+        g_getenv("PEAK_HIBERNATION_CYCLE") == NULL;
 }
 
 static void
@@ -5471,6 +5475,7 @@ void* peak_heartbeat_monitor(void* arg) {
     double prev_global_overhead = 0.0;
     double prev_global_time     = now0;
     double ema_global_rate      = 0.0;
+    double last_reattach_check  = now0;
     PeakMpiClockSampler* active_sampler = NULL;
     SampledRecentBaseline* sampled_recent_baseline = NULL;
 #ifdef HAVE_MPI
@@ -5590,6 +5595,14 @@ void* peak_heartbeat_monitor(void* arg) {
             (double)hb_max_us / 1e6;
         gboolean detach_observation_ready =
             total_execution_time >= min_detach_observation_time;
+        gboolean scheduled_reattach_check =
+            check_interval != 0 && (heartbeat_counter % check_interval) == 0;
+        gboolean use_short_reattach_retry =
+            detach_observation_ready && enable_reattach && check_interval != 0 &&
+            (enable_per_target_heartbeat || enable_global_heartbeat) &&
+            !scheduled_reattach_check && peak_use_short_reattach_retry &&
+            now - last_reattach_check >= peak_reattach_cooldown_s;
+        gboolean short_reattach_retry_ready = FALSE;
 
         double profile_spent_seconds = 0.0;
         double control_spent_seconds = 0.0;
@@ -5630,6 +5643,15 @@ void* peak_heartbeat_monitor(void* arg) {
 
             gboolean attached =
                 peak_general_listener_hook_is_attached_for_policy_unlocked(i);
+            /* Piggyback the due check on the ordinary locked hook scan. */
+            if (use_short_reattach_retry &&
+                peak_hook_states != NULL &&
+                peak_hook_states[i] == PEAK_HOOK_DETACHED &&
+                peak_detached[i] && !peak_need_detach[i] &&
+                peak_general_listener_reattach_cooldown_ready_unlocked(i, now)) {
+                short_reattach_retry_ready = TRUE;
+                use_short_reattach_retry = FALSE;
+            }
             gulong total_num_calls = 0;
             double hook_profile_spent_seconds = 0.0;
             gboolean reuse_cached_sample =
@@ -5918,8 +5940,8 @@ void* peak_heartbeat_monitor(void* arg) {
         /* 3) Reattach. */
         if (detach_observation_ready &&
             enable_reattach &&
-            check_interval != 0 &&
-            (heartbeat_counter % check_interval) == 0) {
+            (scheduled_reattach_check || short_reattach_retry_ready)) {
+            last_reattach_check = now;
             double reattach_gate_ratio = 0.0;
             double reattach_spent_seconds = 0.0;
             double reattach_risk_spent_ratio = 0.0;

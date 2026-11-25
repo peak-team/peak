@@ -3459,9 +3459,70 @@ start_gate_destroy(StartGate* gate)
     pthread_mutex_destroy(&gate->mutex);
 }
 
+static int
+run_short_reattach_check(int expect_reattach)
+{
+    PeakRequestDetachFn request_detach =
+        (PeakRequestDetachFn)required_symbol("peak_general_listener_request_detach");
+    PeakHookStateFn hook_state =
+        (PeakHookStateFn)required_symbol("peak_general_listener_hook_state");
+    if (request_detach == NULL || hook_state == NULL ||
+        hook_state(0) != PEAK_HOOK_ATTACHED) {
+        fprintf(stderr, "expected an attached hook at startup\n");
+        return 2;
+    }
+
+    /* Fix the accrued profile spend independent of machine speed. Initiate
+     * the detach through the controller so the real cooldown is started. */
+    for (uint64_t call = 0; call < 32; ++call) {
+        peak_detach_hot_target(call);
+    }
+    double detach_requested = monotonic_seconds();
+    if (!request_detach(0)) {
+        fprintf(stderr, "failed to request detach\n");
+        return 2;
+    }
+    while (hook_state(0) != PEAK_HOOK_DETACHED &&
+           monotonic_seconds() - detach_requested < 1.0) {
+        usleep(1000);
+    }
+    if (hook_state(0) != PEAK_HOOK_DETACHED) {
+        fprintf(stderr, "controller did not detach the hook\n");
+        return 2;
+    }
+
+    /* This sparse phase ends well before the first ordinary cycle-50 check. */
+    double sparse_deadline = monotonic_seconds() + 1.8;
+    unsigned int attached_samples = 0;
+    while (monotonic_seconds() < sparse_deadline) {
+        if (hook_state(0) == PEAK_HOOK_ATTACHED) {
+            if (monotonic_seconds() - detach_requested < 0.4) {
+                fprintf(stderr, "reattached before the 400 ms cooldown\n");
+                return 2;
+            }
+            ++attached_samples;
+        }
+        peak_detach_hot_target(attached_samples);
+        usleep(25000);
+    }
+
+    if ((expect_reattach && attached_samples < 4) ||
+        (!expect_reattach && attached_samples != 0)) {
+        fprintf(stderr, "expected reattach=%d, got %u attached samples\n",
+                expect_reattach, attached_samples);
+        return 2;
+    }
+    printf("short_reattach_check_ok attached_samples=%u\n", attached_samples);
+    return 0;
+}
+
 int
 main(int argc, char** argv)
 {
+    if (has_flag_arg(argc, argv, "--short-reattach-check")) {
+        return run_short_reattach_check(
+            !has_flag_arg(argc, argv, "--expect-no-reattach"));
+    }
     if (has_flag_arg(argc, argv, "--controller-batch-retry-check")) {
         return run_controller_batch_retry_check();
     }

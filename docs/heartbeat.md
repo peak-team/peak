@@ -251,6 +251,14 @@ static const unsigned int peak_reattach_default_cooldown_ms = 60000;
 the first eligibility check. `PEAK_REATTACH_COOLDOWN_MS=0` disables the
 cooldown and is used by several focused tests.
 
+When `PEAK_HIBERNATION_CYCLE` is unset and the configured cooldown is positive
+and shorter than 60 seconds, the heartbeat can also check for reattach after
+that much wall time has passed since the last check. At least one hook must
+have finished its cooldown. The extra check runs on an existing heartbeat
+and applies the same admission budget as the regular cycle check. Setting
+`PEAK_HIBERNATION_CYCLE` explicitly selects cycle-based checks, with zero
+disabling heartbeat reattach.
+
 A reattach candidate must still be:
 
 - published;
