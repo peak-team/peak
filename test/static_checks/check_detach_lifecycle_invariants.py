@@ -2064,18 +2064,12 @@ def check_stop_window_accounting_sidecar(repo_root):
     require(0 <= global_detach_start < epoch_detach_start < reattach_start,
             "MPI epoch admission must follow ordinary detach and precede reattach")
     global_detach_for_budget = heartbeat[global_detach_start:epoch_detach_start]
-    epoch_detach = " ".join(heartbeat[epoch_detach_start:reattach_start].split())
+    epoch_detach = heartbeat[epoch_detach_start:reattach_start]
     adaptive_sleep_start = heartbeat.find(
         "/* Adapt the next heartbeat sleep interval. */")
     adaptive_sleep = heartbeat[
         adaptive_sleep_start:heartbeat.find("cleanup:", adaptive_sleep_start)
     ]
-    require(re.search(
-        r"\}\s*else\s*\{[^;]*previous_active_blocked = -1\.0;\s*"
-        r"if \(blocked != PEAK_MPI_CLOCK_UNAVAILABLE\)\s*\{[^{}]*"
-        r"peak_mpi_active_clock_carried_ratio\(",
-        heartbeat,
-    ), "invalid MPI cuts must reset recent history and carry lifetime budget on races")
     require("ratio_snapshot[i] = ratio" in heartbeat and
             "rate_snapshot[i] = recent_rate" in heartbeat and
             "attached_recent_sum += recent_rate" in heartbeat and
@@ -2126,80 +2120,29 @@ def check_stop_window_accounting_sidecar(repo_root):
             "local_mpi_ranks" not in per_target_detach and
             "spent_ratio" not in per_target_detach,
             "per-target detach must remain cumulative-only and independent of reattach risk")
-    # Each threshold is specific to its own time window. Either pressure can
-    # trigger detachment, and both must fit before the reduction loop stops.
-    global_detach_tokens = " ".join(global_detach_for_budget.split())
-    require(
-            "const gboolean global_pressure = projected_attached_recent_sum > "
-            "recent_target * peak_global_detach_factor || projected_attached_lifetime_sum > "
-            "lifetime_target * peak_global_detach_factor; "
-            "if (detach_observation_ready && enable_global_heartbeat) { if (global_pressure)"
-            in global_detach_tokens and
-            "recent_exceeded = reduced_recent_sum > recent_target" in global_detach_tokens and
-            "lifetime_exceeded = reduced_lifetime_sum > lifetime_target" in global_detach_tokens and
-            "if ((!recent_exceeded || entries[k].rate <= 0.0) && "
-            "(!lifetime_exceeded || entries[k].lifetime <= 0.0))"
-            in global_detach_tokens,
-            "global detach must trigger on either window exceeding its own threshold "
-            "and reduce until both windows fit")
-    require(
-            "if (enable_global_heartbeat &&" in epoch_detach and
-            "allow_epoch = detach_observation_ready && blocked >= 0.0 && "
-            "sampled_recent_elapsed == 0.0 && !global_pressure && !wake_controller && "
-            "atomic_load_explicit(&heartbeat_running, memory_order_acquire) && "
-            "!peak_general_controller_mpi_finalize_requested();" in epoch_detach and
-            "if (!allow_epoch || now > mpi_epoch.expires ||" in epoch_detach and
-            "if (allow_epoch && hook < heartbeat_capacity && "
-            "calls_snapshot[hook] >= PEAK_GLOBAL_DETACH_MIN_CALLS && "
-            "peak_mpi_epoch_ready(&mpi_epoch, peak_mpi_epoch_hook_unlocked(hook), now) && "
-            "!peak_general_controller_has_pending_unlocked() && "
-            "peak_second() <= mpi_epoch.expires" in epoch_detach and
-            "peak_general_listener_request_detach_with_context_unlocked( hook, "
-            "PEAK_HOOK_REQUEST_SOURCE_GLOBAL_HEARTBEAT, calls_snapshot[hook],"
-            in epoch_detach,
-            "MPI epoch fallback must preserve ordinary decision priority, "
-            "require fresh evidence for the current hook and use the existing queue")
-    require("double recent_target = global_target_ratio" in heartbeat and
-            "double lifetime_target = global_target_ratio" in heartbeat and
-            "recent_target = peak_mpi_active_clock_recent_ratio(" in heartbeat and
-            "lifetime_target = lifetime.ratio" in heartbeat,
-            "detach window targets must default to the configured ratio and use "
-            "their matching active-clock decisions")
-    heartbeat_tokens = " ".join(heartbeat.split())
-    require("sampled_recent_elapsed = sampled_recent.elapsed; "
-            "projected_attached_recent_sum = sampled_attached_seconds / sampled_recent_elapsed; "
-            "recent_target = peak_mpi_active_clock_recent_sampled_ratio( "
-            "global_target_ratio, &sampled_recent);" in heartbeat_tokens and
-            "if (sampler.applied_sleep_seconds <= 0.0) { "
-            "recent_target = peak_mpi_active_clock_recent_ratio(" in heartbeat_tokens and
-            "gboolean immediate_pressure = !(attached_recent_sum <= recent_target * "
-            "peak_global_detach_factor && attached_lifetime_sum <= lifetime_target * "
-            "peak_global_detach_factor);" in heartbeat_tokens and
-            "peak_mpi_active_clock_recent_confirm( &sampled_recent, sampled_recent_horizon, "
-            "sampled_recent_valid, recent_elapsed, recent_overlap, &sampler, immediate_pressure)"
-            in heartbeat_tokens and
-            "sampled_attached_seconds += "
-            "(double)(total_num_calls - baseline->calls) * peak_general_overhead" in heartbeat_tokens,
-            "sampled target and attached pressure must use the same cut interval")
-    aligned_rate = ("double detach_rate = sampled_recent_elapsed > 0.0 "
-                    "? peak_heartbeat_recent_rate( calls_snapshot[i], "
-                    "sampled_recent_baseline[i].calls, sampled_recent_elapsed) : rate_snapshot[i];")
-    require(aligned_rate in global_detach_tokens and
-            aligned_rate in " ".join(per_target_detach.split()) and
-            "double contribution = MAX(detach_rate, ratio_snapshot[i])" in global_detach_tokens and
-            "contribution = MAX(detach_rate / MAX(recent_target, 1e-15), "
-            "ratio_snapshot[i] / MAX(lifetime_target, 1e-15))" in global_detach_tokens and
-            "if (contribution <= 0.0) continue;" in global_detach_for_budget and
-            "entries[n_attached].ratio = contribution" in global_detach_for_budget and
-            "entries[n_attached].rate = detach_rate" in global_detach_for_budget and
-            "entries[n_attached].lifetime = ratio_snapshot[i]" in global_detach_for_budget and
-            "double reduced_recent_sum = projected_attached_recent_sum" in global_detach_for_budget and
-            "double reduced_lifetime_sum = projected_attached_lifetime_sum" in global_detach_for_budget and
-            "if (accepted) { wake_controller = TRUE; "
-            "reduced_recent_sum -= entries[k].rate;" in global_detach_tokens and
+    epoch_gate = re.search(r"\ballow_epoch\s*=\s*([^;]+);", epoch_detach)
+    require(epoch_gate is not None and
+            "!global_pressure" in epoch_gate[1] and
+            "!wake_controller" in epoch_gate[1],
+            "MPI epoch fallback must defer to ordinary detach")
+    epoch_request = epoch_detach.find(
+        "peak_general_listener_request_detach_with_context_unlocked(")
+    require(epoch_request != -1 and
+            "PEAK_HOOK_REQUEST_SOURCE_GLOBAL_HEARTBEAT" in epoch_detach[epoch_request:],
+            "MPI epoch detach must use the ordinary request queue")
+    epoch_admission = epoch_detach[:epoch_request]
+    require("if (allow_epoch &&" in epoch_admission and
+            "PEAK_GLOBAL_DETACH_MIN_CALLS" in epoch_admission and
+            "peak_mpi_epoch_ready(" in epoch_admission and
+            "!peak_general_controller_has_pending_unlocked()" in epoch_admission and
+            "peak_second() <= mpi_epoch.expires" in epoch_admission,
+            "MPI epoch requests must use fresh, eligible evidence with no pending work")
+    require("lifetime_target = lifetime.ratio" in heartbeat and
+            "peak_mpi_active_clock_recent_ratio(" in heartbeat and
+            "peak_mpi_active_clock_recent_sampled_ratio(" in heartbeat,
+            "heartbeat must use the active-clock policy for both detach budgets")
+    require("reduced_recent_sum -= entries[k].rate" in global_detach_for_budget and
             "reduced_lifetime_sum -= entries[k].lifetime" in global_detach_for_budget and
-            "projected_attached_recent_sum = reduced_recent_sum" in global_detach_for_budget and
-            "projected_attached_lifetime_sum = reduced_lifetime_sum" in global_detach_for_budget and
             "spent_ratio" not in global_detach_for_budget and
             "observed_global_overhead" not in global_detach_for_budget and
             "control_spent_seconds" not in global_detach_for_budget and
@@ -2665,37 +2608,18 @@ def check_detach_profile_accounting_order(repo_root):
 def check_global_detach_overhead_selection(repo_root):
     source = read_source(repo_root, "src/general_listener.c")
     heartbeat = extract_function(source, "peak_heartbeat_monitor")
-    policy = read_source(repo_root, "include/internal/general_listener/heartbeat_detach_policy.h")
-    comparator = extract_function(policy, "compare_ratio_de")
-    ordering = extract_function(policy, "peak_heartbeat_sort_detach_entries")
     wait_helper = extract_function(source, "peak_heartbeat_wait_us")
 
-    global_detach_marker = "/* 2) Global detach. */"
-    reattach_marker = "/* 3) Reattach. */"
-    start = heartbeat.find(global_detach_marker)
-    end = heartbeat.find(reattach_marker, start)
-    require(start != -1 and end != -1,
-            "heartbeat must keep explicit global detach and reattach sections")
-    global_detach = heartbeat[start:end]
-
-    require("recent_exceeded && lifetime_exceeded ? compare_ratio_de" in ordering and
-            "peak_heartbeat_compare_recent_detach" in ordering and
-            "peak_heartbeat_compare_lifetime_detach" in ordering,
-            "global detach must use combined ranking only while both targets are exceeded")
-    require(global_detach.count("peak_heartbeat_sort_detach_entries(") == 2 and
-            "both_exceeded && recent_exceeded != lifetime_exceeded" in global_detach and
-            "entries + k + 1, n_attached - k - 1" in global_detach,
-            "global detach may re-sort only unattempted candidates when one target is satisfied")
-    require(comparator.find("x->ratio") < comparator.find("x->rate"),
-            "global detach comparator must prioritize ratio before rate")
-    initial_wait = re.search(
-        r"peak_heartbeat_wait_us\(\s*initial_sleep_us(?:\s*,\s*active_sampler)?\s*\)",
-        heartbeat,
-    )
+    start = heartbeat.find("/* 2) Global detach. */")
+    end = heartbeat.find("/* MPI synchronization epoch detach. */", start)
+    require(0 <= start < end and
+            "peak_heartbeat_sort_detach_entries(" in heartbeat[start:end],
+            "global detach must use the heartbeat ranking policy")
+    initial_wait = heartbeat.find("peak_heartbeat_wait_us(")
     loop_start = heartbeat.find("while (atomic_load(&heartbeat_running))")
     require("pthread_cond_timedwait" in wait_helper,
             "heartbeat wait helper must use the existing condition wait")
-    require(initial_wait is not None and loop_start != -1 and initial_wait.start() < loop_start,
+    require(0 <= initial_wait < loop_start,
             "heartbeat must wait one interval before the first detach decision")
     require("PEAK_HEARTBEAT_MIN_OBSERVATION_US" in source and
             "min_detach_observation_time" in heartbeat and

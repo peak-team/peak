@@ -78,8 +78,31 @@ library from the same MPI environment.
 python3 benchmarks/detach/run_mpi_critical_work.py \
   --exe build/benchmarks/detach/benchmark_mpi_critical_work \
   --libpeak build/src/libpeak.so --launcher 'mpiexec -n 2' \
-  --rounds 128 --base 14000000 --hot 16000 --cooldown-ms 100 --out mpi-critical-results
+  --rounds 128 --base 14000000 --hot 16000 --cooldown-ms 100 --out build/mpi-critical-results
 ```
+
+The runner requests the MPI active clock. Admission depends on MPI thread
+support, world size, and clock qualification. To check admission separately
+from the timed runs, use the same MPI environment and placement:
+
+```sh
+mkdir -p build/mpi-active-clock-qualification
+mpiexec -n 2 env \
+  LD_PRELOAD="$PWD/build/src/libpeak.so" \
+  PEAK_TARGET=fixture_hot_a,fixture_hot_b,fixture_sentinel \
+  PEAK_ENABLE_GLOBAL_HEARTBEAT=1 PEAK_ENABLE_PER_TARGET_HEARTBEAT=0 \
+  PEAK_MPI_ACTIVE_CLOCK=1 PEAK_HEARTBEAT_INTERVAL=0.1 \
+  PEAK_OUTPUT_AGGREGATION=local PEAK_TEXT_OUTPUT=0 PEAK_VERBOSITY=debug \
+  PEAK_STATSLOG_PATH="$PWD/build/mpi-active-clock-qualification/qualification.csv" \
+  build/benchmarks/detach/benchmark_mpi_critical_work common 128 14000000 16000 \
+  > build/mpi-active-clock-qualification/qualification.log 2>&1
+grep -E 'fixed rank=|peak mpi active clock' build/mpi-active-clock-qualification/qualification.log
+```
+
+Match each rank's PID in its `fixed rank=...` line to a `[peak mpi active clock]`
+summary. On multiple hosts, include the hostname in the match using tagged
+launcher output. An `unavailable` diagnostic indicates a failed clock check;
+a missing summary leaves admission unconfirmed for that rank.
 
 The runner holds these counts fixed for every budget and schedule. It reverses
 the instrumented order in the second block and brackets each block with native
