@@ -5996,6 +5996,7 @@ void* peak_heartbeat_monitor(void* arg) {
             pthread_mutex_lock(&lock);
             bool allow_epoch = detach_observation_ready && blocked >= 0.0 &&
                 sampled_recent_elapsed == 0.0 && !global_pressure && !wake_controller &&
+                atomic_load_explicit(&heartbeat_running, memory_order_acquire) &&
                 !peak_general_controller_mpi_finalize_requested();
             if (!allow_epoch || now > mpi_epoch.expires ||
                 (mpi_epoch.confirmed_at > 0.0 ? mpi_epoch.confirmed_at <= now :
@@ -6008,6 +6009,7 @@ void* peak_heartbeat_monitor(void* arg) {
                     calls_snapshot[hook] >= PEAK_GLOBAL_DETACH_MIN_CALLS &&
                     peak_mpi_epoch_ready(&mpi_epoch, peak_mpi_epoch_hook_unlocked(hook), now) &&
                     !peak_general_controller_has_pending_unlocked() &&
+                    peak_second() <= mpi_epoch.expires &&
                     peak_general_listener_request_detach_with_context_unlocked(
                         hook, PEAK_HOOK_REQUEST_SOURCE_GLOBAL_HEARTBEAT, calls_snapshot[hook],
                         lifetime_snapshot[hook], profile_global_overhead,

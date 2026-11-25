@@ -84,4 +84,4 @@ peak_mpi_epoch_ready(const PeakMpiEpoch* epoch, PeakMpiEpochHook hook, double no
            peak_mpi_epoch_same_hook(epoch->nominee, hook);
 }
 
-#endif
+#endif /* PEAK_MPI_EPOCH_POLICY_H */
