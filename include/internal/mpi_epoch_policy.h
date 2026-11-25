@@ -34,7 +34,7 @@ typedef struct {
 typedef struct {
     PeakMpiEpochHook nominee;
     double nominated_at;
-    double expires;
+    double expires;  /* Collection deadline until confirmed, then delivery deadline. */
     double min_calls_per_second;
     double confirmed_at;
     double previous_end;
@@ -59,7 +59,8 @@ static inline bool
 peak_mpi_epoch_observe(PeakMpiEpoch* epoch, PeakMpiEpochHook hook, unsigned kind,
                        unsigned attempt, double now, unsigned long calls)
 {
-    if (!(now > epoch->nominated_at && now <= epoch->expires) ||
+    if (epoch->confirmed_at > epoch->nominated_at ||
+        !(now > epoch->nominated_at && now <= epoch->expires) ||
         !peak_mpi_epoch_same_hook(epoch->nominee, hook))
         return true;
 
@@ -73,6 +74,8 @@ peak_mpi_epoch_observe(PeakMpiEpoch* epoch, PeakMpiEpochHook hook, unsigned kind
                 (now - epoch->previous_end) * epoch->min_calls_per_second &&
             ++epoch->corroborations == 2) {
             epoch->confirmed_at = now;
+            /* Leave one heartbeat horizon for the confirmed result to be delivered. */
+            epoch->expires += epoch->expires - epoch->nominated_at;
             return true;
         }
     }

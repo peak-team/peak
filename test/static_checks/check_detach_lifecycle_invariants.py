@@ -2148,6 +2148,7 @@ def check_stop_window_accounting_sidecar(repo_root):
             "sampled_recent_elapsed == 0.0 && !global_pressure && !wake_controller && "
             "atomic_load_explicit(&heartbeat_running, memory_order_acquire) && "
             "!peak_general_controller_mpi_finalize_requested();" in epoch_detach and
+            "if (!allow_epoch || now > mpi_epoch.expires ||" in epoch_detach and
             "if (allow_epoch && hook < heartbeat_capacity && "
             "calls_snapshot[hook] >= PEAK_GLOBAL_DETACH_MIN_CALLS && "
             "peak_mpi_epoch_ready(&mpi_epoch, peak_mpi_epoch_hook_unlocked(hook), now) && "

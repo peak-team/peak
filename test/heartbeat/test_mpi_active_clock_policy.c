@@ -786,7 +786,7 @@ static void test_completed_epochs(void)
     assert(peak_mpi_epoch_observe(&epoch, hot, PEAK_MPI_EPOCH_BARRIER, 4, 5.0, 402));
     assert(peak_mpi_epoch_ready(&epoch, hot, 5.0));
     assert(!peak_mpi_epoch_ready(&epoch, hot, 4.9));
-    assert(!peak_mpi_epoch_ready(&epoch, hot, 8.1));
+    assert(!peak_mpi_epoch_ready(&epoch, hot, 15.1));
     assert(!peak_mpi_epoch_ready(&epoch, cheap, 5.0));
 
     PeakMpiEpochHook changed = hot;
@@ -853,6 +853,36 @@ static void test_completed_epochs(void)
     }
 }
 
+static void test_epoch_delivery_at_fixed_heartbeat(void)
+{
+    int listener = 0;
+    PeakMpiEpochHook hook = { .listener = &listener };
+    PeakMpiEpoch initial = {
+        .nominee = hook, .nominated_at = 1.0, .expires = 1.1,
+        .min_calls_per_second = peak_mpi_epoch_cost_fraction(0.1) / 1e-6
+    };
+    /* A 100 ms sleep follows 100 us of heartbeat management. */
+    double next_cut = 1.1001;
+    PeakMpiEpoch epoch = initial;
+    assert(!peak_mpi_epoch_observe(&epoch, hook, PEAK_MPI_EPOCH_BARRIER, 1, 1.01, 0));
+    assert(!peak_mpi_epoch_observe(&epoch, hook, PEAK_MPI_EPOCH_BARRIER, 2, 1.02, 1000));
+    assert(peak_mpi_epoch_observe(&epoch, hook, PEAK_MPI_EPOCH_BARRIER, 3, 1.03, 2000));
+    assert(peak_mpi_epoch_ready(&epoch, hook, next_cut));
+    assert(next_cut + 0.0001 <= epoch.expires);
+    assert(equal(epoch.expires, 1.2));
+    assert(!peak_mpi_epoch_ready(&epoch, hook, 1.2001));
+    assert(peak_mpi_epoch_observe(&epoch, hook, PEAK_MPI_EPOCH_BARRIER, 4, 1.04, 3000));
+    assert(epoch.completed_intervals == 2 && epoch.confirmed_at == 1.03);
+    assert(equal(epoch.expires, 1.2));
+
+    epoch = initial;
+    assert(!peak_mpi_epoch_observe(&epoch, hook, PEAK_MPI_EPOCH_BARRIER, 1, 1.01, 0));
+    assert(!peak_mpi_epoch_observe(&epoch, hook, PEAK_MPI_EPOCH_BARRIER, 2, 1.02, 1000));
+    assert(peak_mpi_epoch_observe(&epoch, hook, PEAK_MPI_EPOCH_BARRIER, 3, next_cut, 10000));
+    assert(!peak_mpi_epoch_ready(&epoch, hook, next_cut));
+    assert(epoch.expires == initial.expires);
+}
+
 int main(void)
 {
     expect(20.0, 0.0, 0.0, 0.1, 2.0, 0);
@@ -896,4 +926,5 @@ int main(void)
     test_occupancy_selected_cut_rejects_biased_raw_pressure();
     test_epoch_slowdown_threshold();
     test_completed_epochs();
+    test_epoch_delivery_at_fixed_heartbeat();
 }

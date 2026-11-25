@@ -187,9 +187,11 @@ candidates once using the contribution to the remaining deficit. The pass
 stops when both targets are satisfied or no eligible candidate provides relief
 to a remaining deficit.
 
-The request context records the call count, lifetime ratio, global profile
-pressure, elapsed time, and recent rate that caused the request. It does not
-perform the mutation. The controller owns mutation ordering.
+The request context records the per-hook call count, lifetime ratio, global
+profile pressure, elapsed time, and recent rate. For a grouped recent detach,
+the reported global pressure and per-hook recent rate come from the latest
+heartbeat snapshot. Selection and ranking use the group's observation window.
+The controller owns mutation ordering.
 
 ## Reattach Risk Scaling
 
@@ -543,7 +545,9 @@ interval. For a completed epoch of duration `T` with estimated hook cost
 gives the observed cost fraction for the epoch decision. At a 10% target,
 a 100 ms epoch allows about 9.09 ms of estimated hook cost. Each nomination
 allows at most five attempts, and the MPI thread skips a sample if the
-listener lock is busy. Ordinary recent and lifetime decisions retain their
+listener lock is busy. After confirmation, the heartbeat can act on the
+result once, up to one maximum heartbeat interval after the collection
+deadline. Ordinary recent and lifetime decisions retain their
 detach factor and take priority, as do queued hook changes. Evidence expires
 if the hook or its attachment changes. This captures short bursts that slow a
 rank's peers while the burst's cost is diluted across a longer heartbeat.
