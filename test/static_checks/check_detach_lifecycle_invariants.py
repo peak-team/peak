@@ -2058,10 +2058,13 @@ def check_stop_window_accounting_sidecar(repo_root):
         heartbeat.find("/* 1) Per-target detach. */"):
         heartbeat.find("/* 2) Global detach. */")
     ]
-    global_detach_for_budget = heartbeat[
-        heartbeat.find("/* 2) Global detach. */"):
-        heartbeat.find("/* 3) Reattach. */")
-    ]
+    global_detach_start = heartbeat.find("/* 2) Global detach. */")
+    epoch_detach_start = heartbeat.find("/* MPI synchronization epoch detach. */")
+    reattach_start = heartbeat.find("/* 3) Reattach. */")
+    require(0 <= global_detach_start < epoch_detach_start < reattach_start,
+            "MPI epoch admission must follow ordinary detach and precede reattach")
+    global_detach_for_budget = heartbeat[global_detach_start:epoch_detach_start]
+    epoch_detach = " ".join(heartbeat[epoch_detach_start:reattach_start].split())
     adaptive_sleep_start = heartbeat.find(
         "/* Adapt the next heartbeat sleep interval. */")
     adaptive_sleep = heartbeat[
@@ -2127,8 +2130,10 @@ def check_stop_window_accounting_sidecar(repo_root):
     # trigger detachment, and both must fit before the reduction loop stops.
     global_detach_tokens = " ".join(global_detach_for_budget.split())
     require(
-            "if (projected_attached_recent_sum > recent_target * peak_global_detach_factor || "
-            "projected_attached_lifetime_sum > lifetime_target * peak_global_detach_factor)"
+            "const gboolean global_pressure = projected_attached_recent_sum > "
+            "recent_target * peak_global_detach_factor || projected_attached_lifetime_sum > "
+            "lifetime_target * peak_global_detach_factor; "
+            "if (detach_observation_ready && enable_global_heartbeat) { if (global_pressure)"
             in global_detach_tokens and
             "recent_exceeded = reduced_recent_sum > recent_target" in global_detach_tokens and
             "lifetime_exceeded = reduced_lifetime_sum > lifetime_target" in global_detach_tokens and
@@ -2137,6 +2142,20 @@ def check_stop_window_accounting_sidecar(repo_root):
             in global_detach_tokens,
             "global detach must trigger on either window exceeding its own threshold "
             "and reduce until both windows fit")
+    require(
+            "if (enable_global_heartbeat &&" in epoch_detach and
+            "allow_epoch = detach_observation_ready && blocked >= 0.0 && "
+            "sampled_recent_elapsed == 0.0 && !global_pressure && !wake_controller &&"
+            in epoch_detach and
+            "if (allow_epoch && hook < heartbeat_capacity && "
+            "calls_snapshot[hook] >= PEAK_GLOBAL_DETACH_MIN_CALLS && "
+            "peak_mpi_epoch_ready(&mpi_epoch, peak_mpi_epoch_hook_unlocked(hook), now) && "
+            "!peak_general_controller_has_pending_unlocked()" in epoch_detach and
+            "peak_general_listener_request_detach_with_context_unlocked( hook, "
+            "PEAK_HOOK_REQUEST_SOURCE_GLOBAL_HEARTBEAT, calls_snapshot[hook],"
+            in epoch_detach,
+            "MPI epoch fallback must preserve ordinary decision priority, "
+            "require fresh evidence for the current hook and use the existing queue")
     require("double recent_target = global_target_ratio" in heartbeat and
             "double lifetime_target = global_target_ratio" in heartbeat and
             "recent_target = peak_mpi_active_clock_recent_ratio(" in heartbeat and

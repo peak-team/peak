@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "internal/mpi_active_clock.h"
+#include "internal/mpi_epoch_policy.h"
 #include "logging.h"
 
 #include <mpi.h>
@@ -53,6 +54,34 @@ clock_ns(clockid_t clock)
         return 0;
     return (uint64_t)now.tv_sec * UINT64_C(1000000000) +
            (uint64_t)now.tv_nsec;
+}
+
+static void
+epoch_completed(uint64_t nomination, unsigned kind, bool succeeded)
+{
+    static _Thread_local uint64_t last_nomination ACTIVE_CLOCK_TLS;
+    static _Thread_local unsigned attempts ACTIVE_CLOCK_TLS;
+    static _Thread_local unsigned selected_kind ACTIVE_CLOCK_TLS;
+
+    if (nomination != last_nomination) {
+        last_nomination = nomination;
+        attempts = 0;
+        selected_kind = PEAK_MPI_EPOCH_FAILED;
+    }
+    if (attempts == PEAK_MPI_EPOCH_MAX_ATTEMPTS ||
+        !peak_mpi_epoch_sample_kind(&selected_kind, kind, succeeded))
+        return;
+    ++attempts;
+    if (atomic_load_explicit(&clock_owner, memory_order_relaxed) != getpid() ||
+        atomic_load_explicit(&residence_state, memory_order_relaxed) == UINT64_MAX)
+        return;
+
+    const uint64_t now = clock_ns(CLOCK_MONOTONIC);
+    if (now)
+        peak_general_listener_mpi_epoch_completed(nomination, attempts,
+            succeeded ? kind : PEAK_MPI_EPOCH_FAILED,
+            (double)(now / UINT64_C(1000000000)) +
+            (double)(now % UINT64_C(1000000000)) * 1e-9);
 }
 
 static inline uint64_t
@@ -231,7 +260,7 @@ remote_peer(MPI_Comm comm, int peer)
             (Name##Fn)dlsym(RTLD_NEXT, "PMPI_" #Name), memory_order_release); \
     }
 
-#define ACTIVE_WRAPPER(Prefix, prefix, Name, Parameters, Arguments, Eligible) \
+#define ACTIVE_WRAPPER(Prefix, prefix, Name, Parameters, Arguments, Eligible, Kind, EpochEligible) \
     ACTIVE_CLOCK_API int Prefix##_##Name Parameters                           \
     {                                                                         \
         Name##Fn next = atomic_load_explicit(&next_##prefix##_##Name,         \
@@ -250,14 +279,23 @@ remote_peer(MPI_Comm comm, int peer)
         int result = next Arguments;                                          \
         if (opened != UINT64_MAX)                                             \
             close_interval(opened);                                           \
+        if (Kind) {                                                           \
+            uint64_t nomination = atomic_load_explicit(                       \
+                &peak_mpi_epoch_armed, memory_order_relaxed);                  \
+            if (nomination && (EpochEligible))                                \
+                epoch_completed(nomination, Kind, result == MPI_SUCCESS);    \
+        }                                                                     \
         writer_state = WRITER_IDLE;                                           \
         return result;                                                        \
     }
 
-#define ACTIVE_CALL(Name, Parameters, Arguments, Eligible)                   \
+#define ACTIVE_CALL_EPOCH(Name, Parameters, Arguments, Eligible, Kind, EpochEligible) \
     ACTIVE_SYMBOLS(Name, Parameters)                                         \
-    ACTIVE_WRAPPER(MPI, mpi, Name, Parameters, Arguments, Eligible)          \
-    ACTIVE_WRAPPER(PMPI, pmpi, Name, Parameters, Arguments, Eligible)
+    ACTIVE_WRAPPER(MPI, mpi, Name, Parameters, Arguments, Eligible, Kind, EpochEligible) \
+    ACTIVE_WRAPPER(PMPI, pmpi, Name, Parameters, Arguments, Eligible, Kind, EpochEligible)
+
+#define ACTIVE_CALL(Name, Parameters, Arguments, Eligible)                   \
+    ACTIVE_CALL_EPOCH(Name, Parameters, Arguments, Eligible, 0, false)
 
 ACTIVE_CALL(Send, (const void* buffer, int count, MPI_Datatype type, int dest,
                    int tag, MPI_Comm comm),
@@ -290,15 +328,17 @@ ACTIVE_CALL(Waitsome, (int count, MPI_Request requests[], int* outcount,
             (count, requests, outcount, indices, statuses),
             count > 0 && requests)
 
-ACTIVE_CALL(Barrier, (MPI_Comm comm), (comm), network_comm(comm))
+ACTIVE_CALL_EPOCH(Barrier, (MPI_Comm comm), (comm), network_comm(comm),
+                  PEAK_MPI_EPOCH_BARRIER, comm == MPI_COMM_WORLD)
 ACTIVE_CALL(Bcast, (void* buffer, int count, MPI_Datatype type, int root, MPI_Comm comm),
             (buffer, count, type, root, comm), network_comm(comm))
 ACTIVE_CALL(Reduce, (const void* send_buffer, void* recv_buffer, int count,
                      MPI_Datatype type, MPI_Op op, int root, MPI_Comm comm),
             (send_buffer, recv_buffer, count, type, op, root, comm), network_comm(comm))
-ACTIVE_CALL(Allreduce, (const void* send_buffer, void* recv_buffer, int count,
-                        MPI_Datatype type, MPI_Op op, MPI_Comm comm),
-            (send_buffer, recv_buffer, count, type, op, comm), network_comm(comm))
+ACTIVE_CALL_EPOCH(Allreduce, (const void* send_buffer, void* recv_buffer, int count,
+                              MPI_Datatype type, MPI_Op op, MPI_Comm comm),
+                  (send_buffer, recv_buffer, count, type, op, comm), network_comm(comm),
+                  PEAK_MPI_EPOCH_ALLREDUCE, comm == MPI_COMM_WORLD && count > 0)
 ACTIVE_CALL(Allgather, (const void* send_buffer, int send_count, MPI_Datatype send_type,
                         void* recv_buffer, int recv_count, MPI_Datatype recv_type,
                         MPI_Comm comm),

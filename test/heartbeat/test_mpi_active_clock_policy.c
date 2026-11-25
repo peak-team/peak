@@ -1,5 +1,6 @@
 #include "internal/mpi_active_clock_policy.h"
 #include "internal/mpi_active_clock_sampling.h"
+#include "internal/mpi_epoch_policy.h"
 
 #include <assert.h>
 #include <float.h>
@@ -742,6 +743,90 @@ static void test_recent_raw_pressure_and_topology_reset(void)
     }
 }
 
+static void test_completed_epochs(void)
+{
+    int hot_listener = 0, cheap_listener = 0;
+    PeakMpiEpochHook hot = { .hook = 3, .listener = &hot_listener, .control = 8 };
+    PeakMpiEpochHook cheap = { .hook = 4, .listener = &cheap_listener, .control = 8 };
+    PeakMpiEpoch initial = {
+        .nominee = hot, .nominated_at = 1.0, .expires = 8.0, .min_calls_per_second = 100
+    };
+
+    /* Each rotating owner has two hot intervals even with a cheap one between. */
+    PeakMpiEpoch epoch = initial;
+    assert(!peak_mpi_epoch_observe(&epoch, hot, PEAK_MPI_EPOCH_BARRIER, 1, 2.0, 1));
+    assert(!peak_mpi_epoch_observe(&epoch, hot, PEAK_MPI_EPOCH_BARRIER, 2, 3.0, 201));
+    assert(!peak_mpi_epoch_observe(&epoch, hot, PEAK_MPI_EPOCH_BARRIER, 3, 4.0, 202));
+    assert(peak_mpi_epoch_observe(&epoch, hot, PEAK_MPI_EPOCH_BARRIER, 4, 5.0, 402));
+    assert(peak_mpi_epoch_ready(&epoch, hot, 5.0));
+    assert(!peak_mpi_epoch_ready(&epoch, hot, 4.9));
+    assert(!peak_mpi_epoch_ready(&epoch, hot, 8.1));
+    assert(!peak_mpi_epoch_ready(&epoch, cheap, 5.0));
+
+    PeakMpiEpochHook changed = hot;
+    changed.control += 8;
+    assert(!peak_mpi_epoch_ready(&epoch, changed, 5.0));
+    changed = hot;
+    changed.provider_generation++;
+    assert(!peak_mpi_epoch_ready(&epoch, changed, 5.0));
+    changed = hot;
+    changed.listener = &cheap_listener;
+    assert(!peak_mpi_epoch_ready(&epoch, changed, 5.0));
+
+    epoch = initial;
+    epoch.nominee = cheap;
+    for (unsigned attempt = 1; attempt <= PEAK_MPI_EPOCH_MAX_ATTEMPTS; ++attempt) {
+        /* Even if present in every epoch, cheap calls only reach the threshold. */
+        assert(peak_mpi_epoch_observe(&epoch, cheap, PEAK_MPI_EPOCH_ALLREDUCE,
+                                     attempt, 1.0 + attempt, 100 * attempt) ==
+               (attempt == PEAK_MPI_EPOCH_MAX_ATTEMPTS));
+    }
+    assert(!peak_mpi_epoch_ready(&epoch, cheap, 7.0));
+
+    epoch = initial;
+    assert(!peak_mpi_epoch_observe(&epoch, hot, PEAK_MPI_EPOCH_ALLREDUCE, 1, 2.0, 1));
+    assert(!peak_mpi_epoch_observe(&epoch, hot, PEAK_MPI_EPOCH_ALLREDUCE, 2, 3.0, 201));
+    assert(peak_mpi_epoch_observe(&epoch, changed, PEAK_MPI_EPOCH_ALLREDUCE, 3, 4.0, 401));
+    assert(!peak_mpi_epoch_ready(&epoch, hot, 5.0));
+
+    epoch = initial;
+    assert(peak_mpi_epoch_observe(&epoch, hot, PEAK_MPI_EPOCH_BARRIER, 1, 8.1, 1));
+    epoch = initial;
+    assert(peak_mpi_epoch_observe(&epoch, (PeakMpiEpochHook){0},
+                                 PEAK_MPI_EPOCH_BARRIER, 1, 2.0, 0));
+
+    /* The stream can alternate collective kinds. Only the selected kind's
+     * boundaries contribute; the intervening work remains within the interval. */
+    epoch = initial;
+    unsigned selected = PEAK_MPI_EPOCH_FAILED, attempt = 0;
+    assert(!peak_mpi_epoch_sample_kind(&selected, PEAK_MPI_EPOCH_BARRIER, false));
+    for (unsigned i = 0; i < 5; ++i) {
+        unsigned kind = i % 2 ? PEAK_MPI_EPOCH_BARRIER : PEAK_MPI_EPOCH_ALLREDUCE;
+        if (peak_mpi_epoch_sample_kind(&selected, kind, true))
+            assert(peak_mpi_epoch_observe(&epoch, hot, kind, ++attempt,
+                                         2.0 + i, 150 * i) == (i == 4));
+    }
+    assert(attempt == 3 && selected == PEAK_MPI_EPOCH_ALLREDUCE);
+    assert(peak_mpi_epoch_ready(&epoch, hot, 6.0));
+    assert(!peak_mpi_epoch_sample_kind(&selected, PEAK_MPI_EPOCH_BARRIER, false));
+    assert(peak_mpi_epoch_sample_kind(&selected, PEAK_MPI_EPOCH_ALLREDUCE, false));
+
+    /* Errors, inconsistent collective kinds and missed lock attempts break a run. */
+    const unsigned interrupted_kinds[] = {
+        PEAK_MPI_EPOCH_FAILED, PEAK_MPI_EPOCH_BARRIER, PEAK_MPI_EPOCH_ALLREDUCE
+    };
+    for (unsigned i = 0; i < 3; ++i) {
+        epoch = initial;
+        assert(!peak_mpi_epoch_observe(&epoch, hot, PEAK_MPI_EPOCH_ALLREDUCE, 1, 2.0, 1));
+        assert(!peak_mpi_epoch_observe(&epoch, hot, PEAK_MPI_EPOCH_ALLREDUCE, 2, 3.0, 201));
+        if (i != 2)
+            assert(!peak_mpi_epoch_observe(&epoch, hot, interrupted_kinds[i], 3, 4.0, 401));
+        assert(!peak_mpi_epoch_observe(&epoch, hot, PEAK_MPI_EPOCH_ALLREDUCE, 4, 5.0, 601));
+        assert(peak_mpi_epoch_observe(&epoch, hot, PEAK_MPI_EPOCH_ALLREDUCE, 5, 6.0, 801));
+        assert(!peak_mpi_epoch_ready(&epoch, hot, 6.0));
+    }
+}
+
 int main(void)
 {
     expect(20.0, 0.0, 0.0, 0.1, 2.0, 0);
@@ -783,4 +868,5 @@ int main(void)
     test_sparse_applied_recent_decisions(0, 2);
     test_recent_raw_pressure_and_topology_reset();
     test_occupancy_selected_cut_rejects_biased_raw_pressure();
+    test_completed_epochs();
 }

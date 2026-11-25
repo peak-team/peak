@@ -531,6 +531,19 @@ configured wall-time target while the group collects evidence. Either
 ordinary recent decision or a lifetime budget violation takes priority over
 the grouped recent decision.
 
+With the qualified MPI active clock and global heartbeat enabled, PEAK can
+also sample the MPI owner thread's existing counter for the attached hook
+with the highest recent rate. An MPI epoch runs from the return of one outer
+`MPI_COMM_WORLD` barrier or positive-count all-reduce to the return of the
+next eligible collective of the same kind. The heartbeat can request that
+hook's detach when two completed epochs within one maximum heartbeat interval
+each exceed the configured global overhead ratio times the detach factor.
+Each nomination allows at most five attempts, and the MPI thread skips a
+sample if the listener lock is busy. The ordinary recent and lifetime
+decisions and queued hook changes take priority. Evidence expires if the
+hook or its attachment changes. This captures short bursts that slow a
+rank's peers while the burst's cost is diluted across a longer heartbeat.
+
 Lifetime budgeting and reattach use cumulative residence.
 A raced snapshot carries the preceding absolute
 lifetime allowance rather than granting fresh headroom. A failed reader cut
@@ -621,7 +634,9 @@ blocking MPI calls in seconds, and `lifetime_target` is the resulting
 rank-local overhead budget expressed as a fraction. `configured_target` is
 the configured global overhead budget before that adjustment.
 The estimate describes rank-local wrapper state and cannot identify MPI-wide
-dependencies or bound whole-job slowdown.
+dependencies or bound whole-job slowdown. The `[peak mpi sync epochs]` line
+reports completed same-kind intervals, groups with two corroborating
+intervals, and accepted detach requests based on those groups.
 
 ## Environment Variables and Defaults
 

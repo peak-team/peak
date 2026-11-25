@@ -17,6 +17,7 @@
 #ifdef HAVE_MPI
 #include "internal/general_listener/mpi_report_transport.h"
 #include "internal/mpi_active_clock.h"
+#include "internal/mpi_epoch_policy.h"
 #include "internal/mpi_active_clock_sampling.h"
 #endif
 #include "internal/mpi_active_clock_policy.h"
@@ -5409,6 +5410,65 @@ peak_heartbeat_wait_us(unsigned int sleep_us, PeakMpiClockSampler* sampler)
     return keep_running;
 }
 
+#ifdef HAVE_MPI
+_Atomic uint64_t peak_mpi_epoch_armed;
+static PeakMpiEpoch mpi_epoch;
+static uint64_t mpi_epoch_nomination;
+
+static PeakMpiEpochHook
+peak_mpi_epoch_hook_unlocked(size_t hook)
+{
+    if (!peak_general_hook_is_published_unlocked(hook) ||
+        peak_hook_states[hook] != PEAK_HOOK_ATTACHED)
+        return (PeakMpiEpochHook){0};
+
+    PeakGeneralListener* listener = PEAKGENERAL_LISTENER(array_listener[hook]);
+    uint64_t control = atomic_load_explicit(&listener->callback_hook_control,
+                                            memory_order_acquire);
+    if (peak_general_listener_callback_hook_state(control) != PEAK_HOOK_ATTACHED ||
+        (control & PEAK_CALLBACK_DETACH_COUNT_REQUEST_BIT))
+        return (PeakMpiEpochHook){0};
+
+    return (PeakMpiEpochHook){
+        .hook = hook,
+        .listener = listener,
+        .control = control,
+        .provider_generation = peak_hook_provider_generation
+            ? peak_hook_provider_generation[hook] : 0
+    };
+}
+
+void
+peak_general_listener_mpi_epoch_completed(uint64_t nomination, unsigned attempt,
+                                          unsigned kind, double now)
+{
+    if (pthread_mutex_trylock(&lock) != 0)
+        return;
+
+    if (nomination == atomic_load_explicit(&peak_mpi_epoch_armed, memory_order_relaxed)) {
+        PeakMpiEpochHook hook = {0};
+        gulong calls = 0;
+        if (atomic_load_explicit(&heartbeat_running, memory_order_relaxed) &&
+            !peak_general_controller_mpi_finalize_requested() &&
+            thread_data.initialized && thread_data.self_mapped_valid) {
+            hook = peak_mpi_epoch_hook_unlocked(mpi_epoch.nominee.hook);
+            const PeakGeneralListener* listener = hook.listener;
+            if (listener && listener->num_calls &&
+                thread_data.self_mapped_id < listener->fast_stats_capacity) {
+                calls = peak_general_listener_num_calls_load(
+                    peak_general_listener_num_calls_slot(
+                        (PeakGeneralListener*)listener, thread_data.self_mapped_id));
+            } else {
+                hook = (PeakMpiEpochHook){0};
+            }
+        }
+        if (peak_mpi_epoch_observe(&mpi_epoch, hook, kind, attempt, now, calls))
+            atomic_store_explicit(&peak_mpi_epoch_armed, 0, memory_order_relaxed);
+    }
+    pthread_mutex_unlock(&lock);
+}
+#endif
+
 void* peak_heartbeat_monitor(void* arg) {
     PeakHeartbeatArgs* heartbeat_args = (PeakHeartbeatArgs*)arg;
     peak_general_listener_exclude_current_thread();
@@ -5472,6 +5532,8 @@ void* peak_heartbeat_monitor(void* arg) {
     double sampled_recent_horizon = peak_mpi_active_clock_recent_horizon(
         hb_max_us * 1e-6, PEAK_MPI_CLOCK_PROBE_INTERVAL_NS * 1e-9);
     uint64_t sampled_recent_windows = 0;
+    bool have_mpi_epoch_nomination = false;
+    uint64_t epoch_intervals = 0, epoch_groups = 0, epoch_requests = 0;
     double reported_active_elapsed = 0.0;
     double reported_active_blocked = 0.0;
     double last_active_budget = -1.0;
@@ -5593,6 +5655,10 @@ void* peak_heartbeat_monitor(void* arg) {
         uint64_t control_pause_wall_ns = 0;
         PeakDetachAccountingSnapshot detach_accounting;
 
+#ifdef HAVE_MPI
+        PeakMpiEpochHook epoch_nominee = {0};
+        double epoch_nominee_rate = 0.0;
+#endif
         size_t slot_limit = pthread_listener_reserved_slot_limit();
         pthread_mutex_lock(&lock);
         for (size_t i = 0; i < heartbeat_capacity; i++) {
@@ -5702,6 +5768,16 @@ void* peak_heartbeat_monitor(void* arg) {
             profile_spent_seconds += hook_profile_spent_seconds;
 
             if (attached) {
+#ifdef HAVE_MPI
+                if (blocked >= 0.0 && total_num_calls >= PEAK_GLOBAL_DETACH_MIN_CALLS &&
+                    recent_rate > epoch_nominee_rate) {
+                    PeakMpiEpochHook candidate = peak_mpi_epoch_hook_unlocked(i);
+                    if (candidate.listener) {
+                        epoch_nominee = candidate;
+                        epoch_nominee_rate = recent_rate;
+                    }
+                }
+#endif
                 attached_recent_sum += recent_rate;
                 attached_lifetime_sum += ratio;
             }
@@ -5822,11 +5898,11 @@ void* peak_heartbeat_monitor(void* arg) {
         }
 
         /* 2) Global detach. */
+        const gboolean global_pressure =
+            projected_attached_recent_sum > recent_target * peak_global_detach_factor ||
+            projected_attached_lifetime_sum > lifetime_target * peak_global_detach_factor;
         if (detach_observation_ready && enable_global_heartbeat) {
-            if (projected_attached_recent_sum >
-                    recent_target * peak_global_detach_factor ||
-                projected_attached_lifetime_sum >
-                    lifetime_target * peak_global_detach_factor) {
+            if (global_pressure) {
                 size_t n_attached = 0;
                 pthread_mutex_lock(&lock);
                 for (size_t i = 0; i < heartbeat_capacity; i++) {
@@ -5911,6 +5987,65 @@ void* peak_heartbeat_monitor(void* arg) {
                 pthread_mutex_unlock(&lock);
             }
         }
+
+#ifdef HAVE_MPI
+        /* MPI synchronization epoch detach. */
+        /* Admit only the nominated hook after ordinary policy. */
+        if (enable_global_heartbeat &&
+            (epoch_nominee.listener || have_mpi_epoch_nomination)) {
+            pthread_mutex_lock(&lock);
+            bool allow_epoch = detach_observation_ready && blocked >= 0.0 &&
+                sampled_recent_elapsed == 0.0 && !global_pressure && !wake_controller &&
+                !peak_general_controller_mpi_finalize_requested();
+            if (!allow_epoch || now > mpi_epoch.expires ||
+                (mpi_epoch.confirmed_at > 0.0 ? mpi_epoch.confirmed_at <= now :
+                 atomic_load_explicit(&peak_mpi_epoch_armed, memory_order_relaxed) == 0)) {
+                epoch_intervals += mpi_epoch.completed_intervals;
+                epoch_groups += mpi_epoch.confirmed_at > 0.0;
+                atomic_store_explicit(&peak_mpi_epoch_armed, 0, memory_order_relaxed);
+                size_t hook = mpi_epoch.nominee.hook;
+                if (allow_epoch && hook < heartbeat_capacity &&
+                    calls_snapshot[hook] >= PEAK_GLOBAL_DETACH_MIN_CALLS &&
+                    peak_mpi_epoch_ready(&mpi_epoch, peak_mpi_epoch_hook_unlocked(hook), now) &&
+                    !peak_general_controller_has_pending_unlocked() &&
+                    peak_general_listener_request_detach_with_context_unlocked(
+                        hook, PEAK_HOOK_REQUEST_SOURCE_GLOBAL_HEARTBEAT, calls_snapshot[hook],
+                        lifetime_snapshot[hook], profile_global_overhead,
+                        total_execution_time, rate_snapshot[hook])) {
+                    ++epoch_requests;
+                    wake_controller = TRUE;
+                    projected_attached_recent_sum =
+                        fmax(0.0, projected_attached_recent_sum - rate_snapshot[hook]);
+                    projected_attached_lifetime_sum =
+                        fmax(0.0, projected_attached_lifetime_sum - ratio_snapshot[hook]);
+                }
+                mpi_epoch = (PeakMpiEpoch){0};
+                have_mpi_epoch_nomination = false;
+            }
+            if (allow_epoch && !wake_controller && epoch_nominee.listener &&
+                mpi_epoch.confirmed_at == 0.0 &&
+                atomic_load_explicit(&peak_mpi_epoch_armed, memory_order_relaxed) == 0) {
+                PeakMpiEpochHook hook = peak_mpi_epoch_hook_unlocked(epoch_nominee.hook);
+                double min_rate = global_target_ratio * peak_global_detach_factor /
+                                  peak_general_overhead;
+                if (peak_mpi_epoch_same_hook(epoch_nominee, hook) &&
+                    peak_general_listener_positive_finite(min_rate)) {
+                    mpi_epoch = (PeakMpiEpoch){
+                        .nominee = hook,
+                        .nominated_at = now,
+                        .expires = now + heartbeat_observation_horizon_seconds,
+                        .min_calls_per_second = min_rate
+                    };
+                    have_mpi_epoch_nomination = true;
+                    if (++mpi_epoch_nomination == 0)
+                        ++mpi_epoch_nomination;
+                    atomic_store_explicit(&peak_mpi_epoch_armed, mpi_epoch_nomination,
+                                          memory_order_relaxed);
+                }
+            }
+            pthread_mutex_unlock(&lock);
+        }
+#endif
 
         /* 3) Reattach. */
         if (detach_observation_ready &&
@@ -6311,8 +6446,21 @@ cleanup:
     }
 #endif
     pthread_mutex_lock(&lock);
+#ifdef HAVE_MPI
+    atomic_store_explicit(&peak_mpi_epoch_armed, 0, memory_order_relaxed);
+    epoch_intervals += mpi_epoch.completed_intervals;
+    epoch_groups += mpi_epoch.confirmed_at > 0.0;
+    mpi_epoch = (PeakMpiEpoch){0};
+#endif
     peak_general_listener_snapshot_heartbeat_overhead_seconds_unlocked();
     pthread_mutex_unlock(&lock);
+#ifdef HAVE_MPI
+    if (reported_active_elapsed > 0.0) {
+        peak_log_debug("[peak mpi sync epochs] pid=%ld intervals=%llu groups=%llu requests=%llu\n",
+                       (long)getpid(), (unsigned long long)epoch_intervals,
+                       (unsigned long long)epoch_groups, (unsigned long long)epoch_requests);
+    }
+#endif
     g_free(previous_time);
     g_free(previous_calls);
     g_free(recent_baseline_ready);
